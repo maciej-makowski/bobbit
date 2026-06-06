@@ -19,6 +19,8 @@ import assert from "node:assert/strict";
 import { safeSetItem, safeGetItem, safeRemoveItem, safeGetJSON } from "../src/app/safe-storage.ts";
 
 const realLocalStorage = (globalThis as any).localStorage;
+const realWarn = console.warn;
+let warnings: unknown[][] = [];
 
 function installThrowingStorage(): void {
 	(globalThis as any).localStorage = {
@@ -38,28 +40,52 @@ function installMapStorage(): Map<string, string> {
 	return map;
 }
 
+beforeEach(() => {
+	warnings = [];
+	console.warn = (...args: unknown[]) => { warnings.push(args); };
+});
+
 afterEach(() => {
+	console.warn = realWarn;
 	if (realLocalStorage === undefined) delete (globalThis as any).localStorage;
 	else (globalThis as any).localStorage = realLocalStorage;
 });
 
+function warnMessages(): string[] {
+	return warnings.map((args) => String(args[0]));
+}
+
 describe("safe-storage — never throws on hostile storage", () => {
 	beforeEach(() => installThrowingStorage());
 
-	it("safeSetItem swallows a quota/security exception", () => {
+	it("safeSetItem swallows a quota/security exception and warns once", () => {
 		assert.doesNotThrow(() => safeSetItem("k", "v"));
+		assert.strictEqual(warnings.length, 1);
+		assert.match(warnMessages()[0], /safe-storage/);
+		assert.match(warnMessages()[0], /setItem/);
 	});
 
-	it("safeGetItem returns null instead of throwing", () => {
+	it("safeGetItem returns null instead of throwing and warns once", () => {
 		assert.strictEqual(safeGetItem("k"), null);
+		assert.strictEqual(warnings.length, 1);
+		assert.match(warnMessages()[0], /safe-storage/);
+		assert.match(warnMessages()[0], /getItem/);
 	});
 
-	it("safeRemoveItem swallows a security exception", () => {
+	it("safeRemoveItem swallows a security exception and warns once", () => {
 		assert.doesNotThrow(() => safeRemoveItem("k"));
+		assert.strictEqual(warnings.length, 1);
+		assert.match(warnMessages()[0], /safe-storage/);
+		assert.match(warnMessages()[0], /removeItem/);
 	});
 
-	it("safeGetJSON returns the fallback instead of throwing", () => {
+	it("safeGetJSON returns the fallback instead of throwing and warns at most once on read failure", () => {
 		assert.deepStrictEqual(safeGetJSON<string[]>("k", ["fallback"]), ["fallback"]);
+		// The read failed inside safeGetItem (raw === null → fallback, no parse
+		// branch), so exactly ONE warn must be emitted — never two.
+		assert.strictEqual(warnings.length, 1);
+		assert.match(warnMessages()[0], /safe-storage/);
+		assert.match(warnMessages()[0], /getItem/);
 	});
 });
 
@@ -67,25 +93,32 @@ describe("safe-storage — round-trips when storage works", () => {
 	let map: Map<string, string>;
 	beforeEach(() => { map = installMapStorage(); });
 
-	it("safeSetItem / safeGetItem round-trip", () => {
+	it("safeSetItem / safeGetItem round-trip without warning", () => {
 		safeSetItem("hello", "world");
 		assert.strictEqual(map.get("hello"), "world");
 		assert.strictEqual(safeGetItem("hello"), "world");
+		assert.deepStrictEqual(warnings, []);
 	});
 
-	it("safeGetJSON parses stored JSON", () => {
+	it("safeGetJSON parses stored JSON without warning", () => {
 		safeSetItem("ids", JSON.stringify(["a", "b"]));
 		assert.deepStrictEqual(safeGetJSON<string[]>("ids", []), ["a", "b"]);
+		assert.deepStrictEqual(warnings, []);
 	});
 
-	it("safeGetJSON falls back on corrupted JSON rather than throwing", () => {
+	it("safeGetJSON falls back on corrupted JSON rather than throwing and warns once", () => {
 		safeSetItem("ids", "{not valid json");
 		assert.deepStrictEqual(safeGetJSON<string[]>("ids", []), []);
+		// Storage read succeeded; only the parse branch warns → exactly one warn.
+		assert.strictEqual(warnings.length, 1);
+		assert.match(warnMessages()[0], /safe-storage/);
+		assert.match(warnMessages()[0], /parse/);
 	});
 
-	it("safeRemoveItem deletes the key", () => {
+	it("safeRemoveItem deletes the key without warning", () => {
 		safeSetItem("gone", "soon");
 		safeRemoveItem("gone");
 		assert.strictEqual(safeGetItem("gone"), null);
+		assert.deepStrictEqual(warnings, []);
 	});
 });
