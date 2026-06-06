@@ -13,6 +13,14 @@ import { join, resolve } from "node:path";
  * work). Scale workers to the host on non-Windows; keep the conservative caps
  * on win32 to preserve the flake mitigation.
  *
+ * IMPORTANT — stay modest. In the verification harness the Unit step
+ * (tests/playwright.config.ts, also a Chromium suite) and this E2E step run
+ * CONCURRENTLY. Over-scaling here oversubscribes the host and crashes BOTH
+ * suites with `browserContext.newPage: browser has been closed` /
+ * newPage timeouts. So the goal is "meaningfully faster than 3/4", not
+ * "saturate the box": small low caps (browser ≤6, api/top ≤8) that roughly
+ * halve wall time while leaving CPU/RAM for the parallel unit run.
+ *
  * Honour an explicit BOBBIT_E2E_WORKERS override (CI / debugging) on any OS.
  */
 function workerBudget(kind: "top" | "api" | "browser"): number {
@@ -21,12 +29,12 @@ function workerBudget(kind: "top" | "api" | "browser"): number {
 	const conservative = { top: 4, api: 4, browser: 3 } as const;
 	if (process.platform === "win32") return conservative[kind];
 	const cores = Math.max(1, cpus().length);
-	// Each worker = 1 Node process + 1 Chromium for the browser project. Cap so
-	// we never oversubscribe a small box, but use the headroom on big ones.
+	// Each worker = 1 Node process (+ 1 Chromium for the browser project). Low
+	// caps keep headroom for the concurrently-running unit Chromium suite.
 	const scaled = {
-		top: Math.min(16, Math.max(4, Math.floor(cores / 2))),
-		api: Math.min(16, Math.max(4, Math.floor(cores / 2))),
-		browser: Math.min(10, Math.max(3, Math.floor(cores / 4))),
+		top: Math.min(6, Math.max(4, Math.floor(cores / 5))),
+		api: Math.min(6, Math.max(4, Math.floor(cores / 5))),
+		browser: Math.min(5, Math.max(3, Math.floor(cores / 6))),
 	} as const;
 	return scaled[kind];
 }
