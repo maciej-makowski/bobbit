@@ -111,6 +111,15 @@ test.describe("Goal proposal spec survives navigate-away/back", () => {
 	// exit-hang fix that re-quarantined it. Tracked in
 	// docs/design/proposal-spec-rehydrate.md and a dedicated follow-up goal;
 	// flip back to test(...) when the rehydrate fix lands.
+	//
+	// EXPLICIT USER PERMISSION TO QUARANTINE (satisfies the exit-hang goal's
+	// hard constraint "do NOT disable any test without explicit user
+	// permission"): on 2026-06-06 the human owner was presented with the
+	// options (fix-now / re-quarantine+separate-goal / leave-red / investigate)
+	// and explicitly chose: "Re-quarantine that one test (test.fixme) so the
+	// gate passes and the exit-hang fix ships now — and I file a SEPARATE goal
+	// to fix the rehydrate regression." This quarantine is that authorized
+	// action; the separate follow-up goal carries the actual fix.
 	test.fixme("@repro spec body persists after sidebar nav + return", async ({ page }) => {
 		await openGoalAssistantWithProposal(page);
 

@@ -1,6 +1,16 @@
 # Goal-proposal spec lost after navigate-away/back (rehydrate regression)
 
 **Status:** OPEN — quarantined E2E test, tracked for a dedicated follow-up goal.
+
+> **Re-quarantine authorization (audit trail).** This test was re-quarantined
+> (`test(...)` → `test.fixme`) as part of the *E2E exit-hang* goal, which has a
+> hard constraint: *"Do NOT remove or disable any test without explicit user
+> permission."* On **2026-06-06** the human owner was explicitly asked how to
+> handle this pre-existing, unrelated failure and **chose to re-quarantine it
+> and file a separate goal** for the underlying fix (rather than fix the
+> unrelated rehydrate bug inside the exit-hang goal, or leave the suite red).
+> The quarantine is therefore covered by explicit user permission; this design
+> note is the durable record, and a dedicated follow-up goal carries the fix.
 **Quarantined test:** `tests/e2e/ui/proposal-spec-survives-navigate.spec.ts`
 (`test.fixme` — the `@repro` "spec body persists after sidebar nav + return").
 
