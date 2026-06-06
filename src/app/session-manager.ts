@@ -382,19 +382,38 @@ function createDraftManager<T>(config: {
 
 const goalDraft = createDraftManager({
 	type: 'goal',
-	serialize: (sessionId) => ({
-		sessionId,
-		activeGoalProposal: state.activeProposals.goal ?? undefined,
-		previewTitle: state.previewTitle,
-		previewSpec: state.previewSpec,
-		previewCwd: state.previewCwd,
-		previewProjectId: state.previewProjectId,
-		previewTitleEdited: state.previewTitleEdited,
-		previewSpecEdited: state.previewSpecEdited,
-		previewCwdEdited: state.previewCwdEdited,
-		hasReceivedProposal: state.assistantHasProposal,
-		goalAssistantTab: state.assistantTab,
-	}),
+	serialize: (sessionId) => {
+		// Defence in depth against the navigate-away/back rehydrate race: the
+		// debounce timer is module-scoped and serialize() reads *current* global
+		// state at fire time, not the state captured when save() was scheduled.
+		// A pending save scheduled while the body was correct can fire AFTER a
+		// fast-path switch-back has reset state.previewSpec = "" but before the
+		// rehydrate path repopulates it — writing an empty previewSpec over a
+		// still-populated slot and corrupting the on-disk draft. If the slot
+		// still carries a spec/title/cwd and the user hasn't hand-edited (or
+		// hand-cleared) the field, prefer the slot value so we never persist a
+		// spurious empty over a live proposal.
+		const slotFields = (state.activeProposals.goal?.fields ?? {}) as { spec?: unknown; title?: unknown; cwd?: unknown };
+		let previewTitle = state.previewTitle;
+		let previewSpec = state.previewSpec;
+		let previewCwd = state.previewCwd;
+		if (!state.previewTitleEdited && !previewTitle && typeof slotFields.title === "string" && slotFields.title) previewTitle = slotFields.title;
+		if (!state.previewSpecEdited && !previewSpec && typeof slotFields.spec === "string" && slotFields.spec) previewSpec = slotFields.spec.replace(/\s+$/u, "");
+		if (!state.previewCwdEdited && !previewCwd && typeof slotFields.cwd === "string" && slotFields.cwd) previewCwd = slotFields.cwd;
+		return {
+			sessionId,
+			activeGoalProposal: state.activeProposals.goal ?? undefined,
+			previewTitle,
+			previewSpec,
+			previewCwd,
+			previewProjectId: state.previewProjectId,
+			previewTitleEdited: state.previewTitleEdited,
+			previewSpecEdited: state.previewSpecEdited,
+			previewCwdEdited: state.previewCwdEdited,
+			hasReceivedProposal: state.assistantHasProposal,
+			goalAssistantTab: state.assistantTab,
+		};
+	},
 	restore: (_sessionId, draft: any) => {
 		let dismissed = false;
 		if (draft.activeGoalProposal) {
@@ -1625,6 +1644,35 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 			if (type === "project") {
 				delete state.projectProposalAcceptedBySessionId[sessionId];
 			}
+			// Rehydrate fix: mirror goal fields into the assistant form-mirror
+			// state. The goal-assistant body renders `state.previewSpec` (see
+			// proposal-panels.ts goalPreviewPanel → renderGoalForm), NOT the slot.
+			// Both rehydrate entry points — the connectToSession fast-path
+			// (rehydrateProposalsForSession) and the full-reload WS
+			// `proposal_update {source:"rehydrate"}` handler — funnel ONLY through
+			// this unified callback, never the legacy onGoalProposal that
+			// historically performed this mirroring. Without it, navigate-away/back
+			// leaves `state.previewSpec === ""` and the panel shows
+			// "_No spec content yet_" (and any inline annotations orphan against the
+			// empty body). Gated on the active session being a goal assistant and on
+			// the user not having hand-edited the field. The legacy onGoalProposal
+			// (which still runs second on the live streaming path) is now idempotent
+			// with this. Pinned by tests/e2e/ui/proposal-spec-survives-navigate.spec.ts.
+			if (type === "goal" && state.assistantType === "goal") {
+				const gf = merged as { title?: unknown; spec?: unknown; cwd?: unknown; workflow?: unknown };
+				if (!state.previewTitleEdited && typeof gf.title === "string") state.previewTitle = gf.title;
+				if (!state.previewCwdEdited && typeof gf.cwd === "string" && gf.cwd) state.previewCwd = gf.cwd;
+				// Right-trim trailing whitespace so the rendered body is identical to
+				// the pre-nav live value. The propose_goal tool input carries the raw
+				// spec (no trailing newline) but the server appends one when it
+				// persists the proposal file (proposal-types.ts: `spec + "\n"`); the
+				// rehydrate path reads that normalised body back. Without this trim the
+				// restored body gains a phantom trailing newline and visibly differs
+				// from what the user commented on. Matches the canonical body
+				// normalisation used for dismissal fingerprints (proposal-helpers.ts).
+				if (!state.previewSpecEdited && typeof gf.spec === "string") state.previewSpec = gf.spec.replace(/\s+$/u, "");
+				if (typeof gf.workflow === "string" && gf.workflow) setSelectedWorkflowId(gf.workflow);
+			}
 			const isMatchingAssistant = isAssistantProposalType(type);
 			if (isFirstEmit) {
 				plugin.onFirstEmit(slot, {
@@ -2024,13 +2072,34 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 				if (isStale()) return;
 				if (!restored) {
 					state.assistantTab = "chat";
-					state.previewTitle = "";
-					state.previewCwd = "";
-					state.previewSpec = "";
-					state.previewTitleEdited = false;
-					state.previewCwdEdited = false;
-					state.previewSpecEdited = false;
-					state.assistantHasProposal = false;
+					// A 404 goal draft (the debounced PUT hadn't landed before reload)
+					// must NOT clobber a slot the WS-auth `proposal_update`
+					// {source:"rehydrate"} broadcast already restored. That broadcast
+					// fires (and the unified onProposal mirror runs) before this
+					// draft-restore-miss branch, so a live goal slot scoped to THIS
+					// session is the authoritative body — mirror it into the
+					// form-mirror instead of blanking, otherwise the full-reload path
+					// renders "_No spec content yet_". Right-trim matches the canonical
+					// body normalisation (see the onProposal mirror above).
+					const slot = state.activeProposals.goal;
+					const sf = (slot?.sessionId === sessionId ? slot.fields : null) as { title?: unknown; spec?: unknown; cwd?: unknown } | null;
+					if (sf && (typeof sf.spec === "string" || typeof sf.title === "string")) {
+						state.previewTitle = typeof sf.title === "string" ? sf.title : "";
+						state.previewSpec = typeof sf.spec === "string" ? sf.spec.replace(/\s+$/u, "") : "";
+						state.previewCwd = typeof sf.cwd === "string" ? sf.cwd : "";
+						state.previewTitleEdited = false;
+						state.previewCwdEdited = false;
+						state.previewSpecEdited = false;
+						state.assistantHasProposal = true;
+					} else {
+						state.previewTitle = "";
+						state.previewCwd = "";
+						state.previewSpec = "";
+						state.previewTitleEdited = false;
+						state.previewCwdEdited = false;
+						state.previewSpecEdited = false;
+						state.assistantHasProposal = false;
+					}
 					// Keep previewProjectId if set by showGoalDialog (pre-filled from project button)
 					// Only clear if not already set
 					if (!state.previewProjectId) {
