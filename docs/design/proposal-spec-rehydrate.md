@@ -34,9 +34,10 @@ in-memory annotation cache survives but its anchored text does not.
   deterministically, showing the empty placeholder (not a timing flake).
 
 It was invisible for a long time because the full E2E suite hung at worker
-teardown and never ran to completion (see the E2E exit-hang fix —
-`tests/test-utils/git-fixture.ts` hermetic git fixtures). Once the suite began
-exiting cleanly, this pre-existing failure surfaced. Re-quarantining it (rather
+teardown and never ran to completion (see the E2E exit-hang fix — hermetic git
+fixtures in `tests/test-utils/git-fixture.ts`;
+[debugging.md — E2E suite completes but never exits](../debugging.md#e2e-suite-completes-but-never-exits-worker-teardown-hang)).
+Once the suite began exiting cleanly, this pre-existing failure surfaced. Re-quarantining it (rather
 than fixing an unrelated UI-state bug inside the exit-hang goal) keeps the two
 concerns separate.
 
