@@ -284,6 +284,12 @@ This is not a Bobbit bug — it's a git behaviour. There is no per-worktree stas
 
 ---
 
+## Opening PRs on forks
+
+When working on a **fork** of the main repository, open pull requests against the **fork's own `master` branch**, not the upstream/original repository's `master`. Bobbit's `origin` remote points at the fork; `upstream` (when present) points at the original repo. Targeting the wrong base sends review traffic and merges to a repository you may not control — always confirm the PR base is `origin/master` (the fork) before creating it.
+
+---
+
 ## Related docs
 
 - **[README.md](../README.md)** — Architecture overview, quick start, CLI flags
