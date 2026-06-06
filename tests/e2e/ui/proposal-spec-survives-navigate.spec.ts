@@ -108,9 +108,9 @@ test.describe("Goal proposal spec survives navigate-away/back", () => {
 	// surfaced once the E2E suite stopped hanging at teardown (the hang
 	// previously prevented the suite from ever reaching this test). It is a
 	// client-side proposal-rehydrate bug, entirely unrelated to the E2E
-	// exit-hang fix that re-quarantined it. Tracked in
-	// docs/design/proposal-spec-rehydrate.md and a dedicated follow-up goal;
-	// flip back to test(...) when the rehydrate fix lands.
+	// exit-hang fix that re-quarantined it. It is tracked in a dedicated
+	// follow-up goal (goal state is runtime, not committed to this repo), not
+	// in git; flip back to test(...) when the rehydrate fix lands.
 	//
 	// EXPLICIT USER PERMISSION TO QUARANTINE (satisfies the exit-hang goal's
 	// hard constraint "do NOT disable any test without explicit user
