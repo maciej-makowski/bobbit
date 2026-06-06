@@ -1,9 +1,66 @@
-# llama-swap (z13) local models
+# Manual custom providers: per-model metadata (incl. llama-swap)
 
-This documents how to register the 13 local models served by the user's
-[`llama-swap`](https://github.com/mostlygeek/llama-swap) instance as a Bobbit
-custom provider, **with accurate per-model metadata** (context window, reasoning,
-vision).
+This documents the per-model metadata capability for **manual** custom providers,
+and uses the user's [`llama-swap`](https://github.com/mostlygeek/llama-swap)
+instance (13 local models) as the worked example.
+
+## Manual custom-provider model metadata (general)
+
+Bobbit custom providers come in two families:
+
+- **Auto-discovery** (`ollama`, `lmstudio`, `llama.cpp`, `vllm`) — Bobbit fetches
+  the model list (and whatever metadata the server exposes) on demand.
+- **Manual** (`openai-completions`, `openai-responses`, `anthropic-messages`, and
+  the legacy `manual` alias) — the model list is stored on the provider config
+  itself, in `models[]`.
+
+Each entry in a manual provider's `models[]` accepts **optional per-model
+metadata** so models surface with accurate capabilities in the model selector:
+
+| field | type | default when absent |
+|---|---|---|
+| `id` | string (required) | — |
+| `name` | string | falls back to `id` |
+| `contextWindow` | number | `8192` |
+| `maxTokens` | number | `4096` |
+| `reasoning` | boolean | `false` |
+| `input` | `("text" \| "image")[]` | `["text"]` |
+
+Metadata is applied by `mapManualModels()` in
+`src/server/agent/model-registry.ts`; invalid numbers fall back to the defaults
+and `input` is filtered to the `text`/`image` whitelist. The model's API is
+derived from the provider `type` (`openai-responses` → `openai-responses`,
+`anthropic-messages` → `anthropic-messages`, otherwise `openai-completions`), and
+the registry appends `/v1` to the provider `baseUrl` for the per-model URL.
+
+> **Backward compatibility:** existing manual providers whose models are just
+> `{ id, name }` keep working unchanged — the defaults above are applied.
+
+### Discovery-branch fix (`openai-completions`)
+
+The UI saves manual text providers with `type: "openai-completions"` (or
+`openai-responses` / `anthropic-messages`). Previously the server registry only
+handled the legacy `type: "manual"`, so providers created through the UI fell
+through to an empty list and **surfaced zero models**. All four manual text
+types now route through the same `mapManualModels()` path. Pinned by
+`tests/custom-provider-manual-metadata.test.ts`.
+
+### Setting metadata
+
+The Settings → Providers dialog's model textarea uses the `model-id | Display
+name` line format and does not expose the numeric/boolean metadata fields
+directly; editing a provider **preserves** any metadata already attached to a
+model (matched by `id`), so seeded metadata is not wiped on edit. To seed full
+metadata, POST the provider config (with metadata-bearing `models[]`) to
+`POST /api/custom-providers` — see the re-seedable snippet below.
+
+---
+
+## Example: llama-swap (z13) local models
+
+The rest of this document registers the 13 local models served by the user's
+`llama-swap` instance as one manual custom provider, **with accurate per-model
+metadata** (context window, reasoning, vision).
 
 ## Why a seed snippet instead of auto-discovery
 
