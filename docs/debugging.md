@@ -873,6 +873,14 @@ Resolution: restart the gateway. `startupAigwCheck` in `src/server/agent/aigw-ma
 
 See [docs/internals.md — Startup refresh behavior](internals.md#startup-refresh-behavior).
 
+## Custom/local model selected but prompts still go to Claude
+
+Symptom: a custom-provider model (ollama / lmstudio / llama.cpp / vllm or a manual `openai-completions` / `openai-responses` / `anthropic-messages` provider, e.g. a llama-swap model) appears in the picker and can be selected, but every prompt still runs on the previously-bound model (Claude), with no error.
+
+Cause: the interactive agent resolves providers from pi-ai's cloud-only built-in registry plus `~/.bobbit/agent/models.json`, and custom providers were never written there — so `set_model` couldn't resolve them and the gateway silently kept the old model.
+
+Resolution: `syncCustomProvidersToAgent` in `src/server/agent/custom-provider-agent-sync.ts` now writes a managed provider block (marked `__bobbitManaged: "custom-provider"`) into `models.json` on boot and on `POST`/`DELETE /api/custom-providers`. Confirm the block exists for your provider key (`config.name || config.id`) and that `baseUrl` ends in `/v1`. An unresolvable bind is now a hard failure: `bindModelWithReadback` (`src/server/agent/review-model-override.ts`) reads back via `getState()` and throws on mismatch, surfaced to the UI as `SET_MODEL_FAILED` with nothing persisted. See [docs/llama-swap-provider.md — Binding custom-provider models](llama-swap-provider.md#binding-custom-provider-models-to-the-interactive-agent).
+
 ## Review/naming model mismatch under AI Gateway
 
 Symptom: An AI Gateway is configured with `default.sessionModel` and `default.reviewModel` set to different models, but reviewer/QA sub-sessions run on the session model (or the naming path silently fails to generate a title).
