@@ -803,6 +803,9 @@ function renderWorktreeSection(
 					.value=${pendingChanges.worktree_root ?? resolved.worktree_root?.value ?? ""}
 					@input=${(e: Event) => {
 						pendingChanges.worktree_root = (e.target as HTMLInputElement).value;
+						// Re-render unconditionally so `hasPendingChanges` recomputes and
+						// the Save button appears immediately on first edit.
+						renderApp();
 					}}
 				/>
 			</div>
@@ -819,10 +822,14 @@ function renderWorktreeSection(
 					@input=${(e: Event) => {
 						pendingChanges.base_ref = (e.target as HTMLInputElement).value;
 						// Clear stale inline error as soon as the user edits the field.
-						if (_baseRefErrors.has(projectId)) {
-							_baseRefErrors.delete(projectId);
-							renderApp();
-						}
+						_baseRefErrors.delete(projectId);
+						// Re-render unconditionally (not only when clearing a stale error)
+						// so `hasPendingChanges` recomputes and the Save button appears
+						// immediately on first edit. Previously the no-error path skipped
+						// renderApp(), so Save only showed if an unrelated async render
+						// happened to fire — a race that fails deterministically once the
+						// base-ref detect fetch is warm. See base-ref-settings.spec.ts.
+						renderApp();
 					}}
 				/>
 			</div>
