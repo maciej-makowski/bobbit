@@ -1932,15 +1932,6 @@ export function createGateway(config: GatewayConfig) {
 			clearInterval(cleanupInterval);
 			triggerEngine.stop();
 			inboxNudger.stop();
-			// Forcibly terminate live WebSocket clients before closing the server.
-			// wss.close() stops accepting new connections but does NOT close
-			// established ones, and http.Server.close() then waits indefinitely
-			// for every open (keep-alive / upgraded-WS) socket to drain on its
-			// own. A browser page that is navigating away or already gone can
-			// leave such a socket lingering, which keeps the Node event loop
-			// alive so the process never exits — in E2E this wedges the
-			// Playwright worker at end-of-run and stalls the whole suite.
-			try { for (const client of wss.clients) { try { client.terminate(); } catch { /* best-effort */ } } } catch { /* best-effort */ }
 			wss.close();
 			try { getCpuDiagnostics().shutdown(); } catch { /* best-effort */ }
 			try { verificationHarness?.shutdown(); } catch { /* best-effort */ }
@@ -1954,11 +1945,6 @@ export function createGateway(config: GatewayConfig) {
 			}
 			await sessionManager.cleanupSandboxNetwork();
 			server.close();
-			// Destroy any remaining established sockets (keep-alive HTTP from
-			// in-flight fetches, half-closed upgrades) so server.close() can
-			// complete and the event loop can drain. Without this the process
-			// can stay alive on a single lingering connection. Node 18.2+.
-			try { (server as { closeAllConnections?: () => void }).closeAllConnections?.(); } catch { /* best-effort */ }
 		},
 	};
 }

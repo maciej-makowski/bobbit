@@ -1,43 +1,6 @@
 import { existsSync, mkdirSync } from "node:fs";
-import { cpus, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-
-/**
- * Parallelism scaling. The browser project's historical caps (top-level
- * workers: 4, browser workers: 3, fullyParallel: false) were tuned to dodge a
- * Windows FS / Defender contention flake cluster — see the browser project
- * comment below. On non-Windows hosts there is no such contention, and each
- * browser worker runs its own in-process gateway (CPU/RAM-bound, not FS-bound),
- * so on a many-core machine those caps leave the box ~90% idle and make the
- * full suite take ~25min of mostly-idle wall time (only ~8min is real test
- * work). Scale workers to the host on non-Windows; keep the conservative caps
- * on win32 to preserve the flake mitigation.
- *
- * IMPORTANT — stay modest. In the verification harness the Unit step
- * (tests/playwright.config.ts, also a Chromium suite) and this E2E step run
- * CONCURRENTLY. Over-scaling here oversubscribes the host and crashes BOTH
- * suites with `browserContext.newPage: browser has been closed` /
- * newPage timeouts. So the goal is "meaningfully faster than 3/4", not
- * "saturate the box": small low caps (browser ≤6, api/top ≤8) that roughly
- * halve wall time while leaving CPU/RAM for the parallel unit run.
- *
- * Honour an explicit BOBBIT_E2E_WORKERS override (CI / debugging) on any OS.
- */
-function workerBudget(kind: "top" | "api" | "browser"): number {
-	const override = Number(process.env.BOBBIT_E2E_WORKERS);
-	if (Number.isSafeInteger(override) && override > 0) return override;
-	const conservative = { top: 4, api: 4, browser: 3 } as const;
-	if (process.platform === "win32") return conservative[kind];
-	const cores = Math.max(1, cpus().length);
-	// Each worker = 1 Node process (+ 1 Chromium for the browser project). Low
-	// caps keep headroom for the concurrently-running unit Chromium suite.
-	const scaled = {
-		top: Math.min(6, Math.max(4, Math.floor(cores / 5))),
-		api: Math.min(6, Math.max(4, Math.floor(cores / 5))),
-		browser: Math.min(5, Math.max(3, Math.floor(cores / 6))),
-	} as const;
-	return scaled[kind];
-}
 
 /**
  * E2E test config: split into API (in-process) and browser (process-spawned) projects.
@@ -122,10 +85,7 @@ export default {
 	// flakes (POST /api/sessions → 500 under worktree setup races) without
 	// providing a meaningful wall-clock win once browser project is capped
 	// at 3 anyway.
-	//
-	// Non-Windows hosts scale with core count via workerBudget() — see the
-	// import-site comment. win32 keeps the historical 4.
-	workers: workerBudget("top"),
+	workers: 4,
 	// `line` reporter streams one line per test completion to stdout, with
 	// no batching — unlike `list` which redraws in place and buffers heavily
 	// when stdout is not a TTY (the verification-harness tailer sees nothing
@@ -170,7 +130,7 @@ export default {
 				// Owned by the api-realpush project (different env).
 				"**/goal-archive-branch-cleanup*",
 			],
-			workers: workerBudget("api"),
+			workers: 4,
 		},
 		{
 			// Real-push variant of the in-process harness — isolated project so it
@@ -205,11 +165,6 @@ export default {
 			// (one spec per worker, sequential within-spec), which empirically
 			// eliminates a flake cluster. API project stays fullyParallel: true
 			// (inherited from top-level).
-			//
-			// On non-Windows hosts the FS/Defender contention does not apply, so
-			// workerBudget("browser") scales this to the core count (each worker is
-			// an isolated in-process gateway + Chromium). win32 keeps the cap of 3.
-			workers: workerBudget("browser"),
 			fullyParallel: false,
 		},
 	],
