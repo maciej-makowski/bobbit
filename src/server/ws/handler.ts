@@ -650,7 +650,19 @@ export function handleWebSocketConnection(
 					break;
 				case "set_model":
 					try {
-						await session.rpcClient.setModel(msg.provider, msg.modelId);
+						// The agent's RPC `set_model` does a strict (provider, modelId) lookup
+						// against its registry and RESOLVES (it does NOT reject) with
+						// `{ success: false, error }` when the model can't be resolved — see
+						// pi-coding-agent rpc-mode `set_model` + rpc-bridge `sendCommand`, which
+						// resolves the pending promise for any response, success or not. If we
+						// don't inspect the response we silently persist a model the agent never
+						// bound, and subsequent prompts route to the previously-bound model (the
+						// silent-fallback bug). Treat a non-success response as a hard failure:
+						// surface it and DO NOT persist a model the user didn't actually get.
+						const res: any = await session.rpcClient.setModel(msg.provider, msg.modelId);
+						if (res && res.success === false) {
+							throw new Error(res.error || `Model not found: ${msg.provider}/${msg.modelId}`);
+						}
 						sessionManager.updateModelNameFile(session.id, msg.modelId);
 						sessionManager.persistSessionModel(session.id, msg.provider, msg.modelId);
 					} catch (err: any) {
