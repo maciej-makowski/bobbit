@@ -191,6 +191,13 @@ import { configureAigw, removeAigw, getAigwUrl, discoverAigwModels, proxyRequest
 import { writeOpenAIModelAdditions } from "./agent/openai-model-additions.js";
 import { ReviewAnnotationStore, type ReviewAnnotation } from "./review-annotation-store.js";
 import { getAvailableModels, discoverModelsForConfig, invalidateModelCache } from "./agent/model-registry.js";
+import {
+	syncCustomProviderToModelsJson,
+	syncAllCustomProvidersToModelsJson,
+	removeCustomProviderFromModelsJson,
+	pruneStaleCustomProviders,
+	providerKeyFor,
+} from "./agent/custom-provider-agent-sync.js";
 import { testModelPreference } from "./agent/model-completion.js";
 import type { CustomProviderConfig } from "./agent/model-registry.js";
 import { canonicalImageModelPref, defaultImageModelPref, generateImage, getAvailableImageModels } from "./agent/image-generation.js";
@@ -1566,6 +1573,15 @@ export function createGateway(config: GatewayConfig) {
 			await startupAigwCheck(preferencesStore);
 			writeContextWindowOverrides();
 			writeOpenAIModelAdditions();
+			// Register custom local providers (ollama/lmstudio/llama.cpp/vllm +
+			// manual openai-completions/responses/anthropic) into the agent's
+			// models.json so their models are bindable. Auto-discovery types that
+			// are unreachable keep their prior entry. Never block boot.
+			try {
+				await syncAllCustomProvidersToModelsJson(preferencesStore);
+			} catch (err) {
+				console.warn("[custom-providers] startup sync to models.json failed:", err);
+			}
 
 			// Initialize MCP servers (skip in test environments)
 			if (!process.env.BOBBIT_SKIP_MCP) {
@@ -5254,6 +5270,17 @@ async function handleApiRoute(
 			configs.push(config);
 		}
 		preferencesStore.set("customProviders", configs);
+		invalidateModelCache();
+		// Register this provider in the agent's models.json so the interactive
+		// agent's strict `set_model` lookup can resolve its models (otherwise
+		// selecting one silently keeps the prior model). Prune handles renames.
+		// A sync failure must never 500 the save — log and continue.
+		try {
+			await syncCustomProviderToModelsJson(config);
+			pruneStaleCustomProviders(preferencesStore);
+		} catch (err) {
+			console.warn(`[custom-providers] failed to sync ${providerKeyFor(config)} to models.json:`, err);
+		}
 		json({ ok: true, config });
 		return;
 	}
@@ -5266,8 +5293,19 @@ async function handleApiRoute(
 			return;
 		}
 		const configs = (preferencesStore.get("customProviders") as CustomProviderConfig[] | undefined) || [];
+		const removed = configs.find((c: CustomProviderConfig) => c.id === providerId);
 		const filtered = configs.filter((c: CustomProviderConfig) => c.id !== providerId);
 		preferencesStore.set("customProviders", filtered);
+		invalidateModelCache();
+		// Remove the deleted provider's managed entry from the agent's models.json
+		// (marker-scoped, so aigw/bedrock entries are never touched), then prune
+		// any orphans. Never 500 the delete on a sync failure.
+		try {
+			if (removed) removeCustomProviderFromModelsJson(providerKeyFor(removed));
+			pruneStaleCustomProviders(preferencesStore);
+		} catch (err) {
+			console.warn(`[custom-providers] failed to remove ${providerId} from models.json:`, err);
+		}
 		json({ ok: true });
 		return;
 	}

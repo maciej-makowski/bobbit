@@ -17,8 +17,8 @@ import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { globalAgentDir } from "../bobbit-dir.js";
 import { BOBBIT_AIGW_USER_AGENT, aigwUserAgentHeaders } from "./aigw-user-agent.js";
+import { readModelsJson, writeModelsJson } from "./models-json-store.js";
 import type { PreferencesStore } from "./preferences-store.js";
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -202,40 +202,9 @@ export function deriveName(modelId: string): string {
 }
 
 // ── models.json management ─────────────────────────────────────────
-
-function getModelsJsonPath(): string {
-	return path.join(globalAgentDir(), "models.json");
-}
-
-function readModelsJson(): Record<string, any> {
-	const p = getModelsJsonPath();
-	try {
-		if (fs.existsSync(p)) {
-			return JSON.parse(fs.readFileSync(p, "utf-8"));
-		}
-	} catch (err) {
-		console.error("[aigw-manager] Failed to read models.json:", err);
-	}
-	return { providers: {} };
-}
-
-function writeModelsJson(data: Record<string, any>): void {
-	const p = getModelsJsonPath();
-	let tmp = "";
-	try {
-		const dir = path.dirname(p);
-		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-		tmp = `${p}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-		fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
-		fs.renameSync(tmp, p);
-		console.log(`[aigw-manager] Wrote models.json to ${p}`);
-	} catch (err) {
-		if (tmp) {
-			try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
-		}
-		console.error("[aigw-manager] Failed to write models.json:", err);
-	}
-}
+// readModelsJson / writeModelsJson / getModelsJsonPath now live in the shared
+// models-json-store.ts so the aigw provider, contextWindow overrides, OpenAI
+// model additions, and custom-provider sync all share one atomic-write path.
 
 /**
  * Parse model IDs from pi-ai's models.generated.js, grouped by provider.
