@@ -171,7 +171,11 @@ test.describe("Pre-compaction history affordance", () => {
 		await expect(widget).toHaveCount(1, { timeout: 15_000 });
 		// Count fetch fires lazily on viewport hit \u2014 scroll into view to be
 		// sure, then wait for the data-state to flip to "collapsed".
-		await widget.scrollIntoViewIfNeeded();
+		// The widget can be detached/reattached by an async re-render mid-action,
+		// so retry the scroll instead of letting a stale node handle throw.
+		await expect(async () => {
+			await widget.scrollIntoViewIfNeeded();
+		}).toPass({ timeout: 15_000 });
 		await expect(widget).toHaveAttribute("data-state", "collapsed", { timeout: 15_000 });
 
 		const toggle = page.locator("[data-testid='pre-compaction-toggle']");
@@ -213,7 +217,12 @@ test.describe("Pre-compaction history affordance", () => {
 		});
 		await expect(card).toHaveCount(1, { timeout: 20_000 });
 		const widget2 = page.locator("[data-testid='pre-compaction-history']");
-		await widget2.scrollIntoViewIfNeeded();
+		// After reload, async proposal rehydration (session-manager) fires an extra
+		// renderApp() that can detach/reattach this widget; retry the scroll so a
+		// re-render mid-action doesn't throw "Element is not attached to the DOM".
+		await expect(async () => {
+			await widget2.scrollIntoViewIfNeeded();
+		}).toPass({ timeout: 20_000 });
 		await page.evaluate(() => {
 			const el = document.querySelector("bobbit-pre-compaction-history") as any;
 			el?.refreshCount?.();
