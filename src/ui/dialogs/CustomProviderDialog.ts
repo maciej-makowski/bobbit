@@ -157,14 +157,23 @@ export class CustomProviderDialog extends DialogBase {
 		}
 	}
 
-	private parseManualModels(): Array<{ id: string; name: string }> {
+	private parseManualModels(): Model<any>[] {
+		// Preserve any per-model metadata (contextWindow/maxTokens/reasoning/input)
+		// already present on the provider being edited. The textarea only carries
+		// `id | name`, so without this merge, editing a provider would silently wipe
+		// seeded metadata. Metadata is matched by model id.
+		const existingById = new Map<string, Model<any>>();
+		for (const m of this.provider?.models || []) {
+			if (m && typeof m.id === "string") existingById.set(m.id, m);
+		}
 		return this.manualModelsText
 			.split(/\n+/)
 			.map((line) => line.trim())
 			.filter(Boolean)
 			.map((line) => {
 				const [idPart, namePart] = line.split("|").map((part) => part.trim());
-				return { id: idPart, name: namePart || idPart };
+				const existing = existingById.get(idPart);
+				return { ...(existing || {}), id: idPart, name: namePart || idPart } as Model<any>;
 			});
 	}
 
