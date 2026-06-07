@@ -116,6 +116,8 @@ export interface ContainerRuntime {
 	findContainerByLabel(label: string): Promise<string | null>;
 	isRunning(containerId: string): Promise<boolean>;
 	getContainerImageId(containerId: string): Promise<string | null>;
+	/** Resolve the content id (`.Id`) of an image tag, or null if uninspectable. */
+	getImageId(image: string): Promise<string | null>;
 	startContainer(containerId: string, opts?: { timeoutMs?: number }): Promise<void>;
 	stopContainer(containerId: string, opts?: { timeoutMs?: number }): Promise<void>;
 	removeContainer(containerId: string, opts?: { force?: boolean; timeoutMs?: number }): Promise<void>;

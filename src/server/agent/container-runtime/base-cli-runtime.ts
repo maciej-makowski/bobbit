@@ -359,6 +359,19 @@ export abstract class BaseCliRuntime implements ContainerRuntime {
 		}
 	}
 
+	async getImageId(image: string): Promise<string | null> {
+		try {
+			const { stdout } = await this.run(
+				["inspect", "--format", "{{.Id}}", image],
+				{ timeout: 5_000, env: this.runtimeEnv() },
+			);
+			const value = stdout.trim();
+			return value || null;
+		} catch {
+			return null;
+		}
+	}
+
 	async startContainer(containerId: string, opts?: { timeoutMs?: number }): Promise<void> {
 		await this.run(["start", containerId], { timeout: opts?.timeoutMs ?? 30_000, env: this.runtimeEnv() });
 	}
