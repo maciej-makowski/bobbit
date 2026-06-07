@@ -248,6 +248,63 @@ See [AGENTS.md](../AGENTS.md#testing) for harness selection guidance and test re
 
 ---
 
+## Continuous Integration (CI)
+
+CI is **PR validation only** — there is no CD, publish, or release automation here (releases are cut manually via the `release` skill). The workflow lives at [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) and exists to give every pull request a fast, deterministic quality gate before it reaches `master`.
+
+**Triggers.** Runs on `pull_request` targeting `master` and on `push` to `master`. A `concurrency` group keyed on the ref with `cancel-in-progress: true` supersedes stale runs — pushing a new commit to a PR cancels the previous in-flight run rather than queuing both, so the latest commit always gets the freshest result.
+
+**Why separate jobs.** Each check is its own job (not sequential steps in one job) so that a failure in one is independently visible on the PR and does not mask the others. You can see at a glance whether it was types, dead code, or tests that broke.
+
+| Job | Command | What it catches |
+|---|---|---|
+| `typecheck` | `npm run check` | Type errors across server (`tsconfig.server.json`) and web (`tsconfig.web.json`) |
+| `knip` | `npx knip` | Unused files, exports, and dependencies (config: `knip.config.ts`; no npm script — invoked directly) |
+| `unit` | `npm run test:unit` | Node test-runner suite + Playwright `file://` component fixtures |
+
+The browser/API **E2E suite is not part of per-PR CI** — it runs as a separate, manually-triggered workflow (see [E2E workflow](#e2e-a-separate-manually-triggered-workflow) below).
+
+### Runner environment
+
+- **Runner**: `ubuntu-latest`. No Docker — the only Docker-*requiring* E2E specs (`sandbox-recovery-docker*`) are already excluded by `playwright-e2e.config.ts`, and `sandbox-pentest.spec.ts` only exercises the sandbox arg builder.
+- **Node**: 22, via `actions/setup-node` with `cache: npm` (the repo's `engines` field requires `>=22.19.0`).
+- **Install**: `npm ci` against the committed lockfile for reproducible installs.
+- **Playwright Chromium**: both `test:unit` and `test:e2e` drive Chromium, so those jobs run `npx playwright install --with-deps chromium` and cache `~/.cache/ms-playwright` keyed on the resolved Playwright version (cache hits skip the multi-minute browser download).
+- **Git identity**: the `unit` and `e2e` jobs set a `bobbit-ci` `user.name`/`user.email` before running, because the suites exercise real git operations (worktrees, commits) that fail on a runner with no configured identity.
+
+Each job is self-contained and builds what it needs: `test:e2e` runs a full `npm run build`, and `test:unit` auto-builds the server if it is missing. CI is detected automatically — GitHub sets `CI=true`, which the Playwright configs already key off (unit → 2 workers; E2E → `retries: 3`), so no extra configuration is needed.
+
+### Intentionally excluded
+
+CI deliberately does **not** run:
+
+- **The `test:manual` tier** — real agents, Docker, and live LLM API keys (`npm run test:manual`). It needs credentials and ~5 minutes of wall-clock; it stays a local/manual step.
+- **Docker-only E2E** — `sandbox-recovery-docker*` specs, already ignored by `playwright-e2e.config.ts`.
+- **Linters and formatters** — no eslint, prettier, or any new linter was added for CI. `knip` is the only static-analysis gate.
+- **Pre-commit hooks** — no husky or git hooks were introduced.
+- **CD** — no npm publish, binary sub-packages, or GitHub releases; those remain owned by the `release` skill.
+
+### Required checks
+
+Branch protection on `origin/master` marks **`typecheck`, `knip`, and `unit`** as required status checks (`strict: true`) — a PR cannot merge until all three are green and the branch is up to date with `master`.
+
+> **Sequencing note for whoever changes the required checks.** A required-status-check name must exactly match a context GitHub has actually reported. Let the workflow run once on a real PR first, confirm the reported job names (`typecheck`, `knip`, `unit`), then add the required contexts — otherwise protection blocks every PR waiting on a check that has never reported.
+
+### E2E — a separate, manually-triggered workflow
+
+The browser/API E2E suite lives in its **own** workflow, [`.github/workflows/e2e.yml`](../.github/workflows/e2e.yml), triggered **only** by `workflow_dispatch` — it does **not** run automatically on PRs or pushes. Run it on demand:
+
+- **GitHub UI**: Actions → **E2E** → **Run workflow** (pick the branch/ref).
+- **CLI**: `gh workflow run e2e.yml --ref <branch>`.
+
+The job mirrors the old per-PR e2e job (ubuntu-latest, Node 22, `npm ci`, git identity, cached Playwright Chromium, `npm run test:e2e`).
+
+**Why it's separate.** The E2E suite has a pre-existing flake floor (FS-contention races and goal-assistant cold-start timeouts, partly tracked via `@quarantine`-tagged specs) that `playwright-e2e.config.ts` absorbs with `retries: 3` but does not fully eliminate. Running it per-PR — even non-blocking — produced noisy intermittent reds, so it is gated behind a manual trigger: run it before a risky merge or when touching E2E-covered surfaces, rather than on every PR.
+
+**Follow-up (not the end state).** Stabilize the flake floor (fix the underlying races, exclude/retire the `@quarantine` tags, tighten `retries` back toward 0), then fold E2E back into per-PR CI — ideally as a required check.
+
+---
+
 ## Worktree branch namespaces
 
 When you list `git branch` in a Bobbit-managed repo you'll see several namespaces:
@@ -281,6 +338,12 @@ This is not a Bobbit bug — it's a git behaviour. There is no per-worktree stas
 **If you must stash anyway**, pass `--include-untracked` and immediately pop in the same worktree before any other operation — do not leave entries on the stack that another agent could later pop by accident. The first `git stash list` from any sibling worktree will show the entries you created.
 
 **Diagnostic when this regresses.** `git status` in a worktree shows files you never edited, often touching paths that match another in-progress task. `git reflog show stash` lists every entry on the shared stack with its `WIP on <branch>` annotation — entries from a different branch than the worktree you're in are the smoking gun. Reconstruct by walking `git stash show -p stash@{N}` for each entry and applying to the correct worktree manually.
+
+---
+
+## Opening PRs on forks
+
+When working on a **fork** of the main repository, open pull requests against the **fork's own `master` branch**, not the upstream/original repository's `master`. Bobbit's `origin` remote points at the fork; `upstream` (when present) points at the original repo. Targeting the wrong base sends review traffic and merges to a repository you may not control — always confirm the PR base is `origin/master` (the fork) before creating it.
 
 ---
 
