@@ -173,7 +173,6 @@ import { ProjectConfigStore } from "./agent/project-config-store.js";
 import { ToolGroupPolicyStore } from "./agent/tool-group-policy-store.js";
 import { getAllConfigDirectories, removeBuiltinDirectory, resetConfigDirectories } from "./agent/config-directories.js";
 import { checkDockerAvailability, buildSandboxImage, isBuildingImage, ensureImageAgentVersion } from "./agent/sandbox-status.js";
-import { runtimeBin, DEFAULT_RUNTIME_BIN, type RuntimeBin } from "./agent/runtime-bin.js";
 import { SandboxManager, type SandboxBootstrap } from "./agent/sandbox-manager.js";
 import { resolveSandboxCloneSource, type SandboxCloneSource } from "./agent/sandbox-clone-source.js";
 import { validateSandboxMounts } from "./agent/sandbox-mounts.js";
@@ -392,10 +391,10 @@ async function getCachedPrStatus(cwd: string, branch?: string, fallbackCwd?: str
 }
 
 // ── Async git helpers (avoid blocking event loop) ──
-async function execGit(cmd: string, cwd: string, timeout = 5000, containerId?: string, runtime: RuntimeBin = DEFAULT_RUNTIME_BIN): Promise<string> {
+async function execGit(cmd: string, cwd: string, timeout = 5000, containerId?: string): Promise<string> {
 	if (containerId) {
-		// Run inside the sandbox container
-		const { stdout } = await execFileAsync(runtime, [
+		// Run inside Docker container
+		const { stdout } = await execFileAsync("docker", [
 			"exec", "-w", cwd, containerId, "/bin/sh", "-c", cmd,
 		], { encoding: "utf-8", timeout, env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" } });
 		return stdout.trim();
@@ -403,13 +402,13 @@ async function execGit(cmd: string, cwd: string, timeout = 5000, containerId?: s
 	const { stdout } = await execAsync(cmd, { cwd, encoding: "utf-8", timeout });
 	return stdout.trim();
 }
-async function execGitSafe(cmd: string, cwd: string, fallback = "", containerId?: string, runtime: RuntimeBin = DEFAULT_RUNTIME_BIN): Promise<string> {
-	try { return await execGit(cmd, cwd, 5000, containerId, runtime); } catch { return fallback; }
+async function execGitSafe(cmd: string, cwd: string, fallback = "", containerId?: string): Promise<string> {
+	try { return await execGit(cmd, cwd, 5000, containerId); } catch { return fallback; }
 }
 
-async function execGitArgs(args: string[], cwd: string, timeout = 5000, containerId?: string, runtime: RuntimeBin = DEFAULT_RUNTIME_BIN): Promise<string> {
+async function execGitArgs(args: string[], cwd: string, timeout = 5000, containerId?: string): Promise<string> {
 	if (containerId) {
-		const { stdout } = await execFileAsync(runtime, [
+		const { stdout } = await execFileAsync("docker", [
 			"exec", "-w", cwd, containerId, "git", ...args,
 		], { encoding: "utf-8", timeout, env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" } });
 		return stdout.trim();
@@ -418,8 +417,8 @@ async function execGitArgs(args: string[], cwd: string, timeout = 5000, containe
 	return stdout.trim();
 }
 // Argument-vector variant of execGitSafe: never passes user input through a shell.
-async function execGitArgsSafe(args: string[], cwd: string, fallback = "", containerId?: string, runtime: RuntimeBin = DEFAULT_RUNTIME_BIN): Promise<string> {
-	try { return await execGitArgs(args, cwd, 5000, containerId, runtime); } catch { return fallback; }
+async function execGitArgsSafe(args: string[], cwd: string, fallback = "", containerId?: string): Promise<string> {
+	try { return await execGitArgs(args, cwd, 5000, containerId); } catch { return fallback; }
 }
 
 function branchPublishGitArgs(branch: string): {
@@ -438,15 +437,14 @@ function branchPublishGitArgs(branch: string): {
 async function publishCurrentBranchToOrigin(
 	cwd: string,
 	branch: string,
-	opts: { containerId?: string; setUpstream?: boolean; runtime?: RuntimeBin } = {},
+	opts: { containerId?: string; setUpstream?: boolean } = {},
 ): Promise<string> {
 	const args = branchPublishGitArgs(branch);
-	const runtime = opts.runtime ?? DEFAULT_RUNTIME_BIN;
-	const output = await execGitArgs(args.push, cwd, 30_000, opts.containerId, runtime);
+	const output = await execGitArgs(args.push, cwd, 30_000, opts.containerId);
 	if (opts.setUpstream) {
 		try {
-			await execGitArgs(args.fetchRemoteTracking, cwd, 15_000, opts.containerId, runtime);
-			await execGitArgs(args.setUpstream, cwd, 10_000, opts.containerId, runtime);
+			await execGitArgs(args.fetchRemoteTracking, cwd, 15_000, opts.containerId);
+			await execGitArgs(args.setUpstream, cwd, 10_000, opts.containerId);
 		} catch {
 			// Publishing succeeded; upstream repair is best-effort for compatibility.
 		}
@@ -551,7 +549,7 @@ function evictExpired(now: number): void {
 async function batchGitStatus(
 	cwd: string,
 	containerId?: string,
-	opts?: { untracked?: boolean; configuredBaseRef?: string; runtime?: RuntimeBin },
+	opts?: { untracked?: boolean; configuredBaseRef?: string },
 ): Promise<GitStatusResult | null> {
 	const key = gitStatusCacheKey(cwd, containerId, opts?.untracked);
 	const now = Date.now();
@@ -591,7 +589,7 @@ async function batchGitStatus(
 async function runBatchGitStatus(
 	cwd: string,
 	containerId?: string,
-	opts?: { untracked?: boolean; configuredBaseRef?: string; runtime?: RuntimeBin },
+	opts?: { untracked?: boolean; configuredBaseRef?: string },
 ): Promise<GitStatusResult | null> {
 	_runBatchGitStatusCount++;
 	if (_gitStatusFake) return _gitStatusFake(cwd, containerId, opts);
@@ -650,10 +648,10 @@ function validateComponentsConfig(components: unknown): string | null {
 	return null;
 }
 
-async function getGitDiff(cwd: string, file?: string, containerId?: string, runtime: RuntimeBin = DEFAULT_RUNTIME_BIN): Promise<string> {
+async function getGitDiff(cwd: string, file?: string, containerId?: string): Promise<string> {
 	const opts = { cwd, encoding: "utf-8" as const, timeout: 5000 };
 	let hasHead = true;
-	try { await execGit("git rev-parse --verify HEAD", cwd, 5000, containerId, runtime); } catch { hasHead = false; }
+	try { await execGit("git rev-parse --verify HEAD", cwd, 5000, containerId); } catch { hasHead = false; }
 
 	let diff = "";
 	if (file) {
@@ -665,13 +663,13 @@ async function getGitDiff(cwd: string, file?: string, containerId?: string, runt
 			// Run git diff inside container
 			// Argument-vector execution — `file` is never parsed by a shell.
 			if (hasHead) {
-				diff = await execGitArgsSafe(["diff", "HEAD", "--", file], cwd, "", containerId, runtime);
+				diff = await execGitArgsSafe(["diff", "HEAD", "--", file], cwd, "", containerId);
 			} else {
-				diff = await execGitArgsSafe(["diff", "--cached", "--", file], cwd, "", containerId, runtime)
-					+ await execGitArgsSafe(["diff", "--", file], cwd, "", containerId, runtime);
+				diff = await execGitArgsSafe(["diff", "--cached", "--", file], cwd, "", containerId)
+					+ await execGitArgsSafe(["diff", "--", file], cwd, "", containerId);
 			}
 			if (!diff.trim()) {
-				diff = await execGitArgsSafe(["diff", "--no-index", "/dev/null", "--", file], cwd, "", containerId, runtime);
+				diff = await execGitArgsSafe(["diff", "--no-index", "/dev/null", "--", file], cwd, "", containerId);
 			}
 		} else if (hasHead) {
 			const { stdout } = await execFileAsync("git", ["diff", "HEAD", "--", file], opts);
@@ -695,10 +693,10 @@ async function getGitDiff(cwd: string, file?: string, containerId?: string, runt
 	} else {
 		if (containerId) {
 			if (hasHead) {
-				diff = await execGitSafe("git diff HEAD", cwd, "", containerId, runtime);
+				diff = await execGitSafe("git diff HEAD", cwd, "", containerId);
 			} else {
-				diff = await execGitSafe("git diff --cached", cwd, "", containerId, runtime)
-					+ await execGitSafe("git diff", cwd, "", containerId, runtime);
+				diff = await execGitSafe("git diff --cached", cwd, "", containerId)
+					+ await execGitSafe("git diff", cwd, "", containerId);
 			}
 		} else if (hasHead) {
 			const { stdout } = await execFileAsync("git", ["diff", "HEAD"], opts);
@@ -1602,19 +1600,18 @@ export function createGateway(config: GatewayConfig) {
 
 				const projectDir = project.rootPath;
 				const imageName = cfg.get("sandbox_image") || "bobbit-agent";
-				const runtime = runtimeBin(cfg);
 
 				// Auto-build or rebuild image if missing or stale. Images are
 				// shared across projects (Docker image tags) so the first project
 				// to request a sandbox pays the build cost.
-				const imageStatus = await checkDockerAvailability(imageName, runtime);
+				const imageStatus = await checkDockerAvailability(imageName);
 				if (imageStatus.imageExists === false && imageStatus.dockerfileExists === true) {
-					const buildResult = await buildSandboxImage(imageName, projectDir, runtime);
+					const buildResult = await buildSandboxImage(imageName, projectDir);
 					if (!buildResult.success) {
 						console.error(`[sandbox] Auto-build failed for project ${projectId}; proceeding will likely error`);
 					}
 				} else if (imageStatus.imageExists === true) {
-					await ensureImageAgentVersion(imageName, projectDir, runtime);
+					await ensureImageAgentVersion(imageName, projectDir);
 				}
 
 				const isRepo = await isGitRepo(projectDir);
@@ -1702,7 +1699,6 @@ export function createGateway(config: GatewayConfig) {
 					repoUrl,
 					cloneSource,
 					image: imageName,
-					runtimeBin: runtime,
 					sandboxNetwork,
 					sandboxMounts: poolMounts,
 					sandboxCredentials: poolCredentials,
@@ -2520,7 +2516,7 @@ async function handleApiRoute(
 		const sandboxConfig = projectConfigStore.get("sandbox") || "none";
 		const imageName = projectConfigStore.get("sandbox_image") || "bobbit-agent";
 		const configured = sandboxConfig === "docker";
-		const status = await checkDockerAvailability(configured ? imageName : undefined, runtimeBin(projectConfigStore));
+		const status = await checkDockerAvailability(configured ? imageName : undefined);
 		json({ ...status, configured });
 		return;
 	}
@@ -2536,7 +2532,7 @@ async function handleApiRoute(
 			json({ error: "Build already in progress" }, 409);
 			return;
 		}
-		const result = await buildSandboxImage(imageName, config.defaultCwd, runtimeBin(projectConfigStore));
+		const result = await buildSandboxImage(imageName, config.defaultCwd);
 		if (result.success) {
 			json({ success: true });
 		} else {
@@ -4009,7 +4005,7 @@ async function handleApiRoute(
 			const hasReadyContainer = sessionManager.getSandboxManager()?.getStats().containers.some(c => c.status === "ready") ?? false;
 			if (!hasReadyContainer) {
 				if (!_dockerAvailCache || Date.now() - _dockerAvailCache.ts > 60_000) {
-					const dockerStatus = await checkDockerAvailability(undefined, runtimeBin(projectConfigStore));
+					const dockerStatus = await checkDockerAvailability();
 					_dockerAvailCache = { available: dockerStatus.available, error: dockerStatus.error, ts: Date.now() };
 				}
 				if (!_dockerAvailCache.available) {
@@ -6781,12 +6777,10 @@ async function handleApiRoute(
 		// `docs/design/base-ref.md` §5.
 		let cid: string | undefined;
 		let goalBaseRef: string | undefined;
-		let runtime: RuntimeBin = DEFAULT_RUNTIME_BIN;
 		try {
 			const goalCtx = projectContextManager.getContextForGoal(goalId);
 			if (goalCtx) {
 				goalBaseRef = goalCtx.projectConfigStore.get("base_ref") || undefined;
-				runtime = runtimeBin(goalCtx.projectConfigStore);
 				if (goal.sandboxed) {
 					const sandbox = sessionManager.getSandboxManager()?.get(goalCtx.project.id);
 					cid = sandbox ? await sandbox.getContainerId() : undefined;
@@ -6797,11 +6791,11 @@ async function handleApiRoute(
 		if (!cid && !fs.existsSync(cwd)) { json({ error: "Working directory not found" }, 404); return; }
 		const goalUntracked = url.searchParams.get('untracked') === '1';
 		if (url.searchParams.get('fetch') === 'true') {
-			try { await execGit('git fetch --quiet', cwd, 15000, cid, runtime); } catch { /* best-effort */ }
+			try { await execGit('git fetch --quiet', cwd, 15000, cid); } catch { /* best-effort */ }
 			invalidateGitStatusCache(cwd, cid);
 		}
 		try {
-			const result = await batchGitStatus(cwd, cid, { untracked: goalUntracked, configuredBaseRef: goalBaseRef, runtime });
+			const result = await batchGitStatus(cwd, cid, { untracked: goalUntracked, configuredBaseRef: goalBaseRef });
 			if (!result) { json({ error: "Not a git repository" }, 400); return; }
 
 			// Multi-repo aware envelope: include `repos` map + `aggregate` for back-compat.
@@ -6811,7 +6805,7 @@ async function handleApiRoute(
 				for (const [repoName, repoPath] of Object.entries(repoWorktrees)) {
 					try {
 						if (cid || fs.existsSync(repoPath)) {
-							const r = await batchGitStatus(repoPath, cid, { untracked: goalUntracked, configuredBaseRef: goalBaseRef, runtime });
+							const r = await batchGitStatus(repoPath, cid, { untracked: goalUntracked, configuredBaseRef: goalBaseRef });
 							if (r) repos[repoName] = r;
 						}
 					} catch { /* per-repo failure non-fatal */ }
@@ -6837,11 +6831,9 @@ async function handleApiRoute(
 
 		// Resolve container ID for sandboxed goals
 		let cid: string | undefined;
-		let runtime: RuntimeBin = DEFAULT_RUNTIME_BIN;
 		if (goal.sandboxed) {
 			try {
 				const goalCtx = projectContextManager.getContextForGoal(goalId);
-				runtime = runtimeBin(goalCtx?.projectConfigStore);
 				const sandbox = goalCtx ? sessionManager.getSandboxManager()?.get(goalCtx.project.id) : undefined;
 				cid = sandbox ? await sandbox.getContainerId() : undefined;
 			} catch { /* container unavailable */ }
@@ -6856,7 +6848,7 @@ async function handleApiRoute(
 			diffCwd = goalRepoWorktrees[repoParam];
 		}
 		try {
-			const diff = await getGitDiff(diffCwd, file, cid, runtime);
+			const diff = await getGitDiff(diffCwd, file, cid);
 			json({ diff });
 		} catch (err: any) {
 			if (err.message === "INVALID_PATH") { json({ error: "Invalid file path" }, 400); return; }
@@ -8171,19 +8163,15 @@ async function handleApiRoute(
 		// Resolve project `base_ref` config for the `aheadOfPrimary`/`behindPrimary`
 		// counter — see `docs/design/base-ref.md` §5.
 		let sessionBaseRef: string | undefined;
-		let runtime: RuntimeBin = DEFAULT_RUNTIME_BIN;
 		try {
 			const sessCtx = projectContextManager.getContextForSession(id);
-			if (sessCtx) {
-				sessionBaseRef = sessCtx.projectConfigStore.get("base_ref") || undefined;
-				runtime = runtimeBin(sessCtx.projectConfigStore);
-			}
+			if (sessCtx) sessionBaseRef = sessCtx.projectConfigStore.get("base_ref") || undefined;
 		} catch { /* config unavailable — fall through */ }
 
 		// Optional: run git fetch first when ?fetch=true is passed
 		const sessUntracked = url.searchParams.get('untracked') === '1';
 		if (url.searchParams.get('fetch') === 'true') {
-			try { await execGit('git fetch --quiet', cwd, 15000, cid, runtime); } catch { /* best-effort */ }
+			try { await execGit('git fetch --quiet', cwd, 15000, cid); } catch { /* best-effort */ }
 			invalidateGitStatusCache(cwd, cid);
 		}
 
@@ -8203,7 +8191,7 @@ async function handleApiRoute(
 		// keep the existing 400/500 behavior.
 		let result: Awaited<ReturnType<typeof batchGitStatus>> | undefined;
 		try {
-			result = await batchGitStatus(cwd, cid, { untracked: sessUntracked, configuredBaseRef: sessionBaseRef, runtime });
+			result = await batchGitStatus(cwd, cid, { untracked: sessUntracked, configuredBaseRef: sessionBaseRef });
 		} catch (err: any) {
 			if (!isMultiRepo) {
 				console.error("[git-status handler] error for session", id, "cwd=", cwd, "code=", err?.code, "signal=", err?.signal, "killed=", err?.killed, "stderr=", err?.stderr, "message=", err?.message);
@@ -8225,10 +8213,10 @@ async function handleApiRoute(
 			// upstream config.
 			if (!shouldSkipRemotePush()) {
 				if (!result.isOnPrimary && result.ahead > 0 && result.hasUpstream && result.branch) {
-					publishCurrentBranchToOrigin(cwd, result.branch, { containerId: cid, runtime }).catch(() => {});
+					publishCurrentBranchToOrigin(cwd, result.branch, { containerId: cid }).catch(() => {});
 				} else if (!result.isOnPrimary && !result.hasUpstream && result.branch && /^session\//.test(result.branch)) {
 					// Session branches without upstream: publish safely, then set tracking.
-					publishCurrentBranchToOrigin(cwd, result.branch, { containerId: cid, setUpstream: true, runtime }).catch(() => {});
+					publishCurrentBranchToOrigin(cwd, result.branch, { containerId: cid, setUpstream: true }).catch(() => {});
 				}
 			}
 			return;
@@ -8240,7 +8228,7 @@ async function handleApiRoute(
 		for (const { repo, worktreePath } of sessRepoWorktrees!) {
 			try {
 				if (cid || fs.existsSync(worktreePath)) {
-					const r = await batchGitStatus(worktreePath, cid, { untracked: sessUntracked, configuredBaseRef: sessionBaseRef, runtime });
+					const r = await batchGitStatus(worktreePath, cid, { untracked: sessUntracked, configuredBaseRef: sessionBaseRef });
 					if (r) repos[repo] = r;
 				}
 			} catch { /* per-repo failure non-fatal */ }
@@ -8290,10 +8278,10 @@ async function handleApiRoute(
 		// for a true (non-git-container) polyrepo is fine.
 		if (result && !shouldSkipRemotePush()) {
 			if (!result.isOnPrimary && result.ahead > 0 && result.hasUpstream && result.branch) {
-				publishCurrentBranchToOrigin(cwd, result.branch, { containerId: cid, runtime }).catch(() => {});
+				publishCurrentBranchToOrigin(cwd, result.branch, { containerId: cid }).catch(() => {});
 			} else if (!result.isOnPrimary && !result.hasUpstream && result.branch && /^session\//.test(result.branch)) {
 				// Session branches without upstream: publish safely, then set tracking.
-				publishCurrentBranchToOrigin(cwd, result.branch, { containerId: cid, setUpstream: true, runtime }).catch(() => {});
+				publishCurrentBranchToOrigin(cwd, result.branch, { containerId: cid, setUpstream: true }).catch(() => {});
 			}
 		}
 		return;
@@ -8476,7 +8464,6 @@ async function handleApiRoute(
 		if (!session) { json({ error: "Session not found" }, 404); return; }
 		const cwd = session.cwd;
 		const cid = session.sandboxed ? session.containerId : undefined;
-		const runtime = runtimeBin(projectContextManager.getContextForSession(id)?.projectConfigStore);
 		if (!cid && !fs.existsSync(cwd)) { json({ error: "Working directory not found" }, 404); return; }
 		const file = url.searchParams.get("file") || undefined;
 		// Per-repo diff routing (multi-repo sessions). `session.repoWorktrees` is
@@ -8488,7 +8475,7 @@ async function handleApiRoute(
 			if (entry) diffCwd = entry.worktreePath;
 		}
 		try {
-			const diff = await getGitDiff(diffCwd, file, cid, runtime);
+			const diff = await getGitDiff(diffCwd, file, cid);
 			json({ diff });
 		} catch (err: any) {
 			if (err.message === "INVALID_PATH") { json({ error: "Invalid file path" }, 400); return; }
@@ -8504,15 +8491,14 @@ async function handleApiRoute(
 		if (!session) { json({ error: 'Session not found' }, 404); return; }
 		const cwd = session.cwd;
 		const cid = session.sandboxed ? session.containerId : undefined;
-		const runtime = runtimeBin(projectContextManager.getContextForSession(id)?.projectConfigStore);
 		if (!cid && !fs.existsSync(cwd)) { json({ commits: [] }); return; }
 		try {
 			let branch = '';
-			try { branch = await execGit('git rev-parse --abbrev-ref HEAD', cwd, 5000, cid, runtime); }
+			try { branch = await execGit('git rev-parse --abbrev-ref HEAD', cwd, 5000, cid); }
 			catch { json({ commits: [] }); return; }
 
 			let hasUpstream = false;
-			try { await execGit(`git rev-parse --abbrev-ref ${branch}@{u}`, cwd, 5000, cid, runtime); hasUpstream = true; } catch {}
+			try { await execGit(`git rev-parse --abbrev-ref ${branch}@{u}`, cwd, 5000, cid); hasUpstream = true; } catch {}
 
 			const limit = 50;
 			const direction = url.searchParams.get('direction'); // 'behind' to show incoming commits
@@ -8522,14 +8508,14 @@ async function handleApiRoute(
 				// Compare against origin/<primary>
 				let primaryBranch = 'master';
 				try {
-					const remoteHead = await execGit('git symbolic-ref refs/remotes/origin/HEAD', cwd, 5000, cid, runtime);
+					const remoteHead = await execGit('git symbolic-ref refs/remotes/origin/HEAD', cwd, 5000, cid);
 					primaryBranch = remoteHead.replace('refs/remotes/origin/', '');
 				} catch {
-					try { await execGit('git rev-parse --verify refs/heads/master', cwd, 5000, cid, runtime); primaryBranch = 'master'; }
-					catch { try { await execGit('git rev-parse --verify refs/heads/main', cwd, 5000, cid, runtime); primaryBranch = 'main'; } catch {} }
+					try { await execGit('git rev-parse --verify refs/heads/master', cwd, 5000, cid); primaryBranch = 'master'; }
+					catch { try { await execGit('git rev-parse --verify refs/heads/main', cwd, 5000, cid); primaryBranch = 'main'; } catch {} }
 				}
 				let primaryRef = primaryBranch;
-				try { await execGit(`git rev-parse --verify origin/${primaryBranch}`, cwd, 5000, cid, runtime); primaryRef = `origin/${primaryBranch}`; } catch {}
+				try { await execGit(`git rev-parse --verify origin/${primaryBranch}`, cwd, 5000, cid); primaryRef = `origin/${primaryBranch}`; } catch {}
 				rangeSpec = direction === 'behind' ? `HEAD..${primaryRef}` : `${primaryRef}..HEAD`;
 			} else {
 				rangeSpec = direction === 'behind' && hasUpstream
@@ -8537,7 +8523,7 @@ async function handleApiRoute(
 					: hasUpstream ? '@{u}..HEAD' : `-${limit} HEAD`;
 			}
 
-			const out = await execGit(`git log --format="%H|%h|%s|%an|%aI" --shortstat ${rangeSpec}`, cwd, 10000, cid, runtime);
+			const out = await execGit(`git log --format="%H|%h|%s|%an|%aI" --shortstat ${rangeSpec}`, cwd, 10000, cid);
 			const lines = out.split('\n');
 			const commits: Array<{sha: string; shortSha: string; message: string; author: string; timestamp: string; filesChanged: number; insertions: number; deletions: number}> = [];
 
@@ -8577,7 +8563,6 @@ async function handleApiRoute(
 		if (!session) { json({ error: "Session not found" }, 404); return; }
 		const cwd = session.cwd;
 		const cid = session.sandboxed ? session.containerId : undefined;
-		const runtime = runtimeBin(projectContextManager.getContextForSession(id)?.projectConfigStore);
 		if (!cid && !fs.existsSync(cwd)) { json({ error: "Working directory not found" }, 404); return; }
 		// Use goal branch if available so we find the right PR even if the worktree HEAD diverged.
 		// For non-goal sessions, fall back to the session's persisted branch — needed for sandbox
@@ -8588,7 +8573,7 @@ async function handleApiRoute(
 		// (e.g. gateway assigns a different worktree name). Detect the real branch from the container.
 		if (cid && cwd) {
 			try {
-				const actualBranch = await execGit("git rev-parse --abbrev-ref HEAD", cwd, 5000, cid, runtime);
+				const actualBranch = await execGit("git rev-parse --abbrev-ref HEAD", cwd, 5000, cid);
 				if (actualBranch && actualBranch !== "HEAD") sessionBranch = actualBranch;
 			} catch { /* fall back to persisted branch */ }
 		}
@@ -8610,10 +8595,9 @@ async function handleApiRoute(
 		if (!session) { json({ error: "Session not found" }, 404); return; }
 		const cwd = session.cwd;
 		const cid = session.sandboxed ? session.containerId : undefined;
-		const runtime = runtimeBin(projectContextManager.getContextForSession(id)?.projectConfigStore);
 		if (!cid && !fs.existsSync(cwd)) { json({ error: "Working directory not found" }, 404); return; }
 		try {
-			const output = await execGit('git pull', cwd, 30000, cid, runtime);
+			const output = await execGit('git pull', cwd, 30000, cid);
 			invalidateGitStatusCache(cwd, cid);
 			json({ ok: true, output });
 		} catch (err: unknown) {
@@ -8631,12 +8615,11 @@ async function handleApiRoute(
 		if (!session) { json({ error: "Session not found" }, 404); return; }
 		const cwd = session.cwd;
 		const cid = session.sandboxed ? session.containerId : undefined;
-		const runtime = runtimeBin(projectContextManager.getContextForSession(id)?.projectConfigStore);
 		if (!cid && !fs.existsSync(cwd)) { json({ error: "Working directory not found" }, 404); return; }
 		try {
-			const branch = await execGit('git symbolic-ref --short HEAD', cwd, 5000, cid, runtime);
-			const upstream = await execGitSafe('git rev-parse --abbrev-ref --symbolic-full-name @{u}', cwd, "", cid, runtime);
-			const output = await publishCurrentBranchToOrigin(cwd, branch, { containerId: cid, setUpstream: !upstream, runtime });
+			const branch = await execGit('git symbolic-ref --short HEAD', cwd, 5000, cid);
+			const upstream = await execGitSafe('git rev-parse --abbrev-ref --symbolic-full-name @{u}', cwd, "", cid);
+			const output = await publishCurrentBranchToOrigin(cwd, branch, { containerId: cid, setUpstream: !upstream });
 			invalidateGitStatusCache(cwd, cid);
 			json({ ok: true, output });
 		} catch (err: unknown) {
@@ -8654,7 +8637,6 @@ async function handleApiRoute(
 		if (!session) { json({ error: "Session not found" }, 404); return; }
 		const cwd = session.cwd;
 		const cid = session.sandboxed ? session.containerId : undefined;
-		const runtime = runtimeBin(projectContextManager.getContextForSession(id)?.projectConfigStore);
 		if (!cid && !fs.existsSync(cwd)) { json({ error: "Working directory not found" }, 404); return; }
 		try {
 			// Honour project `base_ref` config. Squash-push fundamentally needs an
@@ -8671,28 +8653,28 @@ async function handleApiRoute(
 			let primaryBranch = parsedBase.branch;
 			if (!primaryBranch) {
 				try {
-					const remoteHead = await execGit("git symbolic-ref refs/remotes/origin/HEAD", cwd, 5000, cid, runtime);
+					const remoteHead = await execGit("git symbolic-ref refs/remotes/origin/HEAD", cwd, 5000, cid);
 					primaryBranch = remoteHead.replace("refs/remotes/origin/", "");
 				} catch {
-					try { await execGit("git rev-parse --verify refs/heads/master", cwd, 5000, cid, runtime); primaryBranch = "master"; }
-					catch { try { await execGit("git rev-parse --verify refs/heads/main", cwd, 5000, cid, runtime); primaryBranch = "main"; } catch { primaryBranch = "master"; } }
+					try { await execGit("git rev-parse --verify refs/heads/master", cwd, 5000, cid); primaryBranch = "master"; }
+					catch { try { await execGit("git rev-parse --verify refs/heads/main", cwd, 5000, cid); primaryBranch = "main"; } catch { primaryBranch = "master"; } }
 				}
 			}
 
 			// Fetch the remote primary; if origin has no such ref, refuse — squash
 			// push only makes sense for a remote primary.
-			try { await execGit(`git fetch origin ${primaryBranch}`, cwd, 30000, cid, runtime); }
+			try { await execGit(`git fetch origin ${primaryBranch}`, cwd, 30000, cid); }
 			catch { json({ error: `origin has no "${primaryBranch}" branch — squash push needs a remote primary. Check the project's base_ref configuration.` }, 400); return; }
 			const primaryRef = `origin/${primaryBranch}`;
 
 			// Check we have commits ahead
-			const aheadCount = parseInt(await execGit(`git rev-list --count ${primaryRef}..HEAD`, cwd, 5000, cid, runtime), 10) || 0;
+			const aheadCount = parseInt(await execGit(`git rev-list --count ${primaryRef}..HEAD`, cwd, 5000, cid), 10) || 0;
 			if (aheadCount === 0) { json({ error: `No commits ahead of ${primaryRef}` }, 400); return; }
 
 			// Build commit message from branch commits
-			const logOutput = await execGit(`git log --format="%s" ${primaryRef}..HEAD`, cwd, 5000, cid, runtime);
+			const logOutput = await execGit(`git log --format="%s" ${primaryRef}..HEAD`, cwd, 5000, cid);
 			const commitMessages = logOutput.trim().split("\n").filter(Boolean);
-			const branch = await execGit("git rev-parse --abbrev-ref HEAD", cwd, 5000, cid, runtime);
+			const branch = await execGit("git rev-parse --abbrev-ref HEAD", cwd, 5000, cid);
 			const summary = commitMessages.length === 1
 				? commitMessages[0]
 				: `Squash ${branch} (${commitMessages.length} commits)`;
@@ -8703,25 +8685,25 @@ async function handleApiRoute(
 
 			// Create squash commit on top of origin/master using plumbing (no checkout needed)
 			// 1. Create a tree that represents the merge result
-			const mergeTree = await execGit(`git merge-tree --write-tree ${primaryRef} HEAD`, cwd, 5000, cid, runtime);
+			const mergeTree = await execGit(`git merge-tree --write-tree ${primaryRef} HEAD`, cwd, 5000, cid);
 			// 2. Create a commit object with that tree, parented on origin/master
 			// For sandboxed sessions, write temp file inside container
 			const msgFile = cid ? `/tmp/SQUASH_MSG_${Date.now()}` : path.join(cwd, ".git", "SQUASH_MSG");
 			if (cid) {
-				await execFileAsync(runtime, [
+				await execFileAsync("docker", [
 					"exec", "-w", cwd, cid, "/bin/sh", "-c", `cat > ${msgFile} << 'BOBBIT_EOF'\n${fullMessage}\nBOBBIT_EOF`,
 				], { encoding: "utf-8", timeout: 5000, env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" } });
 			} else {
 				fs.writeFileSync(msgFile, fullMessage, "utf-8");
 			}
-			const squashCommit = await execGit(`git commit-tree ${mergeTree} -p ${primaryRef} -F "${msgFile}"`, cwd, 5000, cid, runtime);
+			const squashCommit = await execGit(`git commit-tree ${mergeTree} -p ${primaryRef} -F "${msgFile}"`, cwd, 5000, cid);
 			if (cid) {
-				await execGit(`rm -f ${msgFile}`, cwd, 5000, cid, runtime).catch(() => {});
+				await execGit(`rm -f ${msgFile}`, cwd, 5000, cid).catch(() => {});
 			} else {
 				fs.unlinkSync(msgFile);
 			}
 			// 3. Push that commit to master
-			await execGit(`git push origin ${squashCommit}:refs/heads/${primaryBranch}`, cwd, 30000, cid, runtime);
+			await execGit(`git push origin ${squashCommit}:refs/heads/${primaryBranch}`, cwd, 30000, cid);
 			invalidateGitStatusCache(cwd, cid);
 
 			json({ ok: true, output: `Squash pushed ${aheadCount} commit${aheadCount > 1 ? "s" : ""} to ${primaryBranch}` });
@@ -8744,7 +8726,6 @@ async function handleApiRoute(
 		if (!session) { json({ error: "Session not found" }, 404); return; }
 		const cwd = session.cwd;
 		const cid = session.sandboxed ? session.containerId : undefined;
-		const runtime = runtimeBin(projectContextManager.getContextForSession(id)?.projectConfigStore);
 		if (!cid && !fs.existsSync(cwd)) { json({ error: "Working directory not found" }, 404); return; }
 		try {
 			// Honour project `base_ref` config when set (mirrors the git-status
@@ -8761,11 +8742,11 @@ async function handleApiRoute(
 			let primaryBranch = parsedBase.branch;
 			if (!primaryBranch) {
 				try {
-					const remoteHead = await execGit("git symbolic-ref refs/remotes/origin/HEAD", cwd, 5000, cid, runtime);
+					const remoteHead = await execGit("git symbolic-ref refs/remotes/origin/HEAD", cwd, 5000, cid);
 					primaryBranch = remoteHead.replace("refs/remotes/origin/", "");
 				} catch {
-					try { await execGit("git rev-parse --verify refs/heads/master", cwd, 5000, cid, runtime); primaryBranch = "master"; }
-					catch { try { await execGit("git rev-parse --verify refs/heads/main", cwd, 5000, cid, runtime); primaryBranch = "main"; } catch { primaryBranch = "master"; } }
+					try { await execGit("git rev-parse --verify refs/heads/master", cwd, 5000, cid); primaryBranch = "master"; }
+					catch { try { await execGit("git rev-parse --verify refs/heads/main", cwd, 5000, cid); primaryBranch = "main"; } catch { primaryBranch = "master"; } }
 				}
 			}
 
@@ -8773,23 +8754,23 @@ async function handleApiRoute(
 			// else fall back to the bare local branch (matches `pref` semantics
 			// in `git-status-native.ts`).
 			let primaryRef = primaryBranch;
-			try { await execGit(`git rev-parse --verify origin/${primaryBranch}`, cwd, 5000, cid, runtime); primaryRef = `origin/${primaryBranch}`; } catch { /* use local */ }
+			try { await execGit(`git rev-parse --verify origin/${primaryBranch}`, cwd, 5000, cid); primaryRef = `origin/${primaryBranch}`; } catch { /* use local */ }
 
 			// Only fetch when we're actually targeting the remote.
 			if (primaryRef.startsWith("origin/")) {
-				await execGit(`git fetch origin ${primaryBranch}`, cwd, 30000, cid, runtime);
+				await execGit(`git fetch origin ${primaryBranch}`, cwd, 30000, cid);
 			}
-			const output = await execGit(`git rebase ${primaryRef}`, cwd, 30000, cid, runtime);
+			const output = await execGit(`git rebase ${primaryRef}`, cwd, 30000, cid);
 
 			// After rebase, check if orphaned commits remain (common after squash-merge PRs).
 			// If the tree is identical to the primary ref (no diff), the commits are redundant —
 			// reset to the primary ref to clean them up.
-			const aheadAfter = parseInt(await execGitSafe(`git rev-list --count ${primaryRef}..HEAD`, cwd, "0", cid, runtime), 10) || 0;
+			const aheadAfter = parseInt(await execGitSafe(`git rev-list --count ${primaryRef}..HEAD`, cwd, "0", cid), 10) || 0;
 			if (aheadAfter > 0) {
-				const diff = await execGitSafe(`git diff ${primaryRef}..HEAD`, cwd, "", cid, runtime);
+				const diff = await execGitSafe(`git diff ${primaryRef}..HEAD`, cwd, "", cid);
 				if (diff.trim() === "") {
 					// Tree is identical — these are orphaned commits from a squash merge
-					await execGit(`git reset --hard ${primaryRef}`, cwd, 10000, cid, runtime);
+					await execGit(`git reset --hard ${primaryRef}`, cwd, 10000, cid);
 					invalidateGitStatusCache(cwd, cid);
 					json({ ok: true, output: `Rebased and reset ${aheadAfter} orphaned commit(s) from squash merge` });
 					return;
@@ -9511,7 +9492,7 @@ async function handleApiRoute(
 		const body = await readBody(req);
 		if (!body?.command) { json({ error: "command is required" }, 400); return; }
 		try {
-			const info = bgProcessManager.create(id, body.command, session.cwd, session.containerId, session.sandboxed, body.name, runtimeBin(projectContextManager.getContextForSession(id)?.projectConfigStore));
+			const info = bgProcessManager.create(id, body.command, session.cwd, session.containerId, session.sandboxed, body.name);
 			json(info, 201);
 		} catch (err: any) {
 			if (err?.message?.includes("Sandboxed session without containerId")) {
