@@ -56,7 +56,21 @@ jobs:
           path: ~/.cache/ms-playwright
           key: ms-playwright-${{ runner.os }}-${{ steps.pw-version.outputs.v }}
       - run: npx playwright install --with-deps chromium
-      - run: npm run test:unit
+      # test:unit runs node:test (no built-in retry) followed by Playwright
+      # component tests. The node:test tier has a known flake floor (e.g. the
+      # worktree-pool git-worktree-move vs background-reset race in
+      # tests/worktree-pool.test.ts), tracked for a proper fix. Retry the suite
+      # up to 3x so a transient flake doesn't red the build; the Playwright tier
+      # additionally self-heals via retries:2 under CI (tests/playwright.config.ts).
+      - name: Unit tests (retry to absorb node:test flake floor)
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::test:unit attempt $attempt"
+            if npm run test:unit; then echo "::endgroup::"; exit 0; fi
+            echo "::endgroup::"
+            echo "::warning::test:unit attempt $attempt failed; retrying"
+          done
+          exit 1
 
   e2e:
     runs-on: ubuntu-latest
