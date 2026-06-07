@@ -3,33 +3,49 @@
  *
  * Manual repro (reported by user):
  *   1. Open a goal-assistant session; agent streams a `propose_goal`.
- *   2. Add an inline comment on the spec.
- *   3. Navigate away (sidebar click, browser back, anywhere).
+ *   2. (Optionally) add an inline comment on the spec.
+ *   3. Navigate away (sidebar click, browser back, full reload — anywhere).
  *   4. Navigate back to the same session.
  *   5. Panel is still visible (correct), but the spec body is empty (BUG)
- *      and an "orphaned annotations" UI appears because the in-memory
- *      annotation cache survived but its anchored text didn't.
+ *      and — if a comment was added — an "orphaned annotations" UI appears
+ *      because the in-memory annotation cache survived but its anchored
+ *      text didn't.
  *
- * Three plausible causes (this test isolates which):
+ * This file pins the user-visible contract across THREE navigation shapes:
  *
- *   A) connectToSession fast-path (session-manager.ts:817) unconditionally
- *      `delete state.activeProposals.goal` on switch-back, then the WS
- *      rehydrate `proposal_update {source:"rehydrate"}` event arrives but
- *      its fields don't include the spec.
+ *   1. sidebar nav (the `connectToSession` fast-path — cached chatPanel reuse)
+ *   2. full page reload (the slow-path fresh connect + WS-auth rehydrate)
+ *   3. fast-path nav AFTER an inline comment — additionally asserts no
+ *      "orphaned annotations" UI appears (the comment must re-anchor).
  *
- *   B) syncProposalFormState's identity-key guard (render.ts:2067) keeps
- *      `_proposalSpec` stale at "" because `_proposalInitializedFrom`
- *      matches a degenerate empty key.
+ * Three plausible causes (the diagnostics dump below isolates which):
  *
- *   C) The on-disk proposal draft (`proposal-drafts/<sid>/goal.md`) didn't
- *      get the spec written by `propose_goal`, so the rehydrate brings
- *      back fields with `spec=""`.
+ *   A) connectToSession fast-path (session-manager.ts) drops + re-fetches the
+ *      proposal slot on switch-back, but the rehydrate path that repopulates
+ *      it (`rehydrateProposalsForSession` → unified `onProposal`) restores
+ *      `state.activeProposals.goal.fields` only and never touches the
+ *      assistant form-mirror `state.previewSpec` that the rendered body is
+ *      bound to.
  *
- * The test asserts the user-visible contract: after navigate-away/back the
- * goal proposal panel must still show the same spec body the user
- * commented on. If it fails, the diagnostics block prints the rehydrate
- * payload, the live `state.activeProposals.goal.fields`, and the
- * `_proposalSpec` form-mirror so we can pinpoint A/B/C.
+ *   B) The goal-assistant body is bound to `state.previewSpec`
+ *      (proposal-panels.ts `goalPreviewPanel` → `renderGoalForm({ spec:
+ *      state.previewSpec })`), NOT the non-assistant `_proposalSpec` mirror —
+ *      so any `syncProposalFormState` identity-key staleness is downstream of
+ *      whatever leaves `state.previewSpec` empty.
+ *
+ *   C) The on-disk persistence the restore paths read from is missing the
+ *      spec:
+ *        - the goal DRAFT (`GET /api/sessions/<sid>/draft?type=goal`,
+ *          restored by `restoreGoalDraft` → `state.previewSpec`), and/or
+ *        - the proposal FILE (`GET /api/sessions/<sid>/proposals`, restored
+ *          by the rehydrate path → `state.activeProposals.goal.fields`).
+ *
+ * The rendered <commentable-markdown> `.markdown` property reflects
+ * `state.previewSpec` (falling back to the "_No spec content yet_"
+ * placeholder when empty), so the assertions read it directly. On failure
+ * the `[DIAG]` block prints the rehydrate payload, the on-disk goal draft,
+ * the live `state.activeProposals.goal.fields`, the live `state.previewSpec`
+ * form-mirror, and the `previewSpecEdited` flag so we can pinpoint A/B/C.
  */
 import { test, expect } from "../gateway-harness.js";
 import type { Page } from "@playwright/test";
@@ -75,26 +91,84 @@ async function getRenderedSpecText(page: Page): Promise<string> {
 	});
 }
 
-/** Read the in-memory live state for diagnostics on failure. */
-async function dumpProposalState(page: Page): Promise<Record<string, unknown>> {
-	return page.evaluate(() => {
+/**
+ * Pull both server-side persistence stores AND the live in-memory state so a
+ * single dump isolates A vs B vs C. Runs inside the page so it reuses the
+ * authenticated gateway origin + token (mirrors `gatewayFetch`).
+ */
+async function captureDiagnostics(page: Page, sid: string): Promise<Record<string, unknown>> {
+	return page.evaluate(async (sid) => {
+		const url = localStorage.getItem("gateway.url") || window.location.origin;
+		const token = localStorage.getItem("gateway.token") || "";
+		const gf = async (path: string) => {
+			try {
+				const r = await fetch(`${url}${path}`, {
+					headers: { Authorization: `Bearer ${token}` },
+				});
+				if (!r.ok) return { __status: r.status };
+				return await r.json();
+			} catch (e) {
+				return { __err: String(e) };
+			}
+		};
+		const proposalsPayload = await gf(`/api/sessions/${sid}/proposals`);
+		const draftEnvelope: any = await gf(`/api/sessions/${sid}/draft?type=goal`);
+		const onDiskDraft = draftEnvelope && typeof draftEnvelope === "object" && "data" in draftEnvelope
+			? draftEnvelope.data
+			: draftEnvelope;
 		const s = (window as any).bobbitState;
 		const slot = s?.activeProposals?.goal;
-		// _proposalSpec is module-scoped inside render.ts; expose via the
-		// data-panel's <commentable-markdown> .markdown property which is
-		// fed from `config.spec` (= `_proposalSpec`).
 		const cm = document.querySelector("commentable-markdown") as any;
+		const specOf = (v: unknown) =>
+			typeof v === "string" ? { len: v.length, preview: v.slice(0, 80) } : v ?? null;
 		return {
-			selectedSessionId: s?.selectedSessionId ?? null,
-			slotPresent: slot != null,
-			slotFieldsKeys: slot ? Object.keys(slot.fields ?? {}) : null,
-			slotSpecLen: typeof slot?.fields?.spec === "string" ? slot.fields.spec.length : null,
-			slotTitle: slot?.fields?.title ?? null,
-			renderedMarkdownLen: typeof cm?.markdown === "string" ? cm.markdown.length : null,
-			renderedMarkdownPreview:
-				typeof cm?.markdown === "string" ? cm.markdown.slice(0, 80) : null,
+			// (C) proposal FILE — what the rehydrate path reads.
+			rehydratePayload: proposalsPayload,
+			// (C) goal DRAFT — what restoreGoalDraft reads.
+			onDiskGoalDraft_previewSpec: specOf(onDiskDraft?.previewSpec),
+			onDiskGoalDraft_activeGoalProposalSpec: specOf(onDiskDraft?.activeGoalProposal?.fields?.spec),
+			onDiskGoalDraft_keys: onDiskDraft && typeof onDiskDraft === "object" ? Object.keys(onDiskDraft) : null,
+			// (A) live proposal slot fields (rehydrate target).
+			liveSlotSpec: specOf(slot?.fields?.spec),
+			liveSlotTitle: slot?.fields?.title ?? null,
+			// (A/B) live form-mirror — the rendered body is bound to THIS.
+			statePreviewSpec: specOf(s?.previewSpec),
+			statePreviewSpecEdited: s?.previewSpecEdited ?? null,
+			stateAssistantType: s?.assistantType ?? null,
+			// rendered DOM
+			renderedMarkdown: specOf(cm?.markdown),
 		};
-	});
+	}, sid);
+}
+
+/**
+ * Poll the rendered spec body until it equals `expected`. On timeout, dump
+ * the A/B/C diagnostics to the Node-side test log and re-throw the ORIGINAL
+ * assertion error (so the failure message stays about the assertion, not the
+ * diagnostics fetch).
+ */
+async function expectSpecRestored(
+	page: Page,
+	sid: string,
+	expected: string,
+	label: string,
+): Promise<void> {
+	try {
+		await expect(async () => {
+			const rendered = await getRenderedSpecText(page);
+			expect(rendered, "rendered markdown after nav-back").toBe(expected);
+		}).toPass({ timeout: 15_000, intervals: [500, 1000, 2000] });
+	} catch (err) {
+		try {
+			const diag = await captureDiagnostics(page, sid);
+			// eslint-disable-next-line no-console
+			console.log(`\n[DIAG ${label}]\n${JSON.stringify(diag, null, 2)}\n`);
+		} catch (diagErr) {
+			// eslint-disable-next-line no-console
+			console.log(`\n[DIAG ${label}] capture failed: ${String(diagErr)}\n`);
+		}
+		throw err;
+	}
 }
 
 test.describe("Goal proposal spec survives navigate-away/back", () => {
@@ -102,32 +176,12 @@ test.describe("Goal proposal spec survives navigate-away/back", () => {
 		await waitForHealth();
 	});
 
-	// QUARANTINED (test.fixme): this @repro is RED again — the goal-proposal
-	// spec body is lost after navigate-away/back even though PR #602
-	// ("Fix goal-proposal spec rehydrate") is present. The regression was
-	// surfaced once the E2E suite stopped hanging at teardown (the hang
-	// previously prevented the suite from ever reaching this test). It is a
-	// client-side proposal-rehydrate bug, entirely unrelated to the E2E
-	// exit-hang fix that re-quarantined it. It is tracked in a dedicated
-	// follow-up goal (goal state is runtime, not committed to this repo), not
-	// in git; flip back to test(...) when the rehydrate fix lands.
-	//
-	// EXPLICIT USER PERMISSION TO QUARANTINE (satisfies the exit-hang goal's
-	// hard constraint "do NOT disable any test without explicit user
-	// permission"): on 2026-06-06 the human owner was presented with the
-	// options (fix-now / re-quarantine+separate-goal / leave-red / investigate)
-	// and explicitly chose: "Re-quarantine that one test (test.fixme) so the
-	// gate passes and the exit-hang fix ships now — and I file a SEPARATE goal
-	// to fix the rehydrate regression." This quarantine is that authorized
-	// action; the separate follow-up goal carries the actual fix.
-	test.fixme("@repro spec body persists after sidebar nav + return", async ({ page }) => {
+	test("@repro spec body persists after sidebar nav + return", async ({ page }) => {
 		await openGoalAssistantWithProposal(page);
 
 		// Capture the spec body the user is about to comment on. This is
 		// the rendered <commentable-markdown>'s `markdown` property which
-		// reflects the LIVE form-mirror state regardless of which path
-		// (assistant `state.previewSpec` or proposal-panel
-		// `state.activeProposals.goal.fields.spec`) populates it.
+		// reflects the LIVE form-mirror state (`state.previewSpec`).
 		const originalSpec = await getRenderedSpecText(page);
 		expect(originalSpec.length, "proposal spec must be non-empty before nav").toBeGreaterThan(20);
 
@@ -147,7 +201,7 @@ test.describe("Goal proposal spec survives navigate-away/back", () => {
 		await expect(page.locator("textarea").first()).toBeVisible({ timeout: 15_000 });
 
 		// Navigate back to session A.
-		await navigateToHash(page, `#/session/${sidA}`);
+		await navigateToHash(page, `#/session/${sidA!}`);
 		await expect(page.locator("textarea").first()).toBeVisible({ timeout: 15_000 });
 
 		// Wait for the goal-proposal panel to re-render. The fast-path
@@ -156,9 +210,109 @@ test.describe("Goal proposal spec survives navigate-away/back", () => {
 		const panelAfter = page.locator('[data-panel="goal-proposal"]').first();
 		await expect(panelAfter).toBeVisible({ timeout: 15_000 });
 
-		await expect(async () => {
-			const rendered = await getRenderedSpecText(page);
-			expect(rendered, `rendered markdown after nav-back`).toBe(originalSpec);
-		}).toPass({ timeout: 15_000, intervals: [500, 1000, 2000] });
+		await expectSpecRestored(page, sidA!, originalSpec, "fast-path/sidebar-nav");
+	});
+
+	test("@repro spec body persists after full page reload", async ({ page }) => {
+		await openGoalAssistantWithProposal(page);
+
+		const originalSpec = await getRenderedSpecText(page);
+		expect(originalSpec.length, "proposal spec must be non-empty before reload").toBeGreaterThan(20);
+
+		const sidA = await page.evaluate(
+			() => (window as any).bobbitState?.selectedSessionId as string | null,
+		);
+		expect(sidA, "must have an active session id").toBeTruthy();
+
+		// Full reload — exercises the slow-path fresh connect + the WS-auth
+		// `proposal_update {source:"rehydrate"}` broadcast (a different
+		// restore path than the fast-path REST rehydrate above).
+		await page.reload();
+		await expect(
+			page.locator("button").filter({ hasText: "Settings" }).first(),
+		).toBeVisible({ timeout: 20_000 });
+		await page.waitForFunction(
+			(sid) => (window as any).bobbitState?.selectedSessionId === sid,
+			sidA,
+			{ timeout: 20_000 },
+		);
+
+		const panelAfter = page.locator('[data-panel="goal-proposal"]').first();
+		await expect(panelAfter).toBeVisible({ timeout: 20_000 });
+
+		await expectSpecRestored(page, sidA!, originalSpec, "full-reload");
+	});
+
+	test("@repro inline comment re-anchors after nav + no orphaned-annotations UI", async ({ page }) => {
+		const panel = await openGoalAssistantWithProposal(page);
+
+		const originalSpec = await getRenderedSpecText(page);
+		expect(originalSpec.length, "proposal spec must be non-empty before nav").toBeGreaterThan(20);
+
+		const sidA = await page.evaluate(
+			() => (window as any).bobbitState?.selectedSessionId as string | null,
+		);
+		expect(sidA, "must have an active session id").toBeTruthy();
+
+		// Add an inline comment anchored to a phrase the spec body contains.
+		// Mirrors proposal-inline-comments.spec.ts::injectAnnotation — drives
+		// the same backend + annotation-change event the popover-submit path
+		// emits (driving real text-annotator selection is too flaky for E2E).
+		await page.evaluate(() => {
+			const sid = (window as any).bobbitState?.selectedSessionId as string;
+			if (!sid) throw new Error("no active session id");
+			const cm: any = document.querySelector("commentable-markdown");
+			if (!cm) throw new Error("no <commentable-markdown> in DOM");
+			const rd: any = cm.querySelector("review-document");
+			if (!rd) throw new Error("no <review-document> inside <commentable-markdown>");
+			const backend = rd.backend;
+			if (!backend) throw new Error("review-document.backend missing");
+			const bucket = "proposal:goal";
+			const quote = "test goal created";
+			const md = (window as any).bobbitState?.activeProposals?.goal?.fields?.spec ?? "";
+			const start = md.indexOf(quote);
+			const ann = {
+				id: `e2e-ann-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+				quote,
+				comment: "Please clarify this sentence",
+				start: start >= 0 ? start : 0,
+				end: start >= 0 ? start + quote.length : quote.length,
+			};
+			backend.add({ sessionId: sid, bucket }, ann);
+			cm.dispatchEvent(
+				new CustomEvent("annotation-change", {
+					detail: { count: backend.count({ sessionId: sid, bucket }) },
+					bubbles: true,
+					composed: true,
+				}),
+			);
+		});
+
+		// The comment badge confirms the annotation registered.
+		await expect(panel.locator('[data-testid="proposal-comment-count"]')).toBeVisible({
+			timeout: 5_000,
+		});
+
+		// Nav away (fast-path) and back.
+		const sidB = await createSession();
+		await navigateToHash(page, `#/session/${sidB}`);
+		await expect(page.locator("textarea").first()).toBeVisible({ timeout: 15_000 });
+		await navigateToHash(page, `#/session/${sidA!}`);
+		await expect(page.locator("textarea").first()).toBeVisible({ timeout: 15_000 });
+
+		const panelAfter = page.locator('[data-panel="goal-proposal"]').first();
+		await expect(panelAfter).toBeVisible({ timeout: 15_000 });
+
+		// 1. Spec body must come back (so the annotation has text to anchor to).
+		await expectSpecRestored(page, sidA!, originalSpec, "inline-comment/fast-path");
+
+		// 2. No "orphaned annotations" UI: the comment must re-anchor against
+		//    the restored body. On the buggy path the body is empty, the quote
+		//    can't be found, and the annotation falls into the "Detached
+		//    Comments" list with an "… orphaned" re-anchor banner.
+		await expect(
+			page.locator(".review-detached"),
+			"orphaned-annotations UI must not appear after nav-back",
+		).toHaveCount(0, { timeout: 5_000 });
 	});
 });

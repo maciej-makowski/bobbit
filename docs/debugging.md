@@ -18,7 +18,7 @@ Scannable checklists for common issues. Each entry: symptom → where to look �
 - **Diagnostic that nailed it**: log `process.getActiveResourcesInfo()` in the worker `gateway` fixture teardown (`tests/e2e/gateway-harness.ts`) immediately after `await gw.shutdown()`. A lingering `ProcessWrap` plus a stdio `PipeWrap` triplet (stdin/stdout/stderr) means a blocked **child process**, not a leaked timer or socket. Confirm with the live process tree: `git tag` → `nvim …/TAG_EDITMSG` parented under the test worker.
 - **Fix**: route every fixture git invocation through the hermetic, non-interactive runner in `tests/test-utils/git-fixture.ts` (`createGitFixtureRepo` to scaffold a repo, `runFixtureGit` / `gitFixtureEnv` for ad-hoc calls). It neutralises the host config (`GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM = /dev/null`), forbids prompts (`GIT_TERMINAL_PROMPT=0`), makes any editor a no-op (`GIT_EDITOR=true`), supplies a commit/author identity, and passes `-c commit.gpgsign=false -c tag.gpgsign=false` per call — so tags stay lightweight and no editor is ever spawned. The base-ref fixtures were migrated to it. Full rationale: [testing-strategy.md — Git fixtures must be hermetic](testing-strategy.md#git-fixtures-must-be-hermetic).
 - **Prevention**: never shell out to git from a test with a bare `execFileSync("git", …, { cwd })` — use `runFixtureGit(cwd, args)` (or `createGitFixtureRepo` for repo setup) so the hermetic env is always inherited. Host-independent regression guard: `tests/git-fixture-noninteractive.test.ts` injects a hostile `tag.gpgsign=true` global config plus a fast-failing `GIT_EDITOR=false` (never a blocking editor) and asserts the fixture creates a tag promptly without invoking an editor — RED on a non-hermetic helper, GREEN after the fix.
-- **Unrelated failure that surfaced once the suite started exiting**: with the hang fixed and the suite running to completion, the pre-existing `proposal-spec-survives-navigate` E2E reproducer began failing deterministically. It was re-quarantined (`test.fixme`) with explicit user permission and is tracked in a dedicated follow-up goal (goal state is runtime, not committed to git) — it is not part of this fix and the quarantine was left untouched.
+- **Unrelated failure that surfaced once the suite started exiting**: with the hang fixed and the suite running to completion, the pre-existing `proposal-spec-survives-navigate` E2E reproducer began failing deterministically. It was re-quarantined (`test.fixme`) with explicit user permission and deferred to a dedicated follow-up goal — not part of the exit-hang fix. That goal has since landed the fix and re-activated the reproducer; see [Goal-assistant spec body empty after navigate-away/back](#goal-assistant-spec-body-empty-after-navigate-awayback).
 
 ## Gate verification stuck on a `human-signoff` step
 
@@ -1024,6 +1024,14 @@ Only renders when (a) the session is archived, (b) it has no `goalId`, (c) it ha
 ## Proposal panel empty after reload
 
 `proposal_update` events that arrive before the proposal panel UI binds its handler are buffered in `_bufferedProposalEvents` inside `src/app/remote-agent.ts` (getter/setter on the handler property). Rehydrate-on-attach can race ahead of UI wiring; the buffer is the entry point for diagnosis.
+
+## Goal-assistant spec body empty after navigate-away/back
+
+**Symptom:** A goal-assistant session that streamed a `propose_goal` shows the proposal panel after sidebar nav + return (or full reload), but the spec body is blank (`_No spec content yet_`); inline comments orphan with a `.review-detached` re-anchor banner.
+
+**Root cause:** The goal-assistant body binds to `state.previewSpec`, not the proposal slot. Both rehydrate entry points (the `connectToSession` fast-path and the full-reload WS `proposal_update {source:"rehydrate"}`) funnel only through the unified `onProposal`, which repopulated `state.activeProposals.goal.fields` but never the `previewSpec` form-mirror; the racy 300 ms goal-draft debounce was the only re-seed and often missed (404) or wrote `previewSpec:""`.
+
+**Fix:** `src/app/session-manager.ts` — unified `onProposal` mirrors `fields.{title,spec,cwd,workflow}` into the form-mirror when `assistantType === "goal"` and unedited (`:1647`); `serialize()` prefers the populated slot over an empty mirror (`:398`); the slow-path `!restored` branch mirrors the live slot instead of blanking (`:2073`). Pinned by `tests/e2e/ui/proposal-spec-survives-navigate.spec.ts` (3 variants) + `tests/proposal-rehydrate{,-client,-mirror}.test.ts`. Full record: [docs/design/proposal-spec-rehydrate.md](design/proposal-spec-rehydrate.md).
 
 ## Inline-comment annotations on goal/role/staff proposals
 
