@@ -35,7 +35,19 @@ import type {
 	VolumeMount,
 } from "./types.js";
 
-const execFileAsync = promisify(execFileCb);
+const defaultExecFileAsync = promisify(execFileCb);
+
+/**
+ * Injectable execFile implementation. Production uses the promisified
+ * node:child_process execFile; tests pass a fake that records `(file, args,
+ * options)` and returns canned `{stdout, stderr}` so the contract/unit tests
+ * run without a real docker/podman binary.
+ */
+export type ExecFileFn = (
+	file: string,
+	args: string[],
+	options: { timeout?: number; env?: NodeJS.ProcessEnv; maxBuffer?: number; cwd?: string } | undefined,
+) => Promise<{ stdout: string; stderr: string }>;
 
 /** Per-runtime hooks for the otherwise-shared `run` arg builder. */
 export interface RunArgHooks {
@@ -125,6 +137,12 @@ export abstract class BaseCliRuntime implements ContainerRuntime {
 	}
 
 	private _resourceLimits: { cpus: number; memBytes: number } | null | undefined;
+	protected readonly execFileFn: ExecFileFn;
+
+	constructor(execFileFn?: ExecFileFn) {
+		this.execFileFn = execFileFn
+			?? ((file, args, options) => defaultExecFileAsync(file, args, options) as unknown as Promise<{ stdout: string; stderr: string }>);
+	}
 
 	/** Env config for runtime commands — suppresses MSYS path mangling on Windows. */
 	protected runtimeEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
@@ -164,13 +182,13 @@ export abstract class BaseCliRuntime implements ContainerRuntime {
 		options?: { timeout?: number; env?: NodeJS.ProcessEnv; maxBuffer?: number; cwd?: string },
 	): Promise<ExecResult> {
 		if (!cpuDiagnosticsEnabled()) {
-			return await execFileAsync(this.bin, args as string[], options) as unknown as ExecResult;
+			return await this.execFileFn(this.bin, args as string[], options);
 		}
 		const start = performance.now();
 		let success = 0;
 		let errorCode = "none";
 		try {
-			const result = await execFileAsync(this.bin, args as string[], options) as unknown as ExecResult;
+			const result = await this.execFileFn(this.bin, args as string[], options);
 			success = 1;
 			return result;
 		} catch (err) {
