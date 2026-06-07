@@ -7,7 +7,6 @@ import { bobbitDir, bobbitStateDir, globalAgentDir } from "../bobbit-dir.js";
 import { TOOLS_DIR, type ToolManager } from "./tool-manager.js";
 import { THINKING_LEVELS } from "../../shared/thinking-levels.js";
 import { ensurePiAiBedrockHeadersPatch } from "./pi-ai-bedrock-headers-patch.js";
-import { type RuntimeBin, DEFAULT_RUNTIME_BIN } from "./runtime-bin.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Builtin tools directory — dist/server/defaults/tools/ (read-only, shipped with Bobbit). */
@@ -50,8 +49,6 @@ export interface RpcBridgeOptions {
 	gatewayToken?: string;
 	/** Container ID to use with docker exec (from sandbox pool) */
 	containerId?: string;
-	/** Container CLI binary to spawn ("docker" | "podman"). Defaults to "docker". */
-	runtimeBin?: RuntimeBin;
 	/** Tool manager for resolving extension paths (optional — falls back to TOOLS_DIR). */
 	toolManager?: ToolManager;
 	/**
@@ -575,7 +572,7 @@ export class RpcBridge {
 
 		// Host-side spawn doesn't need a specific cwd — the container working
 		// directory is set via `docker exec -w` above.
-		return spawn(this.options.runtimeBin ?? DEFAULT_RUNTIME_BIN, execArgs, {
+		return spawn("docker", execArgs, {
 			stdio: ["pipe", "pipe", "pipe"],
 			env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" },
 		});
