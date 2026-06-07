@@ -15,9 +15,13 @@
  * "Failed to execute 'setItem' on 'Storage'" string in the sidebar right before
  * the UI loaded.
  *
- * These helpers swallow all storage exceptions so callers can treat
- * persistence as best-effort. This is the single source of truth — prefer it
- * over scattered inline `try { localStorage… } catch {}` blocks.
+ * These helpers never let a storage exception escape so callers can treat
+ * persistence as best-effort. Failures are not silent, though: each swallowed
+ * exception is warn-logged (once per failed call) before the fallback is
+ * returned, so quota/security/corruption problems stay observable in the
+ * console without ever aborting a code path. This is the single source of
+ * truth — prefer it over scattered inline `try { localStorage… } catch {}`
+ * blocks.
  */
 
 function hasLocalStorage(): boolean {
@@ -25,7 +29,11 @@ function hasLocalStorage(): boolean {
 		return typeof localStorage !== "undefined";
 	} catch {
 		// Accessing `localStorage` itself can throw (SecurityError) in some
-		// locked-down contexts.
+		// locked-down contexts. Deliberately silent: this probe (and the
+		// SSR/`localStorage`-undefined early returns below) are EXPECTED,
+		// non-error conditions that recur on every call in non-browser/SSR
+		// contexts — warning here would spam the console. Only genuine
+		// access failures inside the wrappers below are warn-logged.
 		return false;
 	}
 }
@@ -35,8 +43,9 @@ export function safeSetItem(key: string, value: string): void {
 	if (!hasLocalStorage()) return;
 	try {
 		localStorage.setItem(key, value);
-	} catch {
-		/* quota exceeded / storage disabled / SSR — persistence is best-effort */
+	} catch (err) {
+		// Quota exceeded / storage disabled — persistence is best-effort.
+		console.warn("[safe-storage] setItem(" + key + ") failed (persistence is best-effort):", err);
 	}
 }
 
@@ -45,8 +54,8 @@ export function safeRemoveItem(key: string): void {
 	if (!hasLocalStorage()) return;
 	try {
 		localStorage.removeItem(key);
-	} catch {
-		/* storage disabled / SSR */
+	} catch (err) {
+		console.warn("[safe-storage] removeItem(" + key + ") failed (persistence is best-effort):", err);
 	}
 }
 
@@ -55,7 +64,8 @@ export function safeGetItem(key: string): string | null {
 	if (!hasLocalStorage()) return null;
 	try {
 		return localStorage.getItem(key);
-	} catch {
+	} catch (err) {
+		console.warn("[safe-storage] getItem(" + key + ") failed (persistence is best-effort):", err);
 		return null;
 	}
 }
@@ -66,11 +76,16 @@ export function safeGetItem(key: string): string | null {
  * bad write can never break module load via an uncaught `SyntaxError`).
  */
 export function safeGetJSON<T>(key: string, fallback: T): T {
+	// Read delegates to `safeGetItem`, which already warns once on a storage
+	// read failure (and returns null → fallback here, no extra warn). Only the
+	// JSON.parse branch below adds its own warn, so corrupted JSON → 1 warn and
+	// a read failure → 1 warn (never two).
 	const raw = safeGetItem(key);
 	if (raw === null) return fallback;
 	try {
 		return JSON.parse(raw) as T;
-	} catch {
+	} catch (err) {
+		console.warn("[safe-storage] parse(" + key + ") failed (using fallback):", err);
 		return fallback;
 	}
 }
