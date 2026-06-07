@@ -55,9 +55,7 @@ Primary branch is **`master`** (not `main`). Never create a `main` branch.
 
 **Worktrees**: dev server runs from the **primary worktree** on `master`. Sessions use separate worktrees under `<project-root>-wt/<branch>/` (single-repo) or `<project-root>-wt/<branch>/<repo>/` (multi-repo). Branch namespaces: `pool/_pool-<id>`, `session/<id8>`, `goal/<slug>-<id>`, `staff-<name>-<id>`. Multi-repo: every component repo gets a sibling worktree on the same branch. Start-point: project `base_ref` else remote primary — see [docs/design/base-ref.md](docs/design/base-ref.md).
 
-**Always edit files in your session worktree, never in the primary worktree.** For infra files: edit here → commit → push → pull from primary. Pushing to remote `master` does NOT update the dev server — `cd <primary-worktree> && git pull origin master`.
-
-**Opening PRs on fork**: when working on forks of the main repository, make sure to open PRs on fork master branch not the original repository master branch. 
+**Always edit files in your session worktree, never in the primary worktree.** For infra files: edit here → commit → push → pull from primary. Pushing to remote `master` does NOT update the dev server — `cd <primary-worktree> && git pull origin master`. On forks, open PRs against the fork's `master`, never the upstream repo's.
 
 See [docs/dev-workflow.md](docs/dev-workflow.md) for the full worktree story — including the worktree-stash hazard (never `git stash` in a session worktree).
 
@@ -67,7 +65,6 @@ AGENTS.md is loaded into **every** agent turn. Keep it small and general.
 
 - **No specific recipes or debugging entries.** Symptom→fix lookups belong in `docs/debugging.md`; how-to-do-X belongs in the relevant `docs/<topic>.md`. Agents discover them via the "Before editing" search step above.
 - **No invariant prose pretending to prevent regressions.** Write the test that pins it instead.
-- Keep this file under ~5 KB. If it grows, the new content probably belongs in `docs/`.
 
 ## Reference docs
 
