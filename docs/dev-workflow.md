@@ -248,6 +248,53 @@ See [AGENTS.md](../AGENTS.md#testing) for harness selection guidance and test re
 
 ---
 
+## Continuous Integration (CI)
+
+CI is **PR validation only** — there is no CD, publish, or release automation here (releases are cut manually via the `release` skill). The workflow lives at [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) and exists to give every pull request a fast, deterministic quality gate before it reaches `master`.
+
+**Triggers.** Runs on `pull_request` targeting `master` and on `push` to `master`. A `concurrency` group keyed on the ref with `cancel-in-progress: true` supersedes stale runs — pushing a new commit to a PR cancels the previous in-flight run rather than queuing both, so the latest commit always gets the freshest result.
+
+**Why separate jobs.** Each check is its own job (not sequential steps in one job) so that a failure in one is independently visible on the PR and does not mask the others. You can see at a glance whether it was types, dead code, or tests that broke.
+
+| Job | Command | What it catches |
+|---|---|---|
+| `typecheck` | `npm run check` | Type errors across server (`tsconfig.server.json`) and web (`tsconfig.web.json`) |
+| `knip` | `npx knip` | Unused files, exports, and dependencies (config: `knip.config.ts`; no npm script — invoked directly) |
+| `unit` | `npm run test:unit` | Node test-runner suite + Playwright `file://` component fixtures |
+| `e2e` | `npm run test:e2e` | API (in-process harness) + browser (spawned gateway) E2E |
+
+### Runner environment
+
+- **Runner**: `ubuntu-latest`. No Docker — the only Docker-*requiring* E2E specs (`sandbox-recovery-docker*`) are already excluded by `playwright-e2e.config.ts`, and `sandbox-pentest.spec.ts` only exercises the sandbox arg builder.
+- **Node**: 22, via `actions/setup-node` with `cache: npm` (the repo's `engines` field requires `>=22.19.0`).
+- **Install**: `npm ci` against the committed lockfile for reproducible installs.
+- **Playwright Chromium**: both `test:unit` and `test:e2e` drive Chromium, so those jobs run `npx playwright install --with-deps chromium` and cache `~/.cache/ms-playwright` keyed on the resolved Playwright version (cache hits skip the multi-minute browser download).
+- **Git identity**: the `unit` and `e2e` jobs set a `bobbit-ci` `user.name`/`user.email` before running, because the suites exercise real git operations (worktrees, commits) that fail on a runner with no configured identity.
+
+Each job is self-contained and builds what it needs: `test:e2e` runs a full `npm run build`, and `test:unit` auto-builds the server if it is missing. CI is detected automatically — GitHub sets `CI=true`, which the Playwright configs already key off (unit → 2 workers; E2E → `retries: 3`), so no extra configuration is needed.
+
+### Intentionally excluded
+
+CI deliberately does **not** run:
+
+- **The `test:manual` tier** — real agents, Docker, and live LLM API keys (`npm run test:manual`). It needs credentials and ~5 minutes of wall-clock; it stays a local/manual step.
+- **Docker-only E2E** — `sandbox-recovery-docker*` specs, already ignored by `playwright-e2e.config.ts`.
+- **Linters and formatters** — no eslint, prettier, or any new linter was added for CI. `knip` is the only static-analysis gate.
+- **Pre-commit hooks** — no husky or git hooks were introduced.
+- **CD** — no npm publish, binary sub-packages, or GitHub releases; those remain owned by the `release` skill.
+
+### Required vs. non-blocking checks
+
+Branch protection on `origin/master` marks **`typecheck`, `knip`, and `unit`** as required status checks — a PR cannot merge until all three are green.
+
+**`e2e` runs on every PR but is intentionally *not* in the required-checks list for now.** The browser/API E2E suite has a pre-existing flake floor (FS-contention races and goal-assistant cold-start timeouts, partly tracked via `@quarantine`-tagged specs) that `playwright-e2e.config.ts` currently absorbs with `retries: 3`. Making `e2e` blocking today would intermittently red otherwise-good PRs, so it is left advisory: review the result, but a transient red does not gate merge.
+
+**This is a known tradeoff, not the end state.** The follow-up is to stabilize the flake floor (fix the underlying races, retire the `@quarantine` tags, tighten `retries` back toward 0) and then promote `e2e` to a required check. Until then, treat a red `e2e` as a signal to investigate rather than an automatic block.
+
+> **Sequencing note for whoever wires up branch protection.** A required-status-check name must exactly match a context GitHub has actually reported. Let the workflow run once on a real PR first, confirm the reported job names (`typecheck`, `knip`, `unit`, `e2e`), then add the required contexts — otherwise protection blocks every PR waiting on a check that has never reported.
+
+---
+
 ## Worktree branch namespaces
 
 When you list `git branch` in a Bobbit-managed repo you'll see several namespaces:
