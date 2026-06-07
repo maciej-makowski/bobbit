@@ -1,0 +1,27 @@
+# systemd --user unit for the Bobbit gateway, fronted by a Cloudflare Tunnel.
+# Installed to ~/.config/systemd/user/bobbit.service by setup.sh, which
+# substitutes the <CHECKOUT_DIR> and <BOBBIT_CWD> placeholders below.
+#
+# Bobbit MUST bind the host loopback (--host 127.0.0.1) to stay in localhost
+# mode (no Bobbit token); Cloudflare Access is the sole auth gate. Binding to
+# 0.0.0.0/:: would flip Bobbit back to requiring its own token — do not do that.
+#
+# PATH prepends a host Node 20+ (default portable install under
+# ~/.local/node/bin). The host base image has no Node; see the runbook for the
+# portable-tarball / rpm-ostree options.
+[Unit]
+Description=Bobbit gateway (localhost mode, fronted by Cloudflare Tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/node/bin:/usr/local/bin:/usr/bin:/bin
+Environment=BOBBIT_NO_OPEN=1
+WorkingDirectory=<CHECKOUT_DIR>
+ExecStart=<CHECKOUT_DIR>/run --host 127.0.0.1 --no-tls --port 3001 --cwd <BOBBIT_CWD>
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

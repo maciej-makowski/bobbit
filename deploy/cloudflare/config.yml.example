@@ -1,0 +1,23 @@
+# Cloudflare Tunnel — locally-managed config template for Bobbit.
+#
+# Copy this file to ~/.config/cloudflared/config.yml on the HOST and replace
+# <TUNNEL_ID> with the UUID printed by `cloudflared tunnel create bobbit-z13`.
+# Drop the matching credentials JSON next to it as
+# ~/.config/cloudflared/<TUNNEL_ID>.json. Neither the real config.yml nor the
+# credentials JSON is committed (see repo .gitignore); only this *.example is.
+#
+# The cloudflared quadlet mounts ~/.config/cloudflared at /etc/cloudflared
+# (read-only), so paths below are the IN-CONTAINER paths.
+
+tunnel: <TUNNEL_ID>
+credentials-file: /etc/cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  # Bobbit runs in localhost mode on the host loopback. Pin 127.0.0.1 (NOT
+  # `localhost` or `::1`) to avoid flaky IPv6 resolution between cloudflared
+  # (Network=host) and Bobbit. WebSocket upgrades (/ws/*) are proxied
+  # transparently by cloudflared — no extra config required.
+  - hostname: bobbit.z13.maciej.dev
+    service: http://127.0.0.1:3001
+  # Catch-all MUST be last and have no hostname.
+  - service: http_status:404
