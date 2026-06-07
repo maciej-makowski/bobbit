@@ -261,7 +261,8 @@ CI is **PR validation only** — there is no CD, publish, or release automation 
 | `typecheck` | `npm run check` | Type errors across server (`tsconfig.server.json`) and web (`tsconfig.web.json`) |
 | `knip` | `npx knip` | Unused files, exports, and dependencies (config: `knip.config.ts`; no npm script — invoked directly) |
 | `unit` | `npm run test:unit` | Node test-runner suite + Playwright `file://` component fixtures |
-| `e2e` | `npm run test:e2e` | API (in-process harness) + browser (spawned gateway) E2E |
+
+The browser/API **E2E suite is not part of per-PR CI** — it runs as a separate, manually-triggered workflow (see [E2E workflow](#e2e-a-separate-manually-triggered-workflow) below).
 
 ### Runner environment
 
@@ -283,15 +284,24 @@ CI deliberately does **not** run:
 - **Pre-commit hooks** — no husky or git hooks were introduced.
 - **CD** — no npm publish, binary sub-packages, or GitHub releases; those remain owned by the `release` skill.
 
-### Required vs. non-blocking checks
+### Required checks
 
-Branch protection on `origin/master` marks **`typecheck`, `knip`, and `unit`** as required status checks — a PR cannot merge until all three are green.
+Branch protection on `origin/master` marks **`typecheck`, `knip`, and `unit`** as required status checks (`strict: true`) — a PR cannot merge until all three are green and the branch is up to date with `master`.
 
-**`e2e` runs on every PR but is intentionally *not* in the required-checks list for now.** The browser/API E2E suite has a pre-existing flake floor (FS-contention races and goal-assistant cold-start timeouts, partly tracked via `@quarantine`-tagged specs) that `playwright-e2e.config.ts` currently absorbs with `retries: 3`. Making `e2e` blocking today would intermittently red otherwise-good PRs, so it is left advisory: review the result, but a transient red does not gate merge.
+> **Sequencing note for whoever changes the required checks.** A required-status-check name must exactly match a context GitHub has actually reported. Let the workflow run once on a real PR first, confirm the reported job names (`typecheck`, `knip`, `unit`), then add the required contexts — otherwise protection blocks every PR waiting on a check that has never reported.
 
-**This is a known tradeoff, not the end state.** The follow-up is to stabilize the flake floor (fix the underlying races, retire the `@quarantine` tags, tighten `retries` back toward 0) and then promote `e2e` to a required check. Until then, treat a red `e2e` as a signal to investigate rather than an automatic block.
+### E2E — a separate, manually-triggered workflow
 
-> **Sequencing note for whoever wires up branch protection.** A required-status-check name must exactly match a context GitHub has actually reported. Let the workflow run once on a real PR first, confirm the reported job names (`typecheck`, `knip`, `unit`, `e2e`), then add the required contexts — otherwise protection blocks every PR waiting on a check that has never reported.
+The browser/API E2E suite lives in its **own** workflow, [`.github/workflows/e2e.yml`](../.github/workflows/e2e.yml), triggered **only** by `workflow_dispatch` — it does **not** run automatically on PRs or pushes. Run it on demand:
+
+- **GitHub UI**: Actions → **E2E** → **Run workflow** (pick the branch/ref).
+- **CLI**: `gh workflow run e2e.yml --ref <branch>`.
+
+The job mirrors the old per-PR e2e job (ubuntu-latest, Node 22, `npm ci`, git identity, cached Playwright Chromium, `npm run test:e2e`).
+
+**Why it's separate.** The E2E suite has a pre-existing flake floor (FS-contention races and goal-assistant cold-start timeouts, partly tracked via `@quarantine`-tagged specs) that `playwright-e2e.config.ts` absorbs with `retries: 3` but does not fully eliminate. Running it per-PR — even non-blocking — produced noisy intermittent reds, so it is gated behind a manual trigger: run it before a risky merge or when touching E2E-covered surfaces, rather than on every PR.
+
+**Follow-up (not the end state).** Stabilize the flake floor (fix the underlying races, exclude/retire the `@quarantine` tags, tighten `retries` back toward 0), then fold E2E back into per-PR CI — ideally as a required check.
 
 ---
 

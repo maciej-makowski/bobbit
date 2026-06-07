@@ -144,4 +144,4 @@ A squishy pixel-art blob that lives in the UI — animated, expressive, and draw
 
 See the [development workflow guide](docs/dev-workflow.md) for dev setup, and [AGENTS.md](AGENTS.md) for repo layout and common tasks.
 
-Every PR into `master` runs CI (typecheck, knip, unit, and E2E) — see [Continuous Integration](docs/dev-workflow.md#continuous-integration-ci) for what runs, what's intentionally excluded, and which checks block merge.
+Every PR into `master` runs CI (typecheck, knip, unit). The browser/API E2E suite runs as a separate, **manually-triggered** workflow (Actions → E2E → "Run workflow"). See [Continuous Integration](docs/dev-workflow.md#continuous-integration-ci) for what runs, what's intentionally excluded, and how to run E2E on demand.
