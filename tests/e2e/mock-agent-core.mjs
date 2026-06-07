@@ -1990,6 +1990,17 @@ export class MockAgentCore {
 				return { success: true, data: this.conversationMessages };
 
 			case "set_model": {
+				// Faithful to the real pi-coding-agent RPC `set_model`, which does a
+				// strict (provider, modelId) registry lookup and returns a
+				// `{ success: false, error }` response (it does NOT throw) when the
+				// model can't be resolved — there is no fuzzy fallback. The mock can't
+				// enumerate a real registry, so it accepts any plausible model (keeping
+				// existing tests green) but rejects an explicit "unresolvable" sentinel
+				// so the gateway's no-silent-fallback contract is exercisable end-to-end.
+				const isUnresolvable = (s) => typeof s === "string" && /unresolvable/i.test(s);
+				if (isUnresolvable(msg.modelId) || isUnresolvable(msg.provider)) {
+					return { success: false, error: `Model not found: ${msg.provider}/${msg.modelId}` };
+				}
 				const knownModels = {
 					"claude-sonnet-4-20250514": { provider: "anthropic", id: "claude-sonnet-4-20250514", contextWindow: 1_000_000, maxTokens: 16384 },
 				};
