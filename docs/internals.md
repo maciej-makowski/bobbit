@@ -1520,6 +1520,10 @@ The Bobbit AI Gateway user agent is not a process-wide default HTTP header. It i
 
 These boundaries are why the same Bobbit process can talk to an AI Gateway and public providers without leaking `User-Agent: Bobbit/<version>` to public endpoints unless that request is actually routed through the configured gateway.
 
+### Custom local providers in `models.json`
+
+The `aigw` provider is not the only dynamic writer of `~/.bobbit/agent/models.json`. Custom local providers (ollama/lmstudio/llama.cpp/vllm and the manual openai-completions/responses/anthropic types) are synced into the same file by `src/server/agent/custom-provider-agent-sync.ts` so the interactive agent's strict `set_model` lookup can resolve them — otherwise selecting a custom model silently falls back to the prior model. Managed entries are stamped `__bobbitManaged: "custom-provider"` so renames/deletes never touch the `aigw` entry or bedrock/anthropic `modelOverrides`; both writers share the atomic read/write helpers in `src/server/agent/models-json-store.ts`. See [docs/llama-swap-provider.md](llama-swap-provider.md#making-custom-models-bindable-the-agent-modelsjson-sync) for the full lifecycle, the no-silent-fallback hard-fail in `src/server/ws/handler.ts`, and the vision image-dispatch path.
+
 ---
 
 ## Semantic search
