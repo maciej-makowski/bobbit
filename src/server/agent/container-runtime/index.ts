@@ -26,6 +26,12 @@ export type {
 export { BaseCliRuntime, serializeContainerRunSpec, type RunArgHooks } from "./base-cli-runtime.js";
 export { DockerRuntime, DOCKER_RUN_ARG_HOOKS, DOCKER_HOST_GATEWAY } from "./docker-runtime.js";
 export { PodmanRuntime, PODMAN_RUN_ARG_HOOKS, PODMAN_HOST_GATEWAY } from "./podman-runtime.js";
+export {
+	registerContainerRuntime,
+	unregisterContainerRuntime,
+	runtimeForContainerId,
+	runtimeForContainerIdOrDocker,
+} from "./registry.js";
 
 /** Minimal shape of the config accessor `resolveContainerRuntime` needs. */
 export interface SandboxRuntimeConfig {

@@ -201,10 +201,14 @@ describe("buildExecCommand", () => {
 			assert.deepEqual(cmd.args, [
 				"exec", "-i", "-w", "/workspace/wt", "-u", "node", "-e", "BOBBIT_SESSION_ID=s1", "abc", "node", "cli.js",
 			]);
-			// MSYS shim is always applied; injected env is merged in.
+			// MSYS shim is always applied to the spawned host-CLI process env.
 			assert.equal(cmd.env.MSYS_NO_PATHCONV, "1");
 			assert.equal(cmd.env.MSYS2_ARG_CONV_EXCL, "*");
-			assert.equal(cmd.env.BOBBIT_SESSION_ID, "s1");
+			// Injected env is delivered ONLY as container -e flags, never merged
+			// into the host CLI's own process environment (the gateway's own
+			// process.env may carry an unrelated BOBBIT_SESSION_ID, so assert the
+			// injected value specifically did not leak in).
+			assert.notEqual(cmd.env.BOBBIT_SESSION_ID, "s1");
 		});
 	}
 

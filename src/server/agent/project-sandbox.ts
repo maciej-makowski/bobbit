@@ -20,6 +20,7 @@ import path from "node:path";
 import { cpuDiagnosticsEnabled, getCpuDiagnostics } from "./cpu-diagnostics.js";
 import { buildContainerRunSpec } from "./docker-args.js";
 import { DockerRuntime } from "./container-runtime/docker-runtime.js";
+import { registerContainerRuntime, unregisterContainerRuntime } from "./container-runtime/registry.js";
 import type { ContainerRuntime } from "./container-runtime/types.js";
 import type { PreferencesStore } from "./preferences-store.js";
 import type { ToolManager } from "./tool-manager.js";
@@ -180,6 +181,9 @@ export class ProjectSandbox {
 
 		try {
 			await this._initContainer();
+			// Register this container's runtime so server-side git-panel helpers
+			// (which only have a containerId) spawn against the right binary.
+			if (this.containerId) registerContainerRuntime(this.containerId, this.runtime);
 			this._status = "ready";
 			this._readyResolve!();
 		} catch (err: any) {
@@ -552,6 +556,7 @@ export class ProjectSandbox {
 		this.stopHealthMonitor();
 		const volumeName = this._volumeName();
 		if (this.containerId) {
+			unregisterContainerRuntime(this.containerId);
 			try {
 				await this.runtime.removeContainer(this.containerId, { force: true, timeoutMs: 15_000 });
 			} catch { /* already gone */ }

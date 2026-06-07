@@ -46,7 +46,7 @@ const defaultExecFileAsync = promisify(execFileCb);
 export type ExecFileFn = (
 	file: string,
 	args: string[],
-	options: { timeout?: number; env?: NodeJS.ProcessEnv; maxBuffer?: number; cwd?: string } | undefined,
+	options: { timeout?: number; env?: NodeJS.ProcessEnv; maxBuffer?: number; cwd?: string; windowsHide?: boolean } | undefined,
 ) => Promise<{ stdout: string; stderr: string }>;
 
 /** Per-runtime hooks for the otherwise-shared `run` arg builder. */
@@ -181,14 +181,15 @@ export abstract class BaseCliRuntime implements ContainerRuntime {
 		args: readonly string[],
 		options?: { timeout?: number; env?: NodeJS.ProcessEnv; maxBuffer?: number; cwd?: string },
 	): Promise<ExecResult> {
+		const opts = { windowsHide: true, ...options };
 		if (!cpuDiagnosticsEnabled()) {
-			return await this.execFileFn(this.bin, args as string[], options);
+			return await this.execFileFn(this.bin, args as string[], opts);
 		}
 		const start = performance.now();
 		let success = 0;
 		let errorCode = "none";
 		try {
-			const result = await this.execFileFn(this.bin, args as string[], options);
+			const result = await this.execFileFn(this.bin, args as string[], opts);
 			success = 1;
 			return result;
 		} catch (err) {
@@ -230,10 +231,14 @@ export abstract class BaseCliRuntime implements ContainerRuntime {
 	}
 
 	buildExecCommand(containerId: string, argv: string[], opts?: ExecOpts): ExecCommand {
+		// `opts.env` becomes `-e KEY=VAL` flags (container env) via execArgs; the
+		// returned `env` is only the spawned host-CLI process env (MSYS shim over
+		// process.env), matching the pre-abstraction spawn behaviour. The caller's
+		// secrets therefore never enter the host CLI's own environment.
 		return {
 			file: this.bin,
 			args: this.execArgs(containerId, argv, opts),
-			env: this.runtimeEnv(opts?.env),
+			env: this.runtimeEnv(),
 		};
 	}
 
