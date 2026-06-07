@@ -75,33 +75,39 @@ export interface ApplyModelStringOptions {
 	skipSetModel?: boolean;
 }
 
+/** Options for {@link bindModelWithReadback}. Same shape as ApplyModelStringOptions. */
+export type BindModelOptions = ApplyModelStringOptions;
+
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * Bind an RPC client to a literal `<provider>/<modelId>` model string.
+ * Bind an RPC client to a separate `provider` + `modelId` pair, with read-back
+ * verification.
  *
- * Hard-fail contract: throws on malformed input, setModel failure (after
- * retries), or read-back mismatch. Caller is responsible for converting the
- * thrown error into the appropriate user-visible failure (e.g. failed gate,
- * red Unavailable badge).
+ * Hard-fail contract: throws on setModel failure (after retries) or read-back
+ * mismatch — the agent must report the EXACT (provider, modelId) we asked for.
+ * This is the single chokepoint that prevents a silent fallback to the
+ * previously-bound model: if the agent can't resolve the model and stays on the
+ * old one, `getState()` read-back mismatches and we throw. Persistence
+ * (`persistSessionModel`) happens ONLY after read-back passes, so a failed bind
+ * never leaves the session pointing at a model the user didn't choose.
+ *
+ * Caller is responsible for converting the thrown error into the appropriate
+ * user-visible failure (e.g. SET_MODEL_FAILED, failed gate, Unavailable badge).
+ *
+ * `modelId` may legitimately contain `/` (e.g. lmstudio model paths), which is
+ * why provider and modelId arrive pre-split rather than as a single string.
  */
-export async function applyModelString(
+export async function bindModelWithReadback(
 	rpc: ReviewModelRpc,
-	modelString: string,
-	opts: ApplyModelStringOptions = {},
+	provider: string,
+	modelId: string,
+	opts: BindModelOptions = {},
 ): Promise<void> {
 	const label = opts.contextLabel ?? "model";
-
-	const slash = modelString.indexOf("/");
-	if (slash <= 0 || slash >= modelString.length - 1) {
-		throw new Error(
-			`malformed ${label}: "${modelString}" (expected "<provider>/<modelId>")`,
-		);
-	}
-	const provider = modelString.slice(0, slash);
-	const modelId = modelString.slice(slash + 1);
+	const modelString = `${provider}/${modelId}`;
 
 	const maxAttempts = Math.max(1, opts.maxAttempts ?? 2);
 	const retryDelayMs = Math.max(0, opts.retryDelayMs ?? 250);
@@ -153,6 +159,31 @@ export async function applyModelString(
 	if (opts.sessionManager && opts.sessionId) {
 		opts.sessionManager.persistSessionModel(opts.sessionId, provider, modelId);
 	}
+}
+
+/**
+ * Bind an RPC client to a literal `<provider>/<modelId>` model string.
+ *
+ * Parses the string then delegates to {@link bindModelWithReadback}. Throws on
+ * malformed input (in addition to the bind helper's failure modes).
+ */
+export async function applyModelString(
+	rpc: ReviewModelRpc,
+	modelString: string,
+	opts: ApplyModelStringOptions = {},
+): Promise<void> {
+	const label = opts.contextLabel ?? "model";
+
+	const slash = modelString.indexOf("/");
+	if (slash <= 0 || slash >= modelString.length - 1) {
+		throw new Error(
+			`malformed ${label}: "${modelString}" (expected "<provider>/<modelId>")`,
+		);
+	}
+	const provider = modelString.slice(0, slash);
+	const modelId = modelString.slice(slash + 1);
+
+	return bindModelWithReadback(rpc, provider, modelId, opts);
 }
 
 export async function applyReviewModelOverrides(

@@ -15,6 +15,7 @@ import { resolveSkillExpansions } from "../skills/resolve-skill-expansions.js";
 import { resolveFileMentions, toWireMention } from "../skills/resolve-file-mentions.js";
 import { buildMergedModelText } from "../skills/merge-mentions.js";
 import { inferMeta } from "../agent/aigw-manager.js";
+import { bindModelWithReadback } from "../agent/review-model-override.js";
 import { clampThinkingLevel, isKnownThinkingLevel } from "../../shared/thinking-levels.js";
 import { truncateLargeToolContentInMessages } from "../agent/truncate-large-content.js";
 import { readSkillSidecarEntries, mergeSidecarEntriesIntoMessages } from "../skills/skill-sidecar.js";
@@ -650,9 +651,19 @@ export function handleWebSocketConnection(
 					break;
 				case "set_model":
 					try {
-						await session.rpcClient.setModel(msg.provider, msg.modelId);
+						// Hard-fail bind with read-back: setModel → getState → throw on
+						// mismatch, persisting ONLY after read-back passes. This prevents
+						// a silent fallback to the previously-bound model (Claude) when the
+						// agent can't resolve the requested model. modelId may contain "/"
+						// (lmstudio paths), so provider/modelId are passed pre-split.
+						await bindModelWithReadback(session.rpcClient, msg.provider, msg.modelId, {
+							sessionManager,
+							sessionId: session.id,
+							contextLabel: "set_model",
+						});
+						// Only update the model-name file once the bind is verified — never
+						// leave the session pointing at a model the user didn't choose.
 						sessionManager.updateModelNameFile(session.id, msg.modelId);
-						sessionManager.persistSessionModel(session.id, msg.provider, msg.modelId);
 					} catch (err: any) {
 						// Surface set_model failures to the UI instead of silently swallowing
 						// them — otherwise the client keeps showing the new model while the

@@ -191,6 +191,7 @@ import { configureAigw, removeAigw, getAigwUrl, discoverAigwModels, proxyRequest
 import { writeOpenAIModelAdditions } from "./agent/openai-model-additions.js";
 import { ReviewAnnotationStore, type ReviewAnnotation } from "./review-annotation-store.js";
 import { getAvailableModels, discoverModelsForConfig, invalidateModelCache } from "./agent/model-registry.js";
+import { syncCustomProvidersToAgent } from "./agent/custom-provider-agent-sync.js";
 import { testModelPreference } from "./agent/model-completion.js";
 import type { CustomProviderConfig } from "./agent/model-registry.js";
 import { canonicalImageModelPref, defaultImageModelPref, generateImage, getAvailableImageModels } from "./agent/image-generation.js";
@@ -1566,6 +1567,16 @@ export function createGateway(config: GatewayConfig) {
 			await startupAigwCheck(preferencesStore);
 			writeContextWindowOverrides();
 			writeOpenAIModelAdditions();
+
+			// Register custom local providers (ollama/lmstudio/llama.cpp/vllm/manual)
+			// into the agent models.json so the interactive agent can bind them via
+			// set_model. Runs before session restore. Never blocks boot — unreachable
+			// auto-discovery hosts keep their prior models.json entry (logged warning).
+			try {
+				await syncCustomProvidersToAgent(preferencesStore);
+			} catch (err) {
+				console.error("[custom-provider-sync] startup sync failed (non-fatal):", err);
+			}
 
 			// Initialize MCP servers (skip in test environments)
 			if (!process.env.BOBBIT_SKIP_MCP) {
@@ -5254,6 +5265,10 @@ async function handleApiRoute(
 			configs.push(config);
 		}
 		preferencesStore.set("customProviders", configs);
+		// Register the added/updated provider into the agent models.json so the
+		// interactive agent can bind its models. Re-syncs all (simplest/robust).
+		await syncCustomProvidersToAgent(preferencesStore);
+		invalidateModelCache();
 		json({ ok: true, config });
 		return;
 	}
@@ -5268,6 +5283,10 @@ async function handleApiRoute(
 		const configs = (preferencesStore.get("customProviders") as CustomProviderConfig[] | undefined) || [];
 		const filtered = configs.filter((c: CustomProviderConfig) => c.id !== providerId);
 		preferencesStore.set("customProviders", filtered);
+		// Remove the now-absent provider's managed block from the agent models.json
+		// (the sync drops managed entries whose key is no longer configured).
+		await syncCustomProvidersToAgent(preferencesStore);
+		invalidateModelCache();
 		json({ ok: true });
 		return;
 	}
