@@ -1,5 +1,7 @@
 # Bobbit
 
+[![CI](https://github.com/maciej-makowski/bobbit/actions/workflows/ci.yml/badge.svg)](https://github.com/maciej-makowski/bobbit/actions/workflows/ci.yml)
+
 **Your AI dev team, running on your machine, controlled from your browser.**
 
 Bobbit is a command centre for AI coding agents. Spin up teams — leads that plan, coders that build in parallel, reviewers and testers that enforce quality — and point them at anything from a quick bug fix to a full-stack feature. Watch every agent work in real time, steer them mid-task, and stay in control of what ships.
@@ -133,6 +135,7 @@ A squishy pixel-art blob that lives in the UI — animated, expressive, and draw
 | [Architecture](docs/architecture.md) | System design, layers, and dependencies |
 | [Development & Testing](docs/dev-workflow.md) | Dev environment, hot reload, testing |
 | [Goals & Workflows](docs/goals-workflows-tasks.md) | Task tracking, gates, and verification |
+| [Nested Sub-Goals](docs/nested-goals.md) | Goals that spawn child goals — teams, depth caps, roll-up, governance |
 | [Marketplace](docs/marketplace.md) | Pack-based install of roles, tools, and skills |
 | [Bobbit Sprites](docs/bobbit-sprites.md) | Pixel-art mascot, animations, and accessories |
 
@@ -141,3 +144,5 @@ A squishy pixel-art blob that lives in the UI — animated, expressive, and draw
 ## Contributing
 
 See the [development workflow guide](docs/dev-workflow.md) for dev setup, and [AGENTS.md](AGENTS.md) for repo layout and common tasks.
+
+Every PR into `master` runs CI (typecheck, knip, unit). The browser/API E2E suite runs as a separate, **manually-triggered** workflow (Actions → E2E → "Run workflow"). See [Continuous Integration](docs/dev-workflow.md#continuous-integration-ci) for what runs, what's intentionally excluded, and how to run E2E on demand.

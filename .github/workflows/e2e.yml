@@ -1,0 +1,39 @@
+name: E2E
+
+# Manually triggered only. The browser/API E2E suite is excluded from the
+# per-PR CI (.github/workflows/ci.yml) because of a pre-existing flake floor
+# (10+ @quarantine-tagged specs, cold-start/FS-contention races). Run this on
+# demand from the Actions tab ("Run workflow") or via `gh workflow run e2e.yml`
+# — optionally against a specific branch/ref.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure git identity
+        run: |
+          git config --global user.name "bobbit-ci"
+          git config --global user.email "bobbit-ci@users.noreply.github.com"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - id: pw-version
+        run: echo "v=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.pw-version.outputs.v }}
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e

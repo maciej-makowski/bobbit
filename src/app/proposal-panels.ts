@@ -13,12 +13,12 @@
 // never statically references this file. Don't add a static import from
 // render.ts to here or you'll re-bloat the entry chunk.
 
-import { html } from "lit";
+import { html, nothing, type TemplateResult } from "lit";
 import { ref, createRef } from "lit/directives/ref.js";
 import { icon } from "@mariozechner/mini-lit";
 import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { Input } from "@mariozechner/mini-lit/dist/Input.js";
-import { Check, Copy, Eye, FolderOpen, Goal as GoalIcon, Pencil, UserCheck, Users, Wrench } from "lucide";
+import { Check, Copy, Eye, FolderOpen, Goal as GoalIcon, Minus, Pencil, Plus, UserCheck, Users, Wrench } from "lucide";
 
 import { state, renderApp, activeSessionId, isProposalStreaming } from "./state.js";
 import {
@@ -28,13 +28,26 @@ import {
 	refreshSessions,
 	fetchSandboxStatus,
 	fetchWorkflows,
+	fetchGroupPolicies,
 	type Workflow,
+	type RoleData,
 	fetchTools,
 	type ToolInfo,
 	createStaffAgent,
 	fetchRoles,
-	type RoleData,
 } from "./api.js";
+import {
+	renderWorkflowInspector,
+	renderWorkflowEditor,
+	clearWorkflowEditorController,
+} from "./workflow-page.js";
+import {
+	renderRoleList,
+	renderRoleInspector,
+	renderRoleEditor,
+	fetchRolesForProject,
+	type RoleEditorDraft,
+} from "./role-manager-page.js";
 import { clearSessionModel, setHashRoute } from "./routing.js";
 import { reconcileFollowTail } from "./follow-tail.js";
 import { ensureMarkdownBlock } from "../ui/lazy/markdown-block.js";
@@ -50,6 +63,7 @@ import {
 	backToSessions,
 } from "./session-manager.js";
 import { deleteProposalFile } from "./proposal-helpers.js";
+import { isSubgoalsEnabled, getSystemMaxNestingDepth } from "./subgoals-flag.js";
 import { PROPOSAL_TYPES, type ProposalType } from "./proposal-registry.js";
 import { showConnectionError } from "./dialogs-lazy.js";
 import { errorDetails } from "./error-helpers.js";
@@ -406,6 +420,12 @@ function clampUnifiedTabsAfterProposalRemoved(type: ProposalType): void {
 function dismissTypedProposal(type: ProposalType): void {
 	const slot = state.activeProposals[type];
 	const sessionId = slot?.sessionId ?? activeSessionId();
+	// If the proposal is still streaming, suppress the rest of the in-flight
+	// tool block so later (content-grown) deltas can't re-populate the panel —
+	// the content-fingerprint dismissal below only matches the body captured now.
+	if (isProposalStreaming(`${type}_proposal`)) {
+		state.remoteAgent?.dismissStreamingProposal(`${type}_proposal`);
+	}
 	clearProposalReviewState(sessionId, type);
 	if (sessionId && slot?.fields) markProposalDismissed(sessionId, type, slot.fields);
 	delete state.activeProposals[type];
@@ -483,6 +503,317 @@ interface GoalFormConfig {
 	 * proposal-panel call site — the goal-dashboard view stays read-only.
 	 */
 	commentable?: boolean;
+
+	/** If set, this goal will be created as a subgoal of the given parent goal ID. */
+	parentGoalId?: string;
+	/** Callback to update the selected parent goal. Pass undefined to clear (top-level). */
+	onParentGoalChange?: (id: string | undefined) => void;
+	/** Whether subgoals are enabled at the system level. */
+	subgoalsEnabled?: boolean;
+	/** Maximum nesting depth from system prefs. */
+	maxNestingDepth?: number;
+
+	/** Current value of the per-goal "Allow subgoals" toggle. `null` means
+	 *  the user has not touched it (inherit system pref). Only set in
+	 *  proposal-modal mode; the goal-assistant flow leaves this undefined
+	 *  so the row is not rendered (and would otherwise be a no-op there). */
+	subgoalsAllowedValue?: boolean | null;
+	/** Current value of the per-goal "Max nesting depth" input. `null` means
+	 *  inherit system pref. Only set in proposal-modal mode. */
+	maxNestingDepthValue?: number | null;
+	/** Invoked when the user toggles "Allow subgoals". Presence (alongside
+	 *  `onMaxNestingDepthChange`) gates rendering of the subgoals row. */
+	onSubgoalsAllowedChange?: (value: boolean) => void;
+	/** Invoked when the user changes the "Max depth" input. `null` means the
+	 *  user cleared the field (inherit system pref). */
+	onMaxNestingDepthChange?: (value: number | null) => void;
+
+	// ---- Root-only orchestration policy (tree-wide; owned by the root) ----
+	/** Current per-goal divergence (plan-mutation) policy. `null` = inherit
+	 *  default ("balanced"). Only meaningful for a top-level/root goal. */
+	divergencePolicyValue?: "strict" | "balanced" | "autonomous" | null;
+	/** Invoked when the user picks a divergence policy. Presence (with
+	 *  `onMaxConcurrentChildrenChange`) gates rendering of the orchestration row. */
+	onDivergencePolicyChange?: (value: "strict" | "balanced" | "autonomous") => void;
+	/** Current per-goal max-concurrent-children cap. `null` = inherit default (3).
+	 *  Only meaningful for a top-level/root goal; clamped to [1, 8]. */
+	maxConcurrentChildrenValue?: number | null;
+	/** Invoked when the user changes the concurrency cap. */
+	onMaxConcurrentChildrenChange?: (value: number) => void;
+
+	// ---- Proposal-modal tabs (Goal / Workflow / Roles) ----
+	/** When true, wrap the form body in a tabbed surface with Workflow + Roles
+	 *  tabs alongside Goal. The footer stays outside the panels so submit/dismiss
+	 *  remain visible on every tab. */
+	tabbed?: boolean;
+	activeTab?: ProposalTab;
+	onTabChange?: (tab: ProposalTab) => void;
+
+	/** Draft-scoped customised workflow. When non-null the submit path forwards
+	 *  it as `workflow` instead of `workflowId`. */
+	inlineWorkflow?: Workflow | null;
+	onInlineWorkflowChange?: (wf: Workflow | null) => void;
+	/** True when the right pane of the Workflow tab should render the editor
+	 *  instead of the read-only inspector. */
+	customizingWorkflow?: boolean;
+	onCustomizeWorkflow?: () => void;
+	onResetWorkflow?: () => void;
+
+	/** Draft-scoped per-role override map keyed by role name. */
+	inlineRoles?: Record<string, RoleData>;
+	selectedRoleName?: string | null;
+	onSelectRole?: (name: string) => void;
+	customizingRole?: boolean;
+	onCustomizeRole?: () => void;
+	onResetRole?: () => void;
+	onRoleDraftChange?: (patch: Partial<RoleEditorDraft>) => void;
+	onRoleEditorTabChange?: (tab: "prompt" | "tools" | "model") => void;
+	onRoleToggleToolGroup?: (group: string) => void;
+	roleEditTab?: "prompt" | "tools" | "model";
+	roleCollapsedGroups?: ReadonlySet<string>;
+	roleList?: RoleData[];
+	roleListLoading?: boolean;
+	availableTools?: ToolInfo[];
+	groupPolicies?: Record<string, string>;
+}
+
+/** Compute a goal's depth (1-based) by walking parentGoalId links. */
+function computeGoalDepth(goalId: string, goals: ReadonlyArray<{ id: string; parentGoalId?: string }>): number {
+	let depth = 1;
+	let cur: { id: string; parentGoalId?: string } | undefined = goals.find(g => g.id === goalId);
+	const seen = new Set<string>();
+	while (cur?.parentGoalId && !seen.has(cur.id)) {
+		seen.add(cur.id);
+		cur = goals.find(g => g.id === cur!.parentGoalId);
+		depth++;
+		if (depth >= 20) break;
+	}
+	return depth;
+}
+
+// ── Shared sub-goal UI fragments ────────────────────────────────────────────
+// Rendered inline on the non-tabbed +New Goal preview, and collated into the
+// dedicated "Sub-goals" tab of the tabbed goal-proposal panel.
+
+/** Parent-goal picker row. */
+function renderParentPickerRow(config: GoalFormConfig, lblCls: string): TemplateResult {
+	return html`
+		<div class="flex items-center gap-2" data-testid="goal-form-parent-row">
+			<label class="${lblCls} w-20 md:w-16">Parent Goal</label>
+			<select
+				class="flex-1 text-sm px-2 py-1.5 rounded-md border border-border bg-background text-foreground h-9"
+				.value=${config.parentGoalId || ""}
+				@change=${(e: Event) => {
+					const v = (e.target as HTMLSelectElement).value;
+					config.onParentGoalChange?.(v || undefined);
+				}}
+				data-testid="goal-form-parent-picker"
+			>
+				<option value="">None (Default)</option>
+				${state.goals.filter(g => !g.archived && (!config.linkedProjectId || g.projectId === config.linkedProjectId)).map(g => html`
+					<option value=${g.id} ?selected=${config.parentGoalId === g.id}>${g.title}</option>
+				`)}
+			</select>
+		</div>
+	`;
+}
+
+/** Breadcrumb + depth indicator + subgoal/top-level badge. */
+function renderSubgoalBreadcrumb(config: GoalFormConfig): TemplateResult | string {
+	if (config.parentGoalId) {
+		// Walk parentGoalId links from the immediate parent up to the top-level
+		// ancestor, then reverse so the breadcrumb reads top-level → … → parent.
+		const ancestors: { id: string; title: string }[] = [];
+		const seen = new Set<string>();
+		let cur = state.goals.find(g => g.id === config.parentGoalId);
+		while (cur && !seen.has(cur.id)) {
+			seen.add(cur.id);
+			ancestors.push({ id: cur.id, title: cur.title });
+			cur = cur.parentGoalId ? state.goals.find(g => g.id === cur!.parentGoalId) : undefined;
+		}
+		ancestors.reverse();
+		return html`
+			<div class="flex flex-col gap-1 text-xs text-muted-foreground">
+				<div class="truncate" data-testid="goal-form-breadcrumb">
+					${ancestors.map(a => html`<span>${a.title}</span><span class="mx-1 opacity-50">›</span>`)}
+					<span class="font-medium text-foreground/80">${config.title || "New Goal"}</span>
+				</div>
+			</div>
+		`;
+	}
+	return "";
+}
+
+/** Allow-subgoals toggle + max-depth control. */
+function renderSubgoalsToggle(config: GoalFormConfig): TemplateResult | string {
+	if (!(config.subgoalsEnabled && config.onSubgoalsAllowedChange && config.onMaxNestingDepthChange)) return "";
+	const systemCap = config.maxNestingDepth ?? 3;
+	// Depth of the goal being proposed (top-level = 1; a child of a depth-N
+	// goal is depth N+1). The most sub-goal levels this goal can itself allow
+	// is the global cap minus its own depth.
+	const proposedDepth = config.parentGoalId ? computeGoalDepth(config.parentGoalId, state.goals) + 1 : 1;
+	const rawCap = systemCap - proposedDepth;       // headroom below this goal
+	const atGlobalCap = rawCap <= 0;                // no room for any sub-goals
+	const depthFixed = rawCap === 1;                // exactly one level possible
+	const effectiveCap = Math.max(1, rawCap);
+	const allowed = !atGlobalCap && (config.subgoalsAllowedValue ?? false);
+	const depthValue = Math.min(config.maxNestingDepthValue ?? effectiveCap, effectiveCap);
+	const infoPanel = (text: string, testid: string) => html`
+		<div class="rounded-md border border-border bg-muted/40 px-3 py-2 text-[11px] leading-snug text-muted-foreground" data-testid=${testid}>${text}</div>
+	`;
+	return html`
+		<div class="flex flex-col gap-2">
+		<label class="flex items-center gap-1.5 ${atGlobalCap ? "opacity-60 cursor-not-allowed" : "cursor-pointer"}">
+			<input type="checkbox" class="toggle-switch"
+				.checked=${allowed}
+				?disabled=${atGlobalCap}
+				data-testid="goal-form-subgoals-toggle"
+				@change=${(e: Event) => {
+					config.onSubgoalsAllowedChange?.((e.target as HTMLInputElement).checked);
+				}} />
+			<span class="text-xs text-muted-foreground font-medium">Allow team lead to create sub-goals</span>
+			<span title="Allow this goal to spawn child subgoals. When off, the team-lead cannot use goal_spawn_child / goal_plan_propose."
+				class="text-[9px] text-muted-foreground cursor-help">ⓘ</span>
+		</label>
+		${atGlobalCap
+			? infoPanel(`This goal sits at depth ${proposedDepth}, the global nesting cap of ${systemCap}. It cannot create sub-goals — pick a shallower parent to allow nesting.`, "goal-form-subgoals-at-cap")
+			: allowed ? html`
+			<label class="flex items-center gap-1.5 text-xs ${depthFixed ? "opacity-60" : "text-muted-foreground"}">
+				<span>Max depth</span>
+				<span class="inline-flex items-center rounded-md border border-border bg-background overflow-hidden">
+					<button
+						type="button"
+						class="flex items-center justify-center w-6 h-6 text-muted-foreground hover:text-foreground hover:bg-secondary disabled:opacity-30 disabled:pointer-events-none transition-colors"
+						title="Decrease"
+						?disabled=${depthFixed || depthValue <= 1}
+						@click=${() => config.onMaxNestingDepthChange?.(Math.max(1, depthValue - 1))}
+					>${icon(Minus, "xs")}</button>
+					<input
+						type="number"
+						min="1"
+						max=${String(effectiveCap)}
+						step="1"
+						.value=${String(depthValue)}
+						?disabled=${depthFixed}
+						data-testid="goal-form-max-depth"
+						class="w-8 text-xs text-center px-0 py-0.5 border-0 border-x border-border bg-background text-foreground focus:outline-none focus:ring-0 disabled:opacity-60 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+						@change=${(e: Event) => {
+							const raw = parseInt((e.target as HTMLInputElement).value, 10);
+							if (Number.isFinite(raw)) {
+								config.onMaxNestingDepthChange?.(Math.min(effectiveCap, Math.max(1, raw)));
+							} else {
+								config.onMaxNestingDepthChange?.(null);
+							}
+						}} />
+					<button
+						type="button"
+						class="flex items-center justify-center w-6 h-6 text-muted-foreground hover:text-foreground hover:bg-secondary disabled:opacity-30 disabled:pointer-events-none transition-colors"
+						title="Increase"
+						?disabled=${depthFixed || depthValue >= effectiveCap}
+						@click=${() => config.onMaxNestingDepthChange?.(Math.min(effectiveCap, depthValue + 1))}
+					>${icon(Plus, "xs")}</button>
+				</span>
+				<span title=${`Global cap is ${systemCap}; this goal sits at depth ${proposedDepth}, so it can allow at most ${effectiveCap} more sub-goal level${effectiveCap === 1 ? "" : "s"}.`}
+					class="text-[9px] text-muted-foreground cursor-help">ⓘ</span>
+			</label>
+			${depthFixed ? infoPanel(`Only one more nesting level fits below the global cap of ${systemCap}, so max depth is fixed at 1.`, "goal-form-max-depth-fixed") : ""}
+		` : ""}
+		</div>
+	`;
+}
+
+/** Whether the dedicated Sub-goals tab should be shown for this proposal. */
+function showSubgoalsTab(config: GoalFormConfig): boolean {
+	return !!(config.subgoalsEnabled || config.parentGoalId);
+}
+
+/** Walk parentGoalId links up to the top-level (root) goal of the tree. */
+function findRootGoal(parentGoalId: string): { title: string; divergencePolicy?: string; maxConcurrentChildren?: number } | undefined {
+	const seen = new Set<string>();
+	let cur = state.goals.find(g => g.id === parentGoalId) as (typeof state.goals)[number] | undefined;
+	while (cur && (cur as { parentGoalId?: string }).parentGoalId && !seen.has(cur.id)) {
+		seen.add(cur.id);
+		cur = state.goals.find(g => g.id === (cur as { parentGoalId?: string }).parentGoalId);
+	}
+	return cur as unknown as { title: string; divergencePolicy?: string; maxConcurrentChildren?: number } | undefined;
+}
+
+const DIVERGENCE_OPTS: { id: "strict" | "balanced" | "autonomous"; label: string; desc: string }[] = [
+	{ id: "strict", label: "Strict", desc: "Approve every plan change, including minor fix-ups." },
+	{ id: "balanced", label: "Balanced", desc: "Auto-apply minor fix-ups; expansions still need your approval." },
+	{ id: "autonomous", label: "Autonomous", desc: "Most self-directed. Dropping acceptance criteria or unpaused restructures are still blocked." },
+];
+
+/**
+ * Root-only tree orchestration: max concurrent children + plan-change autonomy
+ * (divergence policy). These are owned by the top-level goal and resolved at
+ * the root for the whole tree, so for a child goal we render an inherited,
+ * read-only summary instead of editable controls.
+ */
+function renderSubgoalOrchestration(config: GoalFormConfig): TemplateResult | string {
+	if (!(config.onDivergencePolicyChange && config.onMaxConcurrentChildrenChange)) return "";
+	// Only relevant when this goal can actually spawn children.
+	const allowed = config.subgoalsAllowedValue ?? false;
+	if (!allowed) return "";
+
+	// Child goal: concurrency + autonomy are inherited from the root.
+	if (config.parentGoalId) {
+		const root = findRootGoal(config.parentGoalId);
+		const pol = (root?.divergencePolicy as string) || "balanced";
+		const cc = root?.maxConcurrentChildren ?? 5;
+		return html`
+			<div class="rounded-md border border-border bg-muted/40 px-3 py-2 text-[11px] leading-snug text-muted-foreground" data-testid="goal-form-orchestration-inherited">
+				Concurrency and plan-change autonomy are owned by the top-level goal${root ? html` <span class="text-foreground/70 font-medium">${root.title}</span>` : ""} and inherited across the tree: <span class="text-foreground/80 font-medium">${cc} parallel</span> · <span class="text-foreground/80 font-medium">${pol}</span>.
+			</div>
+		`;
+	}
+
+	// Root goal: editable controls. Display the server's default (5) when the
+	// user hasn't overridden it; submission keeps the field unset in that case
+	// so the server stays the single source of truth for the default.
+	const concurrency = Math.max(1, Math.min(8, config.maxConcurrentChildrenValue ?? 5));
+	const policy = config.divergencePolicyValue ?? "balanced";
+	const activeDesc = DIVERGENCE_OPTS.find(o => o.id === policy)?.desc ?? "";
+	return html`
+		<div class="flex flex-col gap-3 pt-1" data-testid="goal-form-orchestration">
+			<div class="flex items-center gap-1.5 text-xs text-muted-foreground">
+				<span>Max concurrent children</span>
+				<span class="inline-flex items-center rounded-md border border-border bg-background overflow-hidden">
+					<button type="button"
+						class="flex items-center justify-center w-6 h-6 text-muted-foreground hover:text-foreground hover:bg-secondary disabled:opacity-30 disabled:pointer-events-none transition-colors"
+						title="Decrease" ?disabled=${concurrency <= 1}
+						@click=${() => config.onMaxConcurrentChildrenChange?.(Math.max(1, concurrency - 1))}
+					>${icon(Minus, "xs")}</button>
+					<input type="number" min="1" max="8" step="1" .value=${String(concurrency)}
+						data-testid="goal-form-max-concurrent-children"
+						class="w-8 text-xs text-center px-0 py-0.5 border-0 border-x border-border bg-background text-foreground focus:outline-none focus:ring-0 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+						@change=${(e: Event) => {
+							const raw = parseInt((e.target as HTMLInputElement).value, 10);
+							if (Number.isFinite(raw)) config.onMaxConcurrentChildrenChange?.(Math.max(1, Math.min(8, raw)));
+						}} />
+					<button type="button"
+						class="flex items-center justify-center w-6 h-6 text-muted-foreground hover:text-foreground hover:bg-secondary disabled:opacity-30 disabled:pointer-events-none transition-colors"
+						title="Increase" ?disabled=${concurrency >= 8}
+						@click=${() => config.onMaxConcurrentChildrenChange?.(Math.min(8, concurrency + 1))}
+					>${icon(Plus, "xs")}</button>
+				</span>
+				<span title="How many child teams may run in parallel across the whole tree (1–8). Higher = faster but more token/compute load."
+					class="text-[9px] text-muted-foreground cursor-help">ⓘ</span>
+			</div>
+			<div class="flex flex-col gap-1">
+				<span class="text-xs text-muted-foreground">Plan-change autonomy</span>
+				<div class="inline-flex rounded-md border border-border overflow-hidden self-start" role="group" data-testid="goal-form-divergence-policy">
+					${DIVERGENCE_OPTS.map((o, i) => html`<button type="button"
+						data-testid="goal-form-divergence-${o.id}"
+						aria-pressed=${policy === o.id ? "true" : "false"}
+						class="text-xs px-3 py-1 transition-colors ${i > 0 ? "border-l border-border" : ""} ${policy === o.id ? "bg-primary text-primary-foreground font-medium" : "bg-background text-muted-foreground hover:text-foreground hover:bg-secondary"}"
+						@click=${() => config.onDivergencePolicyChange?.(o.id)}
+					>${o.label}</button>`)}
+				</div>
+				<span class="text-[11px] text-muted-foreground leading-snug">${activeDesc}</span>
+			</div>
+		</div>
+	`;
 }
 
 function renderGoalForm(config: GoalFormConfig) {
@@ -527,9 +858,15 @@ function renderGoalForm(config: GoalFormConfig) {
 	// When viewing a historical Goal (vN) tab, show that revision's number
 	// in the panel header instead of the live slot's latest rev.
 	const goalRev = (_proposalOverride?.type === "goal" ? _proposalOverride.rev : state.activeProposals.goal?.rev) ?? 0;
-	return html`
-		<div class="flex-1 overflow-y-auto px-5 pt-3 md:pt-4 pb-3 flex flex-col gap-2.5">
-			${goalRev > 0 ? html`<div class="text-xs text-muted-foreground -mb-1" data-testid="proposal-panel-rev">rev ${goalRev}</div>` : ""}
+	const tabbed = !!config.tabbed;
+	const activeTab: ProposalTab = config.activeTab ?? "goal";
+	const goalBody = html`
+		<div class="flex-1 overflow-y-auto px-5 pt-3 md:pt-4 pb-3 flex flex-col gap-2.5"
+			role=${tabbed ? "tabpanel" : nothing}
+			id=${tabbed ? "goal-proposal-panel-goal" : nothing}
+			aria-labelledby=${tabbed ? "goal-proposal-tab-goal" : nothing}
+			data-testid=${tabbed ? "goal-proposal-panel-goal" : nothing}>
+			${!tabbed && goalRev > 0 ? html`<div class="text-xs text-muted-foreground -mb-1" data-testid="proposal-panel-rev">rev ${goalRev}</div>` : ""}
 			${noWorkflows ? html`
 				<div
 					class="rounded-md border p-3 flex flex-col gap-2"
@@ -578,6 +915,8 @@ function renderGoalForm(config: GoalFormConfig) {
 					</div>
 				` : ""}
 			</div>
+			${!tabbed && (config.subgoalsEnabled || config.parentGoalId) ? renderParentPickerRow(config, lblCls) : ""}
+			${!tabbed ? renderSubgoalBreadcrumb(config) : ""}
 			${linkedProject ? html`
 				<div class="flex items-center gap-2 text-[11px] text-muted-foreground min-w-0">
 					<span class="${lblCls} w-20 md:w-16">Worktree</span>
@@ -656,6 +995,7 @@ function renderGoalForm(config: GoalFormConfig) {
 						` : ''}
 					</label>
 				`;})}
+				${!tabbed ? renderSubgoalsToggle(config) : ""}
 			</div>
 			<div class="flex-1 flex flex-col min-h-0">
 				<div class="flex items-center justify-between mb-1.5">
@@ -711,6 +1051,8 @@ function renderGoalForm(config: GoalFormConfig) {
 				}
 			</div>
 		</div>
+	`;
+	const footer = html`
 		<div class="shrink-0 flex flex-col gap-3 px-5 py-3 border-t border-border">
 			<div class="flex items-center justify-end gap-2">
 				${config.streaming ? streamingBadge() : ""}
@@ -738,6 +1080,267 @@ function renderGoalForm(config: GoalFormConfig) {
 					disabled: (config.createDisabled ?? !config.title.trim()) || !!config.streaming || noWorkflows,
 					children: config.saving ? "Creating…" : html`<span class="inline-flex items-center gap-1.5">${icon(GoalIcon, "sm")} Create Goal</span>`,
 				})}</span>
+			</div>
+		</div>
+	`;
+	if (!tabbed) {
+		return html`${goalBody}${footer}`;
+	}
+	const subgoalsTab = showSubgoalsTab(config);
+	const onTabChange = (t: ProposalTab) => config.onTabChange?.(t);
+	const onTabKey = (e: KeyboardEvent) => {
+		const order: ProposalTab[] = subgoalsTab ? ["goal", "workflow", "roles", "subgoals"] : ["goal", "workflow", "roles"];
+		const i = order.indexOf(activeTab);
+		if (e.key === "ArrowRight") { e.preventDefault(); onTabChange(order[(i + 1) % order.length]); }
+		else if (e.key === "ArrowLeft") { e.preventDefault(); onTabChange(order[(i - 1 + order.length) % order.length]); }
+		else if (e.key === "Home") { e.preventDefault(); onTabChange(order[0]); }
+		else if (e.key === "End") { e.preventDefault(); onTabChange(order[order.length - 1]); }
+	};
+	const tabCls = (selected: boolean) => "px-3 py-1.5 text-xs font-medium border-b-2 transition-colors " + (selected
+		? "border-primary text-foreground"
+		: "border-transparent text-muted-foreground hover:text-foreground");
+	// Static literal testids so the source-pin tests can detect them via text search.
+	const tabBar = html`
+		<div role="tablist" aria-label="Goal proposal sections"
+			class="shrink-0 flex items-center gap-1 px-5 pt-2 border-b border-border">
+			<button
+				role="tab"
+				id="goal-proposal-tab-goal"
+				data-testid="goal-proposal-tab-goal"
+				aria-selected=${activeTab === "goal" ? "true" : "false"}
+				aria-controls="goal-proposal-panel-goal"
+				tabindex=${activeTab === "goal" ? 0 : -1}
+				class=${tabCls(activeTab === "goal")}
+				@click=${() => onTabChange("goal")}
+				@keydown=${onTabKey}
+			>Goal</button>
+			<button
+				role="tab"
+				id="goal-proposal-tab-workflow"
+				data-testid="goal-proposal-tab-workflow"
+				aria-selected=${activeTab === "workflow" ? "true" : "false"}
+				aria-controls="goal-proposal-panel-workflow"
+				tabindex=${activeTab === "workflow" ? 0 : -1}
+				class=${tabCls(activeTab === "workflow")}
+				@click=${() => onTabChange("workflow")}
+				@keydown=${onTabKey}
+			>Workflow</button>
+			<button
+				role="tab"
+				id="goal-proposal-tab-roles"
+				data-testid="goal-proposal-tab-roles"
+				aria-selected=${activeTab === "roles" ? "true" : "false"}
+				aria-controls="goal-proposal-panel-roles"
+				tabindex=${activeTab === "roles" ? 0 : -1}
+				class=${tabCls(activeTab === "roles")}
+				@click=${() => onTabChange("roles")}
+				@keydown=${onTabKey}
+			>Roles</button>
+			${subgoalsTab ? html`<button
+				role="tab"
+				id="goal-proposal-tab-subgoals"
+				data-testid="goal-proposal-tab-subgoals"
+				aria-selected=${activeTab === "subgoals" ? "true" : "false"}
+				aria-controls="goal-proposal-panel-subgoals"
+				tabindex=${activeTab === "subgoals" ? 0 : -1}
+				class=${tabCls(activeTab === "subgoals")}
+				@click=${() => onTabChange("subgoals")}
+				@keydown=${onTabKey}
+			>Sub-goals</button>` : ""}
+			${goalRev > 0 ? html`<span class="ml-auto mb-1.5 text-xs px-2 py-0.5 rounded-full border border-border text-muted-foreground" data-testid="proposal-panel-rev">rev ${goalRev}</span>` : ""}
+		</div>
+	`;
+	const panel = activeTab === "goal"
+		? goalBody
+		: activeTab === "workflow"
+			? renderProposalWorkflowTab(config)
+			: activeTab === "subgoals"
+				? renderProposalSubgoalsTab(config)
+				: renderProposalRolesTab(config);
+	return html`${tabBar}${panel}${footer}`;
+}
+
+// ============================================================================
+// PROPOSAL MODAL — WORKFLOW TAB
+//
+// A workflow <select> (synced to the Goal tab's picker via the shared
+// config.workflowId / config.onWorkflowChange) with a Customise/Revert toggle
+// to its right; the chosen workflow renders beneath in read-only inspector
+// form, or as the editor while customising. Reuses renderWorkflowInspector /
+// renderWorkflowEditor from src/app/workflow-page.ts. The editor runs in
+// `goal-draft` scope: every mutation flows back through
+// `config.onInlineWorkflowChange` and NEVER mutates the project workflow store.
+// ============================================================================
+function renderProposalWorkflowTab(config: GoalFormConfig): TemplateResult {
+	const selectedId = config.workflowId;
+	const workflows = _cachedWorkflows;
+	const inline = config.inlineWorkflow ?? null;
+	const customizing = !!config.customizingWorkflow && !!inline;
+	const selectedLibrary = workflows.find((w) => w.id === selectedId) ?? workflows[0] ?? null;
+	const displayWf = inline ?? selectedLibrary;
+	return html`
+		<div class="flex-1 overflow-hidden flex flex-col min-h-0 min-w-0"
+			role="tabpanel"
+			id="goal-proposal-panel-workflow"
+			aria-labelledby="goal-proposal-tab-workflow"
+			data-testid="goal-proposal-panel-workflow">
+			${workflows.length === 0
+				? html`<p class="text-xs text-muted-foreground px-5 pt-3">No workflows available for this project.</p>`
+				: html`
+					<div class="shrink-0 flex items-center gap-2 px-5 pt-3 md:pt-4 pb-3">
+						<label class="text-xs text-muted-foreground font-medium shrink-0">Workflow</label>
+						<select
+							class="flex-1 min-w-0 text-sm px-2 py-1.5 rounded-md border border-border bg-background text-foreground h-9"
+							data-testid="goal-proposal-workflow-select"
+							.value=${selectedId}
+							@change=${config.onWorkflowChange}>
+							${workflows.map((w) => html`
+								<option value=${w.id} ?selected=${selectedId === w.id}>${w.name} (${w.gates.length} gates)</option>
+							`)}
+						</select>
+						${customizing
+							? Button({
+									variant: "ghost",
+									size: "sm",
+									onClick: () => config.onResetWorkflow?.(),
+									children: html`<span data-testid="goal-proposal-workflow-reset">Revert to project definition</span>`,
+							  })
+							: Button({
+									variant: "secondary",
+									size: "sm",
+									onClick: () => config.onCustomizeWorkflow?.(),
+									disabled: !selectedLibrary,
+									children: html`<span data-testid="goal-proposal-workflow-customize">Customise for this goal</span>`,
+							  })}
+					</div>
+					<hr class="shrink-0 border-t border-border" />
+					<div class="flex-1 min-h-0 min-w-0 overflow-auto px-5 py-3">
+						${customizing && inline
+							? renderWorkflowEditor({
+								workflow: inline,
+								onChange: (wf) => config.onInlineWorkflowChange?.(wf),
+								scope: "goal-draft",
+							})
+							: renderWorkflowInspector({ workflow: displayWf, scope: "goal-draft" })}
+					</div>
+				`}
+		</div>
+	`;
+}
+
+// ============================================================================
+// PROPOSAL MODAL — ROLES TAB
+//
+// Reuses renderRoleList / renderRoleInspector / renderRoleEditor exported
+// from src/app/role-manager-page.ts. Customisations are kept in a
+// per-role-name map (`inlineRoles`) and only the subset the user actually
+// touched is forwarded to createGoal at submit time.
+// ============================================================================
+function renderProposalRolesTab(config: GoalFormConfig): TemplateResult {
+	const roles = config.roleList ?? [];
+	const selectedName = config.selectedRoleName ?? null;
+	const inlineMap = config.inlineRoles ?? {};
+	const customizedNames = new Set(Object.keys(inlineMap));
+	const selectedLibraryRole = roles.find((r) => r.name === selectedName) ?? roles[0] ?? null;
+	const inlineSelected = selectedName ? inlineMap[selectedName] : undefined;
+	const displayRole = inlineSelected ?? selectedLibraryRole;
+	const customizing = !!config.customizingRole && !!inlineSelected;
+	const availableTools = config.availableTools ?? [];
+	const groupPolicies = config.groupPolicies ?? {};
+	const draft: RoleEditorDraft | null = displayRole ? {
+		label: displayRole.label,
+		promptTemplate: displayRole.promptTemplate,
+		accessory: displayRole.accessory ?? "none",
+		toolPolicies: { ...(displayRole.toolPolicies ?? {}) },
+		model: displayRole.model ?? "",
+		thinkingLevel: displayRole.thinkingLevel ?? "",
+		activeTab: config.roleEditTab ?? "prompt",
+	} : null;
+	return html`
+		<div class="flex-1 overflow-hidden flex min-h-0"
+			role="tabpanel"
+			id="goal-proposal-panel-roles"
+			aria-labelledby="goal-proposal-tab-roles"
+			data-testid="goal-proposal-panel-roles">
+			<div class="w-64 shrink-0 border-r border-border overflow-y-auto p-3">
+				${config.roleListLoading
+					? html`<p class="text-xs text-muted-foreground">Loading roles…</p>`
+					: roles.length === 0
+						? html`<p class="text-xs text-muted-foreground">No roles available.</p>`
+						: renderRoleList({
+							roles,
+							selectedName,
+							customizedNames,
+							onSelect: (r) => config.onSelectRole?.(r.name),
+							scope: "goal-draft",
+						})}
+			</div>
+			<div class="flex-1 overflow-y-auto p-3 flex flex-col gap-2 min-w-0">
+				<div class="flex items-center justify-end gap-2">
+					${displayRole ? (customizing
+						? Button({
+								variant: "ghost",
+								size: "sm",
+								onClick: () => config.onResetRole?.(),
+								children: html`<span data-testid="goal-proposal-role-reset">Reset to default</span>`,
+						  })
+						: Button({
+								variant: "secondary",
+								size: "sm",
+								onClick: () => config.onCustomizeRole?.(),
+								children: html`<span data-testid="goal-proposal-role-customize">Customize for this goal</span>`,
+						  })) : nothing}
+				</div>
+				${displayRole && draft
+					? (customizing
+						? renderRoleEditor({
+							role: displayRole,
+							draft,
+							availableTools,
+							groupPolicies,
+							collapsedToolGroups: config.roleCollapsedGroups ?? new Set<string>(),
+							callbacks: {
+								onDraftChange: (patch) => config.onRoleDraftChange?.(patch),
+								onTabChange: (tab) => config.onRoleEditorTabChange?.(tab),
+								onToggleToolGroup: (g) => config.onRoleToggleToolGroup?.(g),
+							},
+							scope: "goal-draft",
+						})
+						: renderRoleInspector({
+							role: displayRole,
+							availableTools,
+							groupPolicies,
+							scope: "goal-draft",
+						}))
+					: html`<p class="text-xs text-muted-foreground">Select a role from the list to inspect or customise it.</p>`}
+			</div>
+		</div>
+	`;
+}
+
+// ============================================================================
+// PROPOSAL MODAL — SUB-GOALS TAB
+//
+// Collates the per-goal nesting controls: parent picker, breadcrumb, and the
+// allow-subgoals toggle + max-depth control.
+// ============================================================================
+function renderProposalSubgoalsTab(config: GoalFormConfig): TemplateResult {
+	const lblCls = "text-xs text-muted-foreground font-medium shrink-0";
+	return html`
+		<div class="flex-1 overflow-y-auto px-5 pt-3 md:pt-4 pb-3 flex flex-col gap-4"
+			role="tabpanel"
+			id="goal-proposal-panel-subgoals"
+			aria-labelledby="goal-proposal-tab-subgoals"
+			data-testid="goal-proposal-panel-subgoals">
+			<div class="flex flex-col gap-2.5">
+				${renderParentPickerRow(config, lblCls)}
+				${renderSubgoalBreadcrumb(config)}
+				${config.subgoalsEnabled && config.onSubgoalsAllowedChange && config.onMaxNestingDepthChange ? html`
+					<div class="flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-0.5">
+						${renderSubgoalsToggle(config)}
+					</div>
+				` : ""}
+				${renderSubgoalOrchestration(config)}
 			</div>
 		</div>
 	`;
@@ -2015,6 +2618,129 @@ let _proposalSandboxed = false;
 let _proposalAutoStartTeam = true;
 let _proposalEnabledOptionalSteps: string[] = [];
 let _proposalInitializedFrom: string | null = null;
+// Per-goal subgoal controls. null means "inherit system preference" — only
+// forwarded to createGoal when the user actually touched the control.
+let _proposalParentGoalId: string = "";
+let _proposalSubgoalsAllowed: boolean | null = null;
+let _proposalMaxNestingDepth: number | null = null;
+// Root-only tree orchestration. null = inherit default (balanced / 3).
+let _proposalDivergencePolicy: "strict" | "balanced" | "autonomous" | null = null;
+let _proposalMaxConcurrentChildren: number | null = null;
+
+// ----------------------------------------------------------------------------
+// Proposal-modal tabs state (Goal / Workflow / Roles).
+//
+// `_proposalInlineWorkflow` is the draft-scoped customised workflow — when
+// non-null, the submit path forwards it as `workflow` instead of
+// `workflowId`. `_proposalInlineRoles` is the draft-scoped per-role override
+// map keyed by role name; the submit path forwards it as `inlineRoles` when
+// non-empty. Neither mutates the project workflow/role store.
+//
+// Regression context: a master→PR merge silently dropped the inline-workflow
+// + inline-roles editor surface. This is its replacement — a tabbed UI reusing
+// the main Workflows/Roles page renderers. Pinned by
+// tests/source-pin-merge-invariants.test.ts.
+// ----------------------------------------------------------------------------
+type ProposalTab = "goal" | "workflow" | "roles" | "subgoals";
+let _proposalActiveTab: ProposalTab = "goal";
+let _proposalInlineWorkflow: Workflow | null = null;
+let _proposalInlineRoles: Record<string, RoleData> = {};
+let _proposalSelectedRoleName: string | null = null;
+let _proposalCustomizingWorkflow = false;
+let _proposalCustomizingRole = false;
+let _proposalRoleEditTab: "prompt" | "tools" | "model" = "prompt";
+let _proposalRoleCollapsedGroups = new Set<string>();
+let _proposalTabsInitializedFrom: string | null = null;
+// Role data caches for the modal, project-scoped: roles can be customised per
+// project, so we key the cache by `projectId` ("" for system scope) and
+// re-fetch when the selected project changes.
+const _proposalRolesCacheByProject = new Map<string, RoleData[]>();
+const _proposalRolesLoadingByProject = new Set<string>();
+let _proposalGroupPoliciesCache: Record<string, string> | null = null;
+let _proposalGroupPoliciesLoading = false;
+
+function proposalRolesProjectKey(): string {
+	return state.previewProjectId || "";
+}
+
+/** Read-only accessor: roles list for the modal's currently-selected project. */
+function proposalRolesList(): RoleData[] {
+	return _proposalRolesCacheByProject.get(proposalRolesProjectKey()) ?? [];
+}
+
+function proposalRolesLoading(): boolean {
+	return _proposalRolesLoadingByProject.has(proposalRolesProjectKey());
+}
+
+function ensureProposalRolesLoaded(): void {
+	const key = proposalRolesProjectKey();
+	if (_proposalRolesCacheByProject.has(key) || _proposalRolesLoadingByProject.has(key)) return;
+	_proposalRolesLoadingByProject.add(key);
+	fetchRolesForProject(key || undefined)
+		.then((list) => {
+			_proposalRolesCacheByProject.set(key, list);
+			_proposalRolesLoadingByProject.delete(key);
+			if (proposalRolesProjectKey() === key && !_proposalSelectedRoleName && list.length > 0) {
+				_proposalSelectedRoleName = list[0].name;
+			}
+			renderApp();
+		})
+		.catch(() => {
+			_proposalRolesCacheByProject.set(key, []);
+			_proposalRolesLoadingByProject.delete(key);
+			renderApp();
+		});
+}
+
+function ensureProposalGroupPoliciesLoaded(): void {
+	if (_proposalGroupPoliciesCache !== null || _proposalGroupPoliciesLoading) return;
+	_proposalGroupPoliciesLoading = true;
+	fetchGroupPolicies().then((gp) => {
+		_proposalGroupPoliciesCache = gp;
+		_proposalGroupPoliciesLoading = false;
+		renderApp();
+	}).catch(() => {
+		_proposalGroupPoliciesCache = {};
+		_proposalGroupPoliciesLoading = false;
+		renderApp();
+	});
+}
+
+/** Deep-clone a Workflow so editor mutations never touch the cached library copy. */
+function cloneWorkflow(wf: Workflow): Workflow {
+	return {
+		...wf,
+		gates: (wf.gates || []).map((g) => ({
+			...g,
+			dependsOn: [...(g.dependsOn || [])],
+			verify: g.verify ? g.verify.map((v) => ({ ...v })) : undefined,
+			metadata: g.metadata ? { ...g.metadata } : undefined,
+		})),
+	};
+}
+
+/** Deep-clone a RoleData so editor mutations never touch the cached library copy. */
+function cloneRole(r: RoleData): RoleData {
+	return {
+		...r,
+		toolPolicies: { ...(r.toolPolicies ?? {}) },
+	};
+}
+
+/** Reset all proposal-tab module state. Called when the proposal is dismissed
+ *  or successfully accepted, and when syncing from a new proposal payload. */
+function resetProposalTabsState(): void {
+	_proposalActiveTab = "goal";
+	_proposalInlineWorkflow = null;
+	_proposalInlineRoles = {};
+	_proposalSelectedRoleName = null;
+	_proposalCustomizingWorkflow = false;
+	_proposalCustomizingRole = false;
+	_proposalRoleEditTab = "prompt";
+	_proposalRoleCollapsedGroups = new Set<string>();
+	_proposalTabsInitializedFrom = null;
+	clearWorkflowEditorController();
+}
 
 // When a historical proposal tab is the active panel tab, the dispatcher
 // sets this to an override that supplies the form state for that revision.
@@ -2076,18 +2802,54 @@ function syncProposalFormState(): void {
 	const raw = _proposalOverride?.type === "goal"
 		? _proposalOverride.fields
 		: state.activeProposals.goal?.fields;
-	const proposal = raw as undefined | { title: string; spec: string; cwd?: string; workflow?: string; options?: string };
+	const proposal = raw as undefined | {
+		title: string; spec: string; cwd?: string; workflow?: string; options?: string;
+		parentGoalId?: string; inlineWorkflow?: Workflow; inlineRoles?: Record<string, RoleData>;
+		subgoalsAllowed?: boolean; maxNestingDepth?: number;
+		divergencePolicy?: "strict" | "balanced" | "autonomous"; maxConcurrentChildren?: number;
+	};
 	if (!proposal) return;
+
+	// --- Tab + inline-customisation reset identity ---------------------------
+	// Keyed by the *initial* inline payload, NOT mutable title/spec/cwd, so the
+	// user's active tab + draft workflow/role edits survive every streamed token.
+	const inlineKey = proposal.inlineWorkflow ? JSON.stringify(proposal.inlineWorkflow) : "";
+	const rolesKey = proposal.inlineRoles ? JSON.stringify(proposal.inlineRoles) : "";
+	const tabsKey = `${inlineKey}|${rolesKey}`;
+	if (_proposalTabsInitializedFrom !== tabsKey) {
+		// NOTE: resetProposalTabsState() clears _proposalTabsInitializedFrom, so
+		// set it AFTER the reset, not before.
+		resetProposalTabsState();
+		_proposalTabsInitializedFrom = tabsKey;
+		if (proposal.inlineWorkflow && typeof proposal.inlineWorkflow === "object" && (proposal.inlineWorkflow as Workflow).id) {
+			_proposalInlineWorkflow = cloneWorkflow(proposal.inlineWorkflow as Workflow);
+			_proposalCustomizingWorkflow = true;
+		}
+		if (proposal.inlineRoles && typeof proposal.inlineRoles === "object") {
+			for (const [name, role] of Object.entries(proposal.inlineRoles)) {
+				if (role && typeof role === "object") {
+					_proposalInlineRoles[name] = cloneRole(role as RoleData);
+				}
+			}
+			const firstCustomized = Object.keys(_proposalInlineRoles)[0];
+			if (firstCustomized) _proposalSelectedRoleName = firstCustomized;
+		}
+	}
+
 	// Use a simple identity check to avoid re-initializing on every render
-	const key = `${proposal.title}|${proposal.spec}|${proposal.cwd || ""}|${proposal.workflow || ""}|${proposal.options || ""}`;
+	const key = `${proposal.title}|${proposal.spec}|${proposal.cwd || ""}|${proposal.workflow || ""}|${proposal.options || ""}|${proposal.parentGoalId || ""}|${proposal.subgoalsAllowed ?? ""}|${proposal.maxNestingDepth ?? ""}|${proposal.divergencePolicy ?? ""}|${proposal.maxConcurrentChildren ?? ""}`;
 	if (_proposalInitializedFrom === key) return;
 	_proposalInitializedFrom = key;
 	_proposalTitle = proposal.title;
 	_proposalSpec = proposal.spec;
+	_proposalParentGoalId = proposal.parentGoalId || "";
 	// Preserve project rootPath when proposal doesn't specify cwd
 	const proposalProject = state.previewProjectId ? state.projects.find(p => p.id === state.previewProjectId) : undefined;
 	_proposalCwd = proposal.cwd || proposalProject?.rootPath || "";
 	_proposalWorkflowId = proposal.workflow || "";
+	if (!_proposalWorkflowId && _proposalInlineWorkflow) {
+		_proposalWorkflowId = _proposalInlineWorkflow.id;
+	}
 	// Correct a phantom/empty proposed workflow immediately when the cache is already
 	// loaded, so the rendered option and form state agree on the same render.
 	normalizeWorkflowSelections();
@@ -2096,6 +2858,16 @@ function syncProposalFormState(): void {
 		? proposal.options.split(",").map(s => s.trim()).filter(Boolean)
 		: [];
 	_proposalSaving = false;
+	// Seed the per-goal nesting + orchestration controls from the proposal so an
+	// agent can pre-set everything a human sets on the Sub-goals tab. Absent
+	// fields fall back to null = "inherit default" (submission still defaults
+	// subgoalsAllowed to off and maxConcurrentChildren to its max).
+	_proposalSubgoalsAllowed = typeof proposal.subgoalsAllowed === "boolean" ? proposal.subgoalsAllowed : null;
+	_proposalMaxNestingDepth = typeof proposal.maxNestingDepth === "number" ? proposal.maxNestingDepth : null;
+	_proposalDivergencePolicy = (proposal.divergencePolicy === "strict" || proposal.divergencePolicy === "balanced" || proposal.divergencePolicy === "autonomous")
+		? proposal.divergencePolicy
+		: null;
+	_proposalMaxConcurrentChildren = typeof proposal.maxConcurrentChildren === "number" ? proposal.maxConcurrentChildren : null;
 }
 
 function goalProposalPanel() {
@@ -2126,6 +2898,11 @@ function goalProposalPanel() {
 	syncProposalFormState();
 	ensureWorkflowsLoaded(state.previewProjectId || undefined);
 	ensureSandboxStatusLoaded();
+	ensureProposalRolesLoaded();
+	ensureProposalGroupPoliciesLoaded();
+	ensureToolsLoaded();
+	const subgoalsEnabled = isSubgoalsEnabled();
+	const maxNestingDepth = getSystemMaxNestingDepth();
 
 	const handleCreateGoal = async () => {
 		const trimmedTitle = _proposalTitle.trim();
@@ -2156,13 +2933,51 @@ function goalProposalPanel() {
 		let goal;
 		try {
 			try {
+				// Per-goal sub-goals default to OFF: an untouched (null) value is
+				// submitted as false so the team-lead cannot nest unless the user
+				// explicitly opts in.
+				const subgoalsAllowedField = subgoalsEnabled
+					? (_proposalSubgoalsAllowed ?? false)
+					: undefined;
+				const maxNestingDepthField = subgoalsEnabled && _proposalMaxNestingDepth !== null
+					? _proposalMaxNestingDepth
+					: undefined;
+				// Root-only orchestration. Only forwarded for a top-level goal
+				// (no parent) that allows subgoals, and only when the user
+				// actually picked a value (null = inherit server default).
+				const isRootProposal = !_proposalParentGoalId;
+				const allowsChildren = subgoalsEnabled && (_proposalSubgoalsAllowed ?? false);
+				const divergencePolicyField = isRootProposal && allowsChildren && _proposalDivergencePolicy !== null
+					? _proposalDivergencePolicy
+					: undefined;
+				// Only forward an explicit value when the user actually changed the
+				// stepper; an untouched control stays unset so the goal resolves to
+				// the server default (resolveRootMaxConcurrentChildren). This avoids
+				// baking a literal default into stored data and keeps the default a
+				// single source of truth on the server.
+				const maxConcurrentChildrenField = isRootProposal && allowsChildren && _proposalMaxConcurrentChildren !== null
+					? _proposalMaxConcurrentChildren
+					: undefined;
+				// Customised inline workflow takes precedence over the library
+				// workflowId. inlineRoles is only forwarded when non-empty.
+				const inlineWorkflowField = _proposalInlineWorkflow ?? undefined;
+				const inlineRolesField = Object.keys(_proposalInlineRoles).length > 0
+					? _proposalInlineRoles as Record<string, unknown>
+					: undefined;
 				goal = await createGoal(trimmedTitle, _proposalCwd.trim(), {
 					spec: _proposalSpec,
-					workflowId,
+					workflowId: inlineWorkflowField ? undefined : workflowId,
+					workflow: inlineWorkflowField,
+					inlineRoles: inlineRolesField,
 					sandboxed,
 					projectId,
 					enabledOptionalSteps,
 					autoStartTeam,
+					parentGoalId: _proposalParentGoalId || undefined,
+					subgoalsAllowed: subgoalsAllowedField,
+					maxNestingDepth: maxNestingDepthField,
+					divergencePolicy: divergencePolicyField,
+					maxConcurrentChildren: maxConcurrentChildrenField,
 				});
 			} catch (err) {
 				const { message, code, stack } = errorDetails(err);
@@ -2177,6 +2992,12 @@ function goalProposalPanel() {
 			_proposalInitializedFrom = null;
 			_proposalSandboxed = false;
 			_proposalAutoStartTeam = true;
+			_proposalParentGoalId = "";
+			_proposalSubgoalsAllowed = null;
+			_proposalMaxNestingDepth = null;
+			_proposalDivergencePolicy = null;
+			_proposalMaxConcurrentChildren = null;
+			resetProposalTabsState();
 			setHashRoute("goal-dashboard", goal.id, true);
 		} finally {
 			_proposalSaving = false;
@@ -2193,6 +3014,11 @@ function goalProposalPanel() {
 
 	const handleDismiss = () => {
 		const dismissed = state.activeProposals.goal?.fields as undefined | { title: string; spec: string; cwd?: string; workflow?: string; options?: string };
+		// Suppress the in-flight streaming block so later deltas don't re-open
+		// the just-dismissed goal proposal (see dismissStreamingProposal).
+		if (isProposalStreaming("goal_proposal")) {
+			state.remoteAgent?.dismissStreamingProposal("goal_proposal");
+		}
 		const sidEarly = activeSessionId();
 		if (sidEarly) clearProposalAnnotations(sidEarly, "goal");
 		resetProposalAnnCount("goal");
@@ -2200,6 +3026,12 @@ function goalProposalPanel() {
 		_proposalInitializedFrom = null;
 		_proposalEnabledOptionalSteps = [];
 		_proposalAutoStartTeam = true;
+		_proposalParentGoalId = "";
+		_proposalSubgoalsAllowed = null;
+		_proposalMaxNestingDepth = null;
+		_proposalDivergencePolicy = null;
+		_proposalMaxConcurrentChildren = null;
+		resetProposalTabsState();
 		// Persist dismiss so it survives reconnect
 		const sid = activeSessionId();
 		if (sid && dismissed) {
@@ -2232,7 +3064,17 @@ function goalProposalPanel() {
 		onSpecChange: (e: Event) => { _proposalSpec = (e.target as HTMLTextAreaElement).value; },
 		onCwdChange: (v) => { _proposalCwd = v; renderApp(); },
 		onCwdSelect: (v) => { _proposalCwd = v; renderApp(); },
-		onWorkflowChange: (e: Event) => { _proposalWorkflowId = (e.target as HTMLSelectElement).value; renderApp(); },
+		onWorkflowChange: (e: Event) => {
+			_proposalWorkflowId = (e.target as HTMLSelectElement).value;
+			// Changing the picker selects a different library workflow; any prior
+			// goal-draft inline workflow customisation is for the old selection and
+			// must be cleared so submit doesn't ship stale inline content alongside
+			// the newly-selected workflowId.
+			_proposalInlineWorkflow = null;
+			_proposalCustomizingWorkflow = false;
+			clearWorkflowEditorController();
+			renderApp();
+		},
 		onSandboxChange: (e: Event) => { _proposalSandboxed = (e.target as HTMLInputElement).checked; renderApp(); },
 		onSpecEditToggle: () => { _proposalSpecEditMode = !_proposalSpecEditMode; renderApp(); },
 		onOptionalStepsChange: (steps) => { _proposalEnabledOptionalSteps = steps; renderApp(); },
@@ -2245,9 +3087,110 @@ function goalProposalPanel() {
 		onCreate: handleCreateGoal,
 		onDismiss: handleDismiss,
 		saving: _proposalSaving,
-		createDisabled: !_proposalTitle.trim() || _proposalSaving,
+		createDisabled: (() => {
+			if (!_proposalTitle.trim() || _proposalSaving) return true;
+			// Disable Create when a parent is selected but the child would exceed cap.
+			if (_proposalParentGoalId && maxNestingDepth !== undefined) {
+				const pDepth = computeGoalDepth(_proposalParentGoalId, state.goals);
+				if (pDepth + 1 > maxNestingDepth) return true;
+			}
+			return false;
+		})(),
 		streaming: isProposalStreaming("goal_proposal"),
 		commentable: true,
+		parentGoalId: _proposalParentGoalId || undefined,
+		onParentGoalChange: (id) => { _proposalParentGoalId = id || ""; renderApp(); },
+		subgoalsEnabled,
+		maxNestingDepth,
+		subgoalsAllowedValue: _proposalSubgoalsAllowed,
+		maxNestingDepthValue: _proposalMaxNestingDepth,
+		onSubgoalsAllowedChange: (value: boolean) => { _proposalSubgoalsAllowed = value; renderApp(); },
+		onMaxNestingDepthChange: (value: number | null) => { _proposalMaxNestingDepth = value; renderApp(); },
+		divergencePolicyValue: _proposalDivergencePolicy,
+		maxConcurrentChildrenValue: _proposalMaxConcurrentChildren,
+		onDivergencePolicyChange: (value) => { _proposalDivergencePolicy = value; renderApp(); },
+		onMaxConcurrentChildrenChange: (value) => { _proposalMaxConcurrentChildren = value; renderApp(); },
+
+		// ---- Proposal-modal tabs wiring ----
+		tabbed: true,
+		activeTab: _proposalActiveTab,
+		onTabChange: (tab) => { _proposalActiveTab = tab; renderApp(); },
+
+		inlineWorkflow: _proposalInlineWorkflow,
+		customizingWorkflow: _proposalCustomizingWorkflow,
+		onInlineWorkflowChange: (wf) => { _proposalInlineWorkflow = wf; renderApp(); },
+		onCustomizeWorkflow: () => {
+			const src = _cachedWorkflows.find((w) => w.id === _proposalWorkflowId) ?? _cachedWorkflows[0];
+			if (!src) return;
+			_proposalInlineWorkflow = cloneWorkflow(src);
+			_proposalCustomizingWorkflow = true;
+			clearWorkflowEditorController();
+			renderApp();
+		},
+		onResetWorkflow: () => {
+			_proposalInlineWorkflow = null;
+			_proposalCustomizingWorkflow = false;
+			// Normalize a stale inline-only id back to a real library workflow so
+			// submit doesn't forward a discarded inline workflow's id as `workflowId`.
+			if (!_cachedWorkflows.some((w) => w.id === _proposalWorkflowId)) {
+				_proposalWorkflowId = _cachedWorkflows[0]?.id ?? "";
+			}
+			clearWorkflowEditorController();
+			renderApp();
+		},
+
+		inlineRoles: _proposalInlineRoles,
+		selectedRoleName: _proposalSelectedRoleName,
+		onSelectRole: (name) => {
+			_proposalSelectedRoleName = name;
+			_proposalCustomizingRole = !!_proposalInlineRoles[name];
+			renderApp();
+		},
+		customizingRole: _proposalCustomizingRole && !!_proposalSelectedRoleName && !!_proposalInlineRoles[_proposalSelectedRoleName],
+		onCustomizeRole: () => {
+			const name = _proposalSelectedRoleName;
+			if (!name) return;
+			const src = proposalRolesList().find((r) => r.name === name);
+			if (!src) return;
+			if (!_proposalInlineRoles[name]) _proposalInlineRoles[name] = cloneRole(src);
+			_proposalCustomizingRole = true;
+			_proposalRoleEditTab = "prompt";
+			renderApp();
+		},
+		onResetRole: () => {
+			const name = _proposalSelectedRoleName;
+			if (!name) return;
+			delete _proposalInlineRoles[name];
+			_proposalCustomizingRole = false;
+			renderApp();
+		},
+		onRoleDraftChange: (patch) => {
+			const name = _proposalSelectedRoleName;
+			if (!name) return;
+			const current = _proposalInlineRoles[name];
+			if (!current) return;
+			const next: RoleData = { ...current };
+			if (patch.label !== undefined) next.label = patch.label;
+			if (patch.promptTemplate !== undefined) next.promptTemplate = patch.promptTemplate;
+			if (patch.accessory !== undefined) next.accessory = patch.accessory;
+			if (patch.toolPolicies !== undefined) next.toolPolicies = patch.toolPolicies;
+			if (patch.model !== undefined) next.model = patch.model;
+			if (patch.thinkingLevel !== undefined) next.thinkingLevel = patch.thinkingLevel;
+			_proposalInlineRoles[name] = next;
+			renderApp();
+		},
+		onRoleEditorTabChange: (tab) => { _proposalRoleEditTab = tab; renderApp(); },
+		onRoleToggleToolGroup: (group) => {
+			if (_proposalRoleCollapsedGroups.has(group)) _proposalRoleCollapsedGroups.delete(group);
+			else _proposalRoleCollapsedGroups.add(group);
+			renderApp();
+		},
+		roleEditTab: _proposalRoleEditTab,
+		roleCollapsedGroups: _proposalRoleCollapsedGroups,
+		roleList: proposalRolesList(),
+		roleListLoading: proposalRolesLoading(),
+		availableTools: _availableTools,
+		groupPolicies: _proposalGroupPoliciesCache ?? {},
 	});
 }
 

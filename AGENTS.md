@@ -7,9 +7,9 @@ npm run build          # Full build (server + UI)
 npm run dev:harness    # Gateway via restart harness + vite (use this for dev)
 npm run restart-server # Rebuild & restart after server changes
 npm run check          # Type-check server + web (no emit)
-npm run test:unit      # Unit — file:// fixtures + Node runner (<30s)
-npm run test:e2e       # E2E — API (in-process) + browser (spawned gateway)
-npm run test:manual    # Manual integration — real agents + Docker (~5 min)
+npm run test:unit      # Unit phase — node:test logic + file:// browser fixtures, run concurrently (~90s)
+npm run test:e2e       # E2E phase — API (in-process) + browser (spawned gateway)
+npm run test:manual    # Manual integration — real agents/LLM + Docker (~5 min); ONLY gate-exempt path
 SCREENSHOTS=1 npm run test:manual  # + browser screenshots + HTML report
 ```
 
@@ -39,7 +39,7 @@ Where things live. Use this to orient, then `rg` for the symbol.
 ## Testing
 
 - **UI-only changes** → `test:unit`. **Server changes** → `test:unit` + `test:e2e`. **Session lifecycle / sandbox / worktree / restart** → also `test:manual`.
-- **Test types**: unit (`tests/*.spec.ts`, file:// fixtures), API E2E (`tests/e2e/*.spec.ts`, in-process gateway via `./in-process-harness.js`), browser E2E (`tests/e2e/ui/*.spec.ts`, spawned gateway via `../gateway-harness.js`).
+- **Test types**: unit·node (`tests/*.test.ts` via node:test), unit·browser (`tests/*.spec.ts`, file:// fixtures), API E2E (`tests/e2e/*.spec.ts`, in-process gateway), browser E2E (`tests/e2e/ui/*.spec.ts`, spawned gateway). **Phase invariant**: every test except `tests/manual-integration/**` runs in exactly one of unit/e2e, pinned by `tests/test-phase-invariant.test.ts`. See [docs/testing-strategy.md](docs/testing-strategy.md).
 - Tests run in isolation — never read/write `.bobbit/` directly; use the isolated dir from `e2e-setup.ts`.
 - **Never start background servers from bash** (`node server.js &`) — pipes hang the agent. Use `bash_bg`.
 - Prefer `file://` fixtures for new tests; use E2E only when you need a real server.
@@ -51,15 +51,13 @@ Where things live. Use this to orient, then `rg` for the symbol.
 
 Primary branch is **`master`** (not `main`). Never create a `main` branch.
 
-**Line endings**: LF everywhere except `*.cmd`/`*.bat`/`*.ps1` (CRLF), pinned via `.gitattributes`. Windows: `git config --global core.autocrlf false` (phantom "modified" entries on fresh checkout = `core.autocrlf=true`).
+**Line endings**: LF everywhere except `*.cmd`/`*.bat`/`*.ps1` (CRLF), pinned via `.gitattributes`. Windows: set `git config --global core.autocrlf false`.
 
-**Worktrees**: dev server runs from the **primary worktree** on `master`. Sessions use separate worktrees under `<project-root>-wt/<branch>/` (single-repo) or `<project-root>-wt/<branch>/<repo>/` (multi-repo). Branch namespaces: `pool/_pool-<id>`, `session/<id8>`, `goal/<slug>-<id>`, `staff-<name>-<id>`. Multi-repo: every component repo gets a sibling worktree on the same branch. Start-point: project `base_ref` else remote primary — see [docs/design/base-ref.md](docs/design/base-ref.md).
+**Worktrees**: dev server runs from the **primary worktree** on `master`; sessions use separate worktrees under `<project-root>-wt/<branch>/`. Always edit files in your session worktree, never the primary one. For infra files: edit here → commit → push → `cd <primary-worktree> && git pull origin master` (pushing to remote `master` does NOT update the dev server).
 
-**Always edit files in your session worktree, never in the primary worktree.** For infra files: edit here → commit → push → pull from primary. Pushing to remote `master` does NOT update the dev server — `cd <primary-worktree> && git pull origin master`.
+**Forks**: open PRs against the fork's `master`, not the upstream repo.
 
-**Opening PRs on fork**: when working on forks of the main repository, make sure to open PRs on fork master branch not the original repository master branch. 
-
-See [docs/dev-workflow.md](docs/dev-workflow.md) for the full worktree story — including the worktree-stash hazard (never `git stash` in a session worktree).
+See [docs/dev-workflow.md](docs/dev-workflow.md) for the full worktree story — branch namespaces, start-point/`base_ref` ([docs/design/base-ref.md](docs/design/base-ref.md)), and the worktree-stash hazard (never `git stash` in a session worktree).
 
 ## Maintaining this file
 
@@ -71,4 +69,4 @@ AGENTS.md is loaded into **every** agent turn. Keep it small and general.
 
 ## Reference docs
 
-[docs/internals.md](docs/internals.md) · [docs/debugging.md](docs/debugging.md) · [docs/dev-workflow.md](docs/dev-workflow.md) · [docs/testing-strategy.md](docs/testing-strategy.md) · [docs/architecture.md](docs/architecture.md) · [docs/goals-workflows-tasks.md](docs/goals-workflows-tasks.md) · [docs/rest-api.md](docs/rest-api.md) · [docs/preview-architecture.md](docs/preview-architecture.md) · [docs/mcp-meta-tools.md](docs/mcp-meta-tools.md) · [docs/qa-testing.md](docs/qa-testing.md)
+[docs/internals.md](docs/internals.md) · [docs/debugging.md](docs/debugging.md) · [docs/dev-workflow.md](docs/dev-workflow.md) · [docs/testing-strategy.md](docs/testing-strategy.md) · [docs/architecture.md](docs/architecture.md) · [docs/goals-workflows-tasks.md](docs/goals-workflows-tasks.md) · [docs/nested-goals.md](docs/nested-goals.md) · [docs/rest-api.md](docs/rest-api.md) · [docs/preview-architecture.md](docs/preview-architecture.md) · [docs/mcp-meta-tools.md](docs/mcp-meta-tools.md) · [docs/qa-testing.md](docs/qa-testing.md)

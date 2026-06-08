@@ -7,7 +7,7 @@ import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { Select, type SelectOption } from "@mariozechner/mini-lit/dist/Select.js";
 import { html } from "lit";
 import { live } from "lit/directives/live.js";
-import { ArrowLeft, Brain, Check, FlaskConical, Gauge, Image as ImageIcon, Loader2, Plus, RotateCcw, Sparkles, Trash2, X } from "lucide";
+import { ArrowLeft, Brain, Bug, Check, FlaskConical, Image as ImageIcon, Loader2, Plus, RotateCcw, Sparkles, Trash2, X } from "lucide";
 import {
 	getShortcuts,
 	formatBinding,
@@ -40,6 +40,7 @@ import { setConfigScope, getConfigScope } from "./config-scope.js";
 import { gatewayFetch, fetchSandboxStatus, fetchHarnessStatus, requestHarnessRestart, removeProject, fetchProjects, searchStats, searchRebuild, orphanedIndexRows, cleanupOrphanedIndexRows, type SearchStats, type OrphanedIndexRows } from "./api.js";
 import { applyProjectPalette } from "./session-manager.js";
 import { setPerfInstrumentationEnabled, isPerfInstrumentationEnabled } from "./boot-timing.js";
+import { isClientDebugEnabled, setClientDebugEnabled } from "./client-debug.js";
 import { dispatchIndexEvent } from "./components/search-status-dot.js";
 import "./components/search-status-dot.js";
 import { openOAuthDialog } from "./dialogs.js";
@@ -107,6 +108,11 @@ let _listening = false;
 let settingsShowTimestamps = false;
 let settingsShowTimestampsLoaded = false;
 let settingsPlayFinishSound = true;
+let settingsSubgoalsEnabled = true;
+let settingsMaxNestingDepth: number | null = null;
+const MAX_NESTING_DEPTH_DEFAULT = 3;
+const MAX_NESTING_DEPTH_MIN = 1;
+const MAX_NESTING_DEPTH_MAX = 10;
 let harnessStatusLoaded = false;
 let harnessRestartAvailable = false;
 let harnessRestartState: "idle" | "requesting" | "requested" | "error" = "idle";
@@ -803,6 +809,9 @@ function renderWorktreeSection(
 					.value=${pendingChanges.worktree_root ?? resolved.worktree_root?.value ?? ""}
 					@input=${(e: Event) => {
 						pendingChanges.worktree_root = (e.target as HTMLInputElement).value;
+						// Re-render unconditionally so `hasPendingChanges` recomputes and
+						// the Save button appears immediately on first edit.
+						renderApp();
 					}}
 				/>
 			</div>
@@ -819,10 +828,14 @@ function renderWorktreeSection(
 					@input=${(e: Event) => {
 						pendingChanges.base_ref = (e.target as HTMLInputElement).value;
 						// Clear stale inline error as soon as the user edits the field.
-						if (_baseRefErrors.has(projectId)) {
-							_baseRefErrors.delete(projectId);
-							renderApp();
-						}
+						_baseRefErrors.delete(projectId);
+						// Re-render unconditionally (not only when clearing a stale error)
+						// so `hasPendingChanges` recomputes and the Save button appears
+						// immediately on first edit. Previously the no-error path skipped
+						// renderApp(), so Save only showed if an unrelated async render
+						// happened to fire — a race that fails deterministically once the
+						// base-ref detect fetch is warm. See base-ref-settings.spec.ts.
+						renderApp();
 					}}
 				/>
 			</div>
@@ -947,16 +960,23 @@ function loadHarnessStatus(): void {
 	});
 }
 
-async function togglePerfInstrumentation(): Promise<void> {
-	settingsPerfInstrumentation = !settingsPerfInstrumentation;
-	// Arm/disarm the NEXT reload immediately via the localStorage mirror; the
-	// current page is already past its boot marks.
-	setPerfInstrumentationEnabled(settingsPerfInstrumentation);
+async function toggleDebugMode(): Promise<void> {
+	const on = !isClientDebugEnabled();
+	// Single switch (dev-harness only). Turns on:
+	//   • the floating DBG button → dumps a client diagnostics report into the
+	//     composer (see client-debug.ts), and
+	//   • boot-timing perf instrumentation, so the report's Performance section
+	//     has the boot waterfall (and the on-disk sink still records).
+	// Both flags are localStorage-backed and persist across reload; the perf
+	// server preference is mirrored so a fresh browser re-arms correctly.
+	setClientDebugEnabled(on);
+	settingsPerfInstrumentation = on;
+	setPerfInstrumentationEnabled(on);
 	renderApp();
 	try {
 		await gatewayFetch("/api/preferences", {
 			method: "PUT",
-			body: JSON.stringify({ devPerfInstrumentation: settingsPerfInstrumentation }),
+			body: JSON.stringify({ devPerfInstrumentation: on }),
 		});
 	} catch { /* the localStorage mirror still governs the next reload */ }
 }
@@ -979,8 +999,8 @@ async function requestSettingsRestart(): Promise<void> {
 	renderApp();
 }
 
-function renderPerfInstrumentationToggle() {
-	const on = settingsPerfInstrumentation;
+function renderDebugModeToggle() {
+	const on = isClientDebugEnabled();
 	return html`
 		<button
 			class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border transition-colors ${on
@@ -988,12 +1008,12 @@ function renderPerfInstrumentationToggle() {
 				: "border-border bg-background text-foreground hover:bg-secondary"}"
 			role="switch"
 			aria-checked=${on ? "true" : "false"}
-			data-testid="perf-instrumentation-toggle"
-			@click=${togglePerfInstrumentation}
-			title="Record reload performance stats to .bobbit/state/boot-timing.jsonl on each full reload. Applies on the next reload."
+			data-testid="debug-mode-toggle"
+			@click=${toggleDebugMode}
+			title="Debug mode: show the floating DBG button (dumps a client diagnostics report — environment, viewport/safe-area, performance, app state — into the composer) and record boot-timing perf stats. Applies on the next reload."
 		>
-			${icon(Gauge, "xs")}
-			<span>Perf ${on ? "On" : "Off"}</span>
+			${icon(Bug, "xs")}
+			<span>Debug ${on ? "On" : "Off"}</span>
 		</button>
 	`;
 }
@@ -1008,7 +1028,7 @@ function renderHarnessRestartControl() {
 			${harnessRestartState === "error" && harnessRestartError ? html`
 				<span class="text-xs text-destructive max-w-[40vw] sm:max-w-[18rem] truncate" title=${harnessRestartError}>${harnessRestartError}</span>
 			` : ""}
-			${renderPerfInstrumentationToggle()}
+			${renderDebugModeToggle()}
 			<button
 				class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground hover:bg-secondary transition-colors disabled:opacity-60 disabled:pointer-events-none"
 				?disabled=${requesting || requested}
@@ -2165,6 +2185,10 @@ function loadGeneralSettings() {
 					settingsShowTimestamps = !!prefs.showTimestamps;
 					// Default ON when unset — only an explicit `false` opts out.
 					settingsPlayFinishSound = prefs.playAgentFinishSound !== false;
+					// Subgoals (Experimental) — default OFF; only an explicit `true` enables. See docs/nested-goals.md.
+					settingsSubgoalsEnabled = prefs.subgoalsEnabled === true;
+					const rawDepth = prefs.maxNestingDepth;
+					settingsMaxNestingDepth = (typeof rawDepth === "number" && Number.isFinite(rawDepth)) ? rawDepth : null;
 					const raw = prefs.skillsCatalogBudget;
 					settingsSkillsCatalogBudget = (typeof raw === "number" && Number.isFinite(raw)) ? raw : null;
 					settingsGithubTrustedHosts = Array.isArray(prefs.githubTrustedHosts)
@@ -2287,6 +2311,49 @@ async function togglePlayFinishSound(): Promise<void> {
 	} catch {}
 }
 
+async function setMaxNestingDepth(raw: number): Promise<void> {
+	if (!Number.isFinite(raw)) return;
+	let n = Math.floor(raw);
+	if (n < MAX_NESTING_DEPTH_MIN) n = MAX_NESTING_DEPTH_MIN;
+	if (n > MAX_NESTING_DEPTH_MAX) n = MAX_NESTING_DEPTH_MAX;
+	settingsMaxNestingDepth = n;
+	document.documentElement.dataset.maxNestingDepth = String(n);
+	renderApp();
+	try {
+		await gatewayFetch("/api/preferences", {
+			method: "PUT",
+			body: JSON.stringify({ maxNestingDepth: n }),
+		});
+	} catch {}
+}
+
+async function resetMaxNestingDepth(): Promise<void> {
+	settingsMaxNestingDepth = null;
+	document.documentElement.dataset.maxNestingDepth = String(MAX_NESTING_DEPTH_DEFAULT);
+	renderApp();
+	try {
+		await gatewayFetch("/api/preferences", {
+			method: "PUT",
+			body: JSON.stringify({ maxNestingDepth: null }),
+		});
+	} catch {}
+}
+
+async function toggleSubgoalsEnabled(): Promise<void> {
+	settingsSubgoalsEnabled = !settingsSubgoalsEnabled;
+	// Apply synchronously to the dataset so the six client-side gate sites
+	// (workflow picker, Plan/Children tabs, sidebar nesting, mutation card)
+	// flip without waiting on the preferences_changed broadcast.
+	document.documentElement.dataset.subgoalsEnabled = settingsSubgoalsEnabled ? "true" : "false";
+	renderApp();
+	try {
+		await gatewayFetch("/api/preferences", {
+			method: "PUT",
+			body: JSON.stringify({ subgoalsEnabled: settingsSubgoalsEnabled }),
+		});
+	} catch {}
+}
+
 function setSidebarFontScaleStop(stopIndex: number): void {
 	const clampedIndex = Math.max(0, Math.min(SIDEBAR_FONT_SCALE_STOPS.length - 1, Math.round(stopIndex)));
 	const value = SIDEBAR_FONT_SCALE_STOPS[clampedIndex].value;
@@ -2369,6 +2436,56 @@ function renderGeneralTab() {
 				<p class="text-xs text-muted-foreground ml-6">
 					Play a short notification beep when an agent finishes its turn.
 				</p>
+			</div>
+			<div class="flex flex-col gap-1.5">
+				<label class="flex items-center gap-2 cursor-pointer">
+					<input
+						type="checkbox"
+						class="w-4 h-4 rounded border-input accent-primary cursor-pointer"
+						data-testid="general-subgoals-enabled"
+						.checked=${settingsSubgoalsEnabled}
+						@change=${toggleSubgoalsEnabled}
+					/>
+					<span class="text-sm font-medium text-foreground">Subgoals</span>
+					<span
+						class="ml-1 text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200"
+						data-testid="experimental-pill"
+					>Experimental</span>
+				</label>
+				<p class="text-xs text-muted-foreground ml-6">
+					Enable nested goals (parent / child / DAG subgoals). Surfaces the
+					<code>parent</code> workflow, the nine <code>Children</code> tools,
+					the Plan tab DAG, and the Children tab on the goal dashboard.
+					Currently experimental — behaviour may change.
+				</p>
+			</div>
+			<div class="flex flex-col gap-1.5 ${settingsSubgoalsEnabled ? '' : 'opacity-50'}">
+				<span class="text-sm font-medium text-foreground">Max subgoal depth</span>
+				<p class="text-xs text-muted-foreground">
+					Maximum nesting depth for subgoal trees. Depth 3 = root → child → grandchild.
+					Setting this higher risks runaway spawning. System setting is the ceiling —
+					per-goal overrides can only tighten, not loosen. Range: ${MAX_NESTING_DEPTH_MIN}–${MAX_NESTING_DEPTH_MAX}.
+				</p>
+				<div class="flex items-center gap-3">
+					<input
+						type="number"
+						min="${MAX_NESTING_DEPTH_MIN}"
+						max="${MAX_NESTING_DEPTH_MAX}"
+						step="1"
+						data-testid="general-max-nesting-depth"
+						class="w-24 px-2 py-1 rounded border border-input bg-background text-sm"
+						.value=${String(settingsMaxNestingDepth ?? MAX_NESTING_DEPTH_DEFAULT)}
+						?disabled=${!settingsSubgoalsEnabled}
+						@change=${(e: Event) => setMaxNestingDepth(Number((e.target as HTMLInputElement).value))}
+					/>
+					<span class="text-xs text-muted-foreground">${settingsMaxNestingDepth === null ? "(default)" : ""}</span>
+					<button
+						class="text-xs text-muted-foreground hover:text-foreground underline"
+						data-testid="general-max-nesting-depth-reset"
+						?disabled=${settingsMaxNestingDepth === null || !settingsSubgoalsEnabled}
+						@click=${resetMaxNestingDepth}
+					>Reset to default</button>
+				</div>
 			</div>
 			<div class="flex flex-col gap-1.5">
 				<span class="text-sm font-medium text-foreground">Skills catalog budget</span>

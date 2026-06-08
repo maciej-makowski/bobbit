@@ -14,12 +14,37 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Builtin tools directory — dist/server/defaults/tools/ (read-only, shipped with Bobbit). */
 const BUILTIN_TOOLS_DIR = path.join(__dirname, "..", "defaults", "tools");
 
-/** Redact sensitive env vars (-e KEY=VALUE) from container exec arg arrays for logging. */
-function redactDockerArgs(args: string[]): string {
-	const sensitiveKeys = /^(BOBBIT_TOKEN|GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN|AWS_SECRET|.*_API_KEY|.*_OAUTH_TOKEN|.*_ACCESS_KEY)/i;
+/**
+ * Redact sensitive env vars from Docker arg arrays for logging.
+ *
+ * Handles both `-e NAME=VALUE` (the form spawnDockerExec uses) and the
+ * separated `-e NAME VALUE` form, redacting only the VALUE and leaving the
+ * NAME visible for diagnostics.
+ *
+ * The match is on the env-var NAME, broadened to cover any `*_SECRET` /
+ * `*_TOKEN` so per-session capability secrets (BOBBIT_SESSION_SECRET — a
+ * replayable `X-Bobbit-Session-Secret` credential) and arbitrary
+ * future credentials never leak into gateway logs in cleartext. Exported for
+ * regression testing.
+ */
+export function redactDockerArgs(args: string[]): string {
+	// Match on env-var NAME (left of "=", or the bare token in the split form).
+	const sensitiveName = /^(BOBBIT_TOKEN|GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN|AWS_SECRET|.*_SECRET|.*_TOKEN|.*_API_KEY|.*_OAUTH_TOKEN|.*_ACCESS_KEY)$/i;
+	const isSensitive = (token: string): boolean => {
+		const name = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+		return sensitiveName.test(name);
+	};
 	return args.map((a, i) => {
-		if (i > 0 && args[i - 1] === "-e" && sensitiveKeys.test(a)) {
-			return a.replace(/=.*/, "=<REDACTED>");
+		if (i > 0 && args[i - 1] === "-e" && isSensitive(a)) {
+			// `-e NAME=VALUE` form: redact the value after the first "=".
+			if (a.includes("=")) return a.replace(/=.*/s, "=<REDACTED>");
+			// `-e NAME` form: the NAME token itself is fine; the value (next arg)
+			// is redacted below.
+			return a;
+		}
+		// Split `-e NAME VALUE` form: redact the VALUE following a sensitive NAME.
+		if (i > 1 && args[i - 2] === "-e" && !args[i - 1].includes("=") && isSensitive(args[i - 1])) {
+			return "<REDACTED>";
 		}
 		return a;
 	}).join(" ");
@@ -536,6 +561,10 @@ export class RpcBridge {
 		// runtime owns `-i`/`-w`/`-e`/env-shim construction; we own spawn + stdio.
 		const execEnv: Record<string, string> = {};
 		if (this.options.env?.BOBBIT_SESSION_ID) execEnv.BOBBIT_SESSION_ID = this.options.env.BOBBIT_SESSION_ID;
+		// S1: the per-session capability secret reaches the sandboxed agent process
+		// via the runtime's `exec -e` (NOT the pool container's PID 1 env — so it
+		// never appears in /proc/1/environ). See session-secret.ts.
+		if (this.options.env?.BOBBIT_SESSION_SECRET) execEnv.BOBBIT_SESSION_SECRET = this.options.env.BOBBIT_SESSION_SECRET;
 		if (this.options.env?.BOBBIT_GOAL_ID) execEnv.BOBBIT_GOAL_ID = this.options.env.BOBBIT_GOAL_ID;
 		if (this.options.gatewayToken) execEnv.BOBBIT_TOKEN = this.options.gatewayToken;
 		if (this.options.gatewayUrl) execEnv.BOBBIT_GATEWAY_URL = this.options.gatewayUrl;
