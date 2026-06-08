@@ -82,6 +82,42 @@ Persisted under the **new pref key `modelGateways`** (a JSON array) in
   `google`, `xai`, `amazon-bedrock`, `groq`, `mistral`, …) — see
   `model-registry.ts::ENV_MAP` for the canonical list; reject with 400.
 
+### `aigw`-type naming constraint (singleton enterprise gateway)
+
+An **`aigw`-type** gateway MUST be named exactly **`"aigw"`**, and at most one
+`aigw`-type gateway may exist. `saveGateways` rejects (400) any `aigw`-type row
+whose `name !== "aigw"`, and any list containing more than one `aigw`-type row.
+`openai-compatible` gateways may use any valid `name` (per the rules above).
+
+Rationale: exclusivity already makes the enterprise gateway a singleton (one
+enabled `aigw` shadows all built-ins **and** every `openai-compatible`
+gateway, §4), and **three behavior-bearing guards key on the literal provider
+string `"aigw"`** and cannot be generalized cheaply:
+
+- `src/server/agent/pi-ai-bedrock-headers-patch.ts` (`model?.provider !== "aigw"`)
+  — Bedrock SDK middleware that injects the `x-opencode-session` / User-Agent
+  request headers at the AWS client layer.
+- `src/server/agent/model-completion.ts::resolveProviderHeaders`
+  (`provider !== "aigw"`) — resolves the provider-level `headers` block from
+  `models.json` for completion / title-gen requests.
+- `src/shared/thinking-levels.ts::providerMatches` (`provider === "aigw"`) —
+  **client-side** guard (provider **string only**, no prefs access) that lets
+  an `aigw`-routed `claude-opus`/`claude-*` light up the `xhigh` thinking
+  capability.
+
+By pinning the `aigw` name to `"aigw"`, these three guards stay correct
+**unchanged**: the migrated default (which already keeps `name:"aigw"`, §2) and
+any user-created `aigw` gateway both retain header injection, Bedrock routing,
+and `xhigh`. **This is why no slice owns `pi-ai-bedrock-headers-patch.ts`,
+`model-completion.ts`, or `shared/thinking-levels.ts` — they require no change.**
+Generalizing them to "any enabled `aigw`-type gateway name" was considered and
+rejected: `shared/thinking-levels.ts` runs client-side with only a provider
+string and cannot look up gateway types, so it would need a separate
+canonical-family-hint mechanism — disproportionate for a singleton enterprise
+gateway. (If a future requirement truly needs multiple differently-named
+enterprise gateways, revisit this by emitting a canonical-family hint on the
+`ApiModel` record and switching all three guards to consume it.)
+
 ### Accessor helpers (Slice A, exported from `aigw-manager.ts`)
 
 ```ts
@@ -613,11 +649,13 @@ with no API key from the picker.
   		|| modelsAreEqual(this.currentModel, model)); // never hide the current model
   }
   ```
-  This is correct-by-construction scoped to built-ins: gateway and custom
-  models are always emitted with `authenticated:true` (§4,
-  `model-registry.ts::mapManualModels`/discovery), so only built-in cloud
-  models can ever be `authenticated:false`. Document that invariant in a code
-  comment.
+  This is correct-by-construction scoped to built-ins: gateway models are
+  always emitted with `authenticated:true` (§4, `model-registry.ts:201`), and
+  custom-provider rows are likewise emitted `authenticated:true` in the
+  post-#6-revert code path (`model-registry.ts:~342/379/413/440`), so only
+  built-in cloud models can ever be `authenticated:false`. (NB: `mapManualModels`
+  was removed by the PR #6 revert `01e701c4` — do not reference it.) Document this
+  invariant in a code comment.
 - **Display-only:** the toggle lives entirely in the browser; it must not be
   sent to `/api/models`, must not affect server-side resolution, and must not
   touch `default.sessionModel` validation. (Optionally mirror the same
@@ -681,6 +719,15 @@ const port = (srv.address() as any).port;
   pruning, baseUrl normalization, Bedrock env set/clear). Plus: existing
   `tests/aigw-headers.test.ts` must stay green via the legacy shim path.
 - `multi-gateway-exclusivity.test.ts` — `isExclusiveMode` truth table (§4).
+- `multi-gateway-validation.test.ts` — `saveGateways` **accepts** an `aigw`-type
+  gateway named exactly `"aigw"`; **rejects** (throws / 400) an `aigw`-type
+  gateway named anything else and a list containing two `aigw`-type rows;
+  accepts arbitrarily-named `openai-compatible` gateways; rejects names that
+  collide with a built-in provider id or violate `^[a-zA-Z0-9._-]+$`. This pins
+  the §1 naming constraint that keeps `pi-ai-bedrock-headers-patch.ts`,
+  `model-completion.ts`, and `shared/thinking-levels.ts` correct **unchanged**
+  (an `aigw` gateway therefore always retains header injection + Bedrock routing
+  + `xhigh`, regardless of how it was created).
 
 ### API E2E (in-process gateway, Slice C) — `tests/e2e/multi-gateway-api.spec.ts`
 
@@ -753,7 +800,8 @@ slices edit the same file.
   `tests/multi-gateway-exclusivity.test.ts`.
 - **Public contract it must honor (imported by B/C/D):**
   `GatewayType`, `ModelGateway`, `listGateways`, `getEnabledGateways`,
-  `getGatewayByName`, `saveGateways` (validates §1), `isExclusiveMode`,
+  `getGatewayByName`, `saveGateways` (validates §1, **incl. the `aigw`-name=`"aigw"`
+  singleton constraint**), `isExclusiveMode`,
   `migrateGatewayPrefs`, `discoverGatewayModels`, `syncGatewaysModelsJson`,
   `isClaudeId`, `stripProviderPrefix`, `bedrockRoutesForType`, and the rewritten
   `startupAigwCheck` (now list-aware). Keeps exporting `AigwModel`, `inferMeta`,
@@ -761,6 +809,11 @@ slices edit the same file.
   `applyPiOfflineEnv`. **Removes** `writeAigwModelsJson`/`removeAigwModelsJson`/
   `configureAigw`/`removeAigw`/`getAigwUrl` (callers move to the new API; the
   legacy REST shims in Slice C re-implement configure/remove via the list).
+- **`aigw`-name constraint (§1):** `saveGateways` enforces the singleton
+  `aigw`-name=`"aigw"` rule. Consequently **no file outside this slice changes**
+  for the three literal `"aigw"` guards — `pi-ai-bedrock-headers-patch.ts`,
+  `model-completion.ts`, and `shared/thinking-levels.ts` are intentionally left
+  untouched and owned by no slice.
 - **Depends on:** nothing (foundation). Must land/lock signatures first so
   B/C/D can compile against stubs.
 
