@@ -37,34 +37,13 @@ export interface ApiModel {
 	authenticated: boolean;
 }
 
-/** Optional per-model metadata for manual custom-provider models. */
-export interface ManualModelConfig {
-	id: string;
-	name: string;
-	contextWindow?: number;
-	maxTokens?: number;
-	reasoning?: boolean;
-	input?: ("text" | "image")[];
-}
-
 export interface CustomProviderConfig {
 	id: string;
 	name: string;
-	type:
-		| "ollama"
-		| "lmstudio"
-		| "llama.cpp"
-		| "vllm"
-		| "manual"
-		| "openai-completions"
-		| "openai-responses"
-		| "anthropic-messages"
-		| "openai-images"
-		| "gemini-images"
-		| "google-imagen";
+	type: "ollama" | "lmstudio" | "llama.cpp" | "vllm" | "manual" | "openai-images" | "gemini-images" | "google-imagen";
 	baseUrl: string;
 	apiKey?: string;
-	models?: ManualModelConfig[];
+	models?: Array<{ id: string; name: string }>;
 }
 
 // ── Cache ──────────────────────────────────────────────────────────
@@ -348,56 +327,23 @@ async function discoverFromSingleConfig(config: CustomProviderConfig): Promise<A
 		case "llama.cpp":
 		case "vllm":
 			return discoverOpenAICompatModelsServer(config);
-		// Manual text providers store their models (with optional metadata) on the
-		// config. The UI persists these as openai-completions/openai-responses/
-		// anthropic-messages; "manual" is the legacy alias. All route here — before
-		// this, only "manual" was handled and the UI's openai-completions providers
-		// silently produced zero models (pinned by custom-provider-manual-metadata.test.ts).
 		case "manual":
-		case "openai-completions":
-		case "openai-responses":
-		case "anthropic-messages":
-			return mapManualModels(config);
+			return (config.models || []).map(m => ({
+				id: m.id,
+				name: m.name || m.id,
+				provider: config.name || config.id,
+				api: "openai-completions" as const,
+				baseUrl: `${config.baseUrl}/v1`,
+				contextWindow: 8192,
+				maxTokens: 4096,
+				reasoning: false,
+				input: ["text"] as ("text" | "image")[],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				authenticated: true,
+			}));
 		default:
 			return [];
 	}
-}
-
-/** Default metadata for manual models when fields are absent (backward compatible). */
-const MANUAL_DEFAULT_CONTEXT = 8192;
-const MANUAL_DEFAULT_MAX_TOKENS = 4096;
-
-function positiveIntOr(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
-
-function normalizeInput(value: unknown): ("text" | "image")[] {
-	if (!Array.isArray(value)) return ["text"];
-	const filtered = value.filter((v): v is "text" | "image" => v === "text" || v === "image");
-	return filtered.length > 0 ? filtered : ["text"];
-}
-
-function manualApiForType(type: CustomProviderConfig["type"]): string {
-	if (type === "openai-responses") return "openai-responses";
-	if (type === "anthropic-messages") return "anthropic-messages";
-	return "openai-completions";
-}
-
-function mapManualModels(config: CustomProviderConfig): ApiModel[] {
-	const api = manualApiForType(config.type);
-	return (config.models || []).map(m => ({
-		id: m.id,
-		name: m.name || m.id,
-		provider: config.name || config.id,
-		api,
-		baseUrl: `${config.baseUrl}/v1`,
-		contextWindow: positiveIntOr(m.contextWindow, MANUAL_DEFAULT_CONTEXT),
-		maxTokens: positiveIntOr(m.maxTokens, MANUAL_DEFAULT_MAX_TOKENS),
-		reasoning: m.reasoning ?? false,
-		input: normalizeInput(m.input),
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		authenticated: true,
-	}));
 }
 
 async function discoverOllamaModelsServer(config: CustomProviderConfig): Promise<ApiModel[]> {
