@@ -17,6 +17,14 @@ const config: KnipConfig = {
     'tests/**/*.test.ts',
     // Playwright config files for the real/workflow tiers — knip can't infer these as roots.
     'tests/**/*.config.ts',
+    // Root Playwright e2e config + its global hooks. The config lives at repo
+    // root (not under tests/) and wires globalSetup/globalTeardown via string
+    // paths knip can't statically follow, so list the hook files as explicit
+    // roots. (Upstream's e2e restructure removed the variant configs that
+    // previously kept these reachable.)
+    'playwright-e2e.config.ts',
+    'tests/e2e/e2e-global-setup.ts',
+    'tests/e2e/e2e-teardown.ts',
     // Standalone tsx harness invoked directly, not from a spec.
     'tests/code-review-e2e.ts',
     // Playwright component-test HTML entrypoints (knip can't see the .html that loads them).
@@ -37,6 +45,12 @@ const config: KnipConfig = {
     'src/shared/pr-walkthrough/draft.ts',
     'src/shared/pr-walkthrough/index.ts',
     'src/ui/components/pr-walkthrough/index.ts',
+    // Upstream-provided e2e helpers not currently wired into the fork after
+    // upstream's e2e restructure removed the coverage config; dom-stub is a
+    // side-effect DOM shim kept for future UI-in-node tests. Kept identical to
+    // upstream (no source drift); revisit wiring on a future sync.
+    'tests/e2e/e2e-coverage-teardown.ts',
+    'tests/helpers/dom-stub.ts',
   ],
   ignoreDependencies: [
     'playwright', // runtime is pulled in transitively via @playwright/test

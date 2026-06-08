@@ -1,4 +1,5 @@
 import { buildAvailableRolesList } from "./team-manager.js";
+import { applyPromptConditionals } from "./prompt-conditionals.js";
 import type { RoleManager } from "./role-manager.js";
 import type { PersistedStaff } from "./staff-store.js";
 
@@ -28,13 +29,17 @@ interface RoleSource {
  */
 export function resolveRolePrompt(
 	role: RoleLike | undefined,
-	ctx: { branch?: string; agentId: string; roleManager?: RoleSource },
+	ctx: { branch?: string; agentId: string; roleManager?: RoleSource; subGoalsEnabled?: boolean },
 ): string | undefined {
 	if (!role?.promptTemplate) return undefined;
 	let p = role.promptTemplate;
 	if (ctx.branch) p = p.replace(/\{\{GOAL_BRANCH\}\}/g, ctx.branch);
 	p = p.replace(/\{\{AGENT_ID\}\}/g, ctx.agentId);
 	p = p.replace(/\{\{AVAILABLE_ROLES\}\}/g, buildAvailableRolesList(ctx.roleManager as any));
+	// Conditional blocks ({if:subGoalsEnabled} … {endif:subGoalsEnabled}) are
+	// resolved LAST so they can wrap any substituted content. No-op for
+	// templates without conditional tags.
+	p = applyPromptConditionals(p, { subGoalsEnabled: ctx.subGoalsEnabled ?? false });
 	return p;
 }
 
@@ -85,11 +90,19 @@ export function buildStaffSystemPrompt(
  * - **Plain sessions** (no role, no staff): both `undefined`.
  */
 export function buildRestoreRolePrompt(
-	ps: { staffId?: string; role?: string; goalId?: string; id: string },
+	ps: { staffId?: string; role?: string; goalId?: string; id: string; projectId?: string },
 	ctx: {
 		goalBranch?: string;
 		roleManager?: RoleManager;
 		getStaff?: (id: string) => PersistedStaff | undefined;
+		/**
+		 * Optional field-level template resolver (project→ancestor→server→builtin
+		 * cascade). When supplied it takes precedence over the plain role-manager
+		 * view so project-scoped `promptTemplate` overrides survive a restart.
+		 */
+		resolveTemplate?: (roleName: string, projectId?: string) => string | undefined;
+		/** System-scope subgoals feature flag — gates `{if:subGoalsEnabled}` blocks. */
+		subGoalsEnabled?: boolean;
 	},
 ): { rolePrompt?: string; roleName?: string } {
 	if (ps.staffId && ctx.getStaff) {
@@ -98,11 +111,15 @@ export function buildRestoreRolePrompt(
 			return { rolePrompt: buildStaffSystemPrompt(staff, ctx.roleManager), roleName: staff.roleId };
 		}
 	}
-	const role = ps.role && ctx.roleManager ? ctx.roleManager.getRole(ps.role) : undefined;
-	const rolePrompt = resolveRolePrompt(role, {
+	const template = ps.role
+		? (ctx.resolveTemplate?.(ps.role, ps.projectId)
+			?? (ctx.roleManager ? ctx.roleManager.getRole(ps.role)?.promptTemplate : undefined))
+		: undefined;
+	const rolePrompt = resolveRolePrompt(template ? { promptTemplate: template } : undefined, {
 		branch: ctx.goalBranch,
 		agentId: `${ps.role}-${(ps.goalId || ps.id).slice(0, 8)}`,
 		roleManager: ctx.roleManager,
+		subGoalsEnabled: ctx.subGoalsEnabled,
 	});
 	return { rolePrompt, roleName: rolePrompt ? ps.role : undefined };
 }

@@ -36,16 +36,129 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+/**
+ * Frontmatter keys preserved by the goal proposal's serializer. Anything
+ * not listed here is dropped at write time. When extending the propose_goal
+ * tool with a new top-level field, add the key here AND validate any
+ * nested structure inside `validateGoalInlineFields` below.
+ *
+ * `inlineWorkflow` and `inlineRoles` are optional snapshots that ride
+ * through the proposal pipeline untouched — they get applied to the goal
+ * record at acceptance time (POST /api/goals body.workflow + body.inlineRoles).
+ */
+const GOAL_FRONTMATTER_KEYS = [
+	"title",
+	"cwd",
+	"workflow",          // string workflow id (looked up against the project workflow store)
+	"options",
+	"inlineWorkflow",    // full Workflow object (snapshotted onto goal.workflow, bypasses store)
+	"inlineRoles",       // Record<roleName, Role> (snapshotted onto goal.inlineRoles)
+	"parentGoalId",      // optional parent goal id — when set, the created goal becomes a subgoal
+	"subgoalsAllowed",   // boolean — allow the team-lead to spawn sub-goals (Sub-goals tab toggle)
+	"maxNestingDepth",   // number — per-goal sub-goal nesting cap (clamped to the global ceiling)
+	"divergencePolicy",  // "strict"|"balanced"|"autonomous" — root-only plan-change autonomy
+	"maxConcurrentChildren", // number [1,8] — root-only concurrent child-team cap
+] as const;
+
+/**
+ * Structural validation for the two optional inline fields. Returns null
+ * when valid (or when the field is absent — both are optional). Returns a
+ * STRUCTURAL_VALIDATION_FAILED ParseError when present but malformed.
+ */
+function validateGoalInlineFields(fields: Record<string, unknown>): ParseError | null {
+	const iw = fields.inlineWorkflow;
+	if (iw !== undefined && iw !== null) {
+		if (!isPlainObject(iw)) {
+			return {
+				ok: false,
+				code: "STRUCTURAL_VALIDATION_FAILED",
+				message: "inlineWorkflow must be an object with `id`, `name`, and `gates[]`",
+			};
+		}
+		if (typeof iw.id !== "string" || iw.id.trim() === "") {
+			return {
+				ok: false,
+				code: "STRUCTURAL_VALIDATION_FAILED",
+				message: "inlineWorkflow.id must be a non-empty string",
+			};
+		}
+		if (!Array.isArray(iw.gates)) {
+			return {
+				ok: false,
+				code: "STRUCTURAL_VALIDATION_FAILED",
+				message: "inlineWorkflow.gates must be an array",
+			};
+		}
+	}
+	const ir = fields.inlineRoles;
+	if (ir !== undefined && ir !== null) {
+		if (!isPlainObject(ir)) {
+			return {
+				ok: false,
+				code: "STRUCTURAL_VALIDATION_FAILED",
+				message: "inlineRoles must be a Record<roleName, Role>",
+			};
+		}
+		for (const [roleName, role] of Object.entries(ir)) {
+			if (!isPlainObject(role)) {
+				return {
+					ok: false,
+					code: "STRUCTURAL_VALIDATION_FAILED",
+					message: `inlineRoles[${roleName}] must be an object`,
+				};
+			}
+			for (const required of ["name", "label", "promptTemplate"] as const) {
+				const v = (role as Record<string, unknown>)[required];
+				if (typeof v !== "string" || v.trim() === "") {
+					return {
+						ok: false,
+						code: "STRUCTURAL_VALIDATION_FAILED",
+						message: `inlineRoles[${roleName}].${required} must be a non-empty string`,
+					};
+				}
+			}
+		}
+	}
+
+	// Per-goal nesting + orchestration scalars. All optional; validated only
+	// when present so an agent can pre-set what a human sets on the Sub-goals
+	// tab. Acceptance (POST /api/goals) re-clamps and applies root-only gating.
+	const sa = fields.subgoalsAllowed;
+	if (sa !== undefined && sa !== null && typeof sa !== "boolean") {
+		return { ok: false, code: "STRUCTURAL_VALIDATION_FAILED", message: "subgoalsAllowed must be a boolean" };
+	}
+	const mnd = fields.maxNestingDepth;
+	if (mnd !== undefined && mnd !== null && (typeof mnd !== "number" || !Number.isInteger(mnd) || mnd < 1)) {
+		return { ok: false, code: "STRUCTURAL_VALIDATION_FAILED", message: "maxNestingDepth must be an integer >= 1" };
+	}
+	const dp = fields.divergencePolicy;
+	if (dp !== undefined && dp !== null && dp !== "strict" && dp !== "balanced" && dp !== "autonomous") {
+		return { ok: false, code: "STRUCTURAL_VALIDATION_FAILED", message: "divergencePolicy must be one of: strict, balanced, autonomous" };
+	}
+	const mcc = fields.maxConcurrentChildren;
+	if (mcc !== undefined && mcc !== null && (typeof mcc !== "number" || !Number.isInteger(mcc) || mcc < 1 || mcc > 8)) {
+		return { ok: false, code: "STRUCTURAL_VALIDATION_FAILED", message: "maxConcurrentChildren must be an integer in [1, 8]" };
+	}
+	return null;
+}
+
 const goalPlugin: ProposalTypePlugin = {
 	type: "goal",
 	filename: "goal.md",
 	requiredFields: ["title", "spec"],
 	serialize(fields) {
 		const fm: Record<string, unknown> = {};
-		for (const k of ["title", "cwd", "workflow", "options"] as const) {
-			if (fields[k] !== undefined && fields[k] !== null && fields[k] !== "") {
-				fm[k] = fields[k];
-			}
+		for (const k of GOAL_FRONTMATTER_KEYS) {
+			const v = fields[k];
+			if (v === undefined || v === null) continue;
+			// Skip empty strings (legacy "" -> drop), empty plain objects
+			// (e.g. `inlineRoles: {}` shouldn't write a noisy `inlineRoles: {}`
+			// line), and empty arrays. Non-empty objects/arrays/strings ride
+			// through as native YAML — no JSON-stringification.
+			if (typeof v === "string" && v === "") continue;
+			if (Array.isArray(v) && v.length === 0) continue;
+			if (isPlainObject(v) && Object.keys(v).length === 0) continue;
+			fm[k] = v;
 		}
 		const fmYaml = Object.keys(fm).length > 0 ? yamlStringify(fm).trimEnd() : "";
 		const spec = typeof fields.spec === "string" ? fields.spec : "";
@@ -96,6 +209,8 @@ const goalPlugin: ProposalTypePlugin = {
 				message: "goal proposal must have a non-empty body (spec)",
 			};
 		}
+		const inlineErr = validateGoalInlineFields(fields);
+		if (inlineErr) return inlineErr;
 		return { ok: true, value: { type: "goal", fields } };
 	},
 };
