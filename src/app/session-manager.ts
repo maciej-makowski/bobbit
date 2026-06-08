@@ -14,7 +14,7 @@ import {
 	GW_SESSION_KEY,
 	type GatewaySession,
 } from "./state.js";
-import { gatewayFetch, saveDraftToServer, loadDraftFromServer, deleteDraftFromServer, refreshSessions, startSessionPolling, updateLocalSessionTitle, updateLocalSessionStatus, fetchGitStatus, refreshPrStatusCache, teardownTeam } from "./api.js";
+import { gatewayFetch, saveDraftToServer, loadDraftFromServer, deleteDraftFromServer, refreshSessions, startSessionPolling, updateLocalSessionTitle, updateLocalSessionStatus, fetchGitStatus, refreshPrStatusCache, teardownTeam, promoteProject, fetchProjects, notifyProposalDecision } from "./api.js";
 import { formatProjectAssistantAutoPrompt } from "./project-assistant-autoprompt.js";
 import { errorDetails } from "./error-helpers.js";
 import { runGitStatusRefresh, abortableSleep } from "./git-status-refresh.js";
@@ -48,7 +48,10 @@ import {
 	isProposalDismissed as isProposalDismissedTyped,
 	markProposalDismissed as markProposalDismissedTyped,
 	clearProposalDismissed as clearProposalDismissedTyped,
+	deleteProposalFile,
 } from "./proposal-helpers.js";
+import { initAnnotationStore } from "../ui/components/review/AnnotationStore.js";
+import { shouldApplyProposalUpdate } from "./proposal-update-policy.js";
 import { PROPOSAL_TYPE_REGISTRY, PROPOSAL_TYPES, isProposalType, revealProposalPanel, type ProposalType, type ProposalSlot } from "./proposal-registry.js";
 import {
 	CHAT_PANEL_TAB_ID,
@@ -442,7 +445,13 @@ const goalDraft = createDraftManager({
 					rev,
 				};
 			}
-		} else {
+		} else if (state.activeProposals.goal?.sessionId !== _sessionId) {
+			// Finding 2 — an OFF-SCREEN proposal's client draft was never saved
+			// (the unified/legacy callbacks early-return while the panel is inactive),
+			// so the on-disk draft lacks activeGoalProposal. The live slot, however,
+			// may have just been (re)populated for THIS session by rehydrate. Only drop
+			// a slot left over from a DIFFERENT session; never delete a freshly
+			// rehydrated current-session slot here (a no-op when the slot is absent).
 			delete state.activeProposals.goal;
 		}
 		if (dismissed) {
@@ -474,6 +483,31 @@ export function saveGoalDraft(sessionId: string): void { goalDraft.save(sessionI
 async function restoreGoalDraft(sessionId: string): Promise<boolean> { return goalDraft.restore(sessionId); }
 /** Delete goal draft from the server. */
 export function deleteGoalDraft(sessionId: string): void { goalDraft.delete(sessionId); }
+
+/**
+ * Mirror a rehydrated goal proposal slot into the legacy form-mirror state the
+ * goal-assistant panel (goalPreviewPanel) renders from. Shared by the slow/boot
+ * draft-restore path and the fast-path switch-back so both surface an off-screen
+ * or rehydrated proposal identically — the fast path previously lacked this
+ * reconciliation, so restoreGoalDraft could blank previewTitle/previewSpec from a
+ * stale/empty client draft and reintroduce Failure Mode B. Respects the *Edited
+ * flags so a genuine in-progress user edit always wins. Persists the draft so the
+ * next fast-path restore is correct. Returns true if a slot for this session was
+ * reconciled.
+ */
+function reconcileGoalSlotIntoFormMirror(sessionId: string): boolean {
+	const goalSlot = state.activeProposals.goal;
+	if (!goalSlot || goalSlot.sessionId !== sessionId) return false;
+	const g = goalSlot.fields as { title?: string; spec?: string; cwd?: string; workflow?: string };
+	if (!state.previewTitleEdited && typeof g.title === "string") state.previewTitle = g.title;
+	if (!state.previewSpecEdited && typeof g.spec === "string") state.previewSpec = g.spec;
+	if (!state.previewCwdEdited && g.cwd) state.previewCwd = g.cwd;
+	if (g.workflow) setSelectedWorkflowId(g.workflow);
+	state.assistantHasProposal = true;
+	if (state.assistantTab === "chat" && !isDesktop()) state.assistantTab = "preview";
+	saveGoalDraft(sessionId);
+	return true;
+}
 
 // ============================================================================
 // ROLE DRAFT
@@ -1126,7 +1160,7 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 		// has the user's spec. Fire-and-forget; the unified onProposal
 		// callback consumes the resulting events identically to the
 		// auth-time path.
-		rehydrateProposalsForSession(sessionId).catch((err) => {
+		const fastPathRehydrate = rehydrateProposalsForSession(sessionId).catch((err) => {
 			console.warn("[session-manager] proposal rehydrate failed:", err);
 		});
 
@@ -1136,7 +1170,18 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 		// after switch-away/back, breaking the assistant preview panel
 		// (and inline-comment annotation anchoring against an empty body).
 		if (state.assistantType === "goal") {
-			restoreGoalDraft(sessionId).catch((err) => {
+			// Finding 2 — fast-path switch-back stale-draft race. rehydrate (slot)
+			// and restoreGoalDraft (form-mirror) ran fire-and-forget with no ordering;
+			// for an OFF-SCREEN proposal the client draft is stale/empty, so restore
+			// could blank previewTitle/previewSpec after rehydrate populated the slot.
+			// Wait for BOTH, then run the same slot→form reconciliation the slow path
+			// has (reconcileGoalSlotIntoFormMirror) so the rehydrated proposal always
+			// wins over a stale draft, regardless of which promise settled first.
+			Promise.allSettled([fastPathRehydrate, restoreGoalDraft(sessionId)]).then(() => {
+				if (activeSessionId() !== sessionId) return;
+				reconcileGoalSlotIntoFormMirror(sessionId);
+				renderApp();
+			}).catch((err) => {
 				console.warn("[session-manager] fast-path goal draft restore failed:", err);
 			});
 		} else if (state.assistantType === "role") {
@@ -1353,9 +1398,8 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 			try { refreshGitStatusForSession(sessionId); } catch { /* ignore */ }
 			try { refreshBgProcessesForSession(sessionId); } catch { /* ignore */ }
 			try {
-				const { initAnnotationStore } = await import("../ui/components/review/AnnotationStore.js");
 				initAnnotationStore(sessionId).catch(() => { /* best-effort */ });
-			} catch { /* AnnotationStore module load failed — keep going */ }
+			} catch { /* AnnotationStore init failed — keep going */ }
 		};
 
 		// Server broadcasts session_removed when ANY session is terminated/archived/
@@ -1450,10 +1494,22 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 				) {
 					return;
 				}
-				if (!state.previewTitleEdited) state.previewTitle = proposal.title;
-				if (!state.previewCwdEdited && proposal.cwd) state.previewCwd = proposal.cwd;
-				if (!state.previewSpecEdited) state.previewSpec = proposal.spec;
-				if (proposal.workflow) setSelectedWorkflowId(proposal.workflow);
+				// Finding 1 — the unified onProposal mirror owns the form-mirror once
+				// the slot carries a server-stamped rev (>0). A non-streaming transcript
+				// replay (_streaming === false) fired by _checkToolProposals carries the
+				// ORIGINAL tool-use fields, which are stale after an edit_proposal / later
+				// propose_goal stamped a newer rev. Skip the stale form-mirror rewrite in
+				// that case; live streaming partials and first-emit (no server rev yet)
+				// still write. assistantHasProposal / tab / summarisation / saveGoalDraft
+				// below stay unconditional so first-emit + summarisation are unaffected.
+				const goalSlot = state.activeProposals.goal;
+				const serverAuthoritative = !_streaming && goalSlot?.sessionId === sessionId && (goalSlot.rev ?? 0) > 0;
+				if (!serverAuthoritative) {
+					if (!state.previewTitleEdited) state.previewTitle = proposal.title;
+					if (!state.previewCwdEdited && proposal.cwd) state.previewCwd = proposal.cwd;
+					if (!state.previewSpecEdited) state.previewSpec = proposal.spec;
+					if (proposal.workflow) setSelectedWorkflowId(proposal.workflow);
+				}
 				state.assistantHasProposal = true;
 				if (state.assistantTab === "chat" && !isDesktop()) {
 					state.assistantTab = "preview";
@@ -1584,7 +1640,7 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 		// resolution, goal title summarisation, workflow JSON parse → populateFromProposal,
 		// per-type form-mirror state). The plugin.mergeFields shallow-merge guarantees
 		// the second invocation per propose_* tool-use is idempotent.
-		remote.onProposal = (type, fields, _streaming, serverRev?: number) => {
+		remote.onProposal = (type, fields, streaming, serverRev?: number) => {
 			if (activeSessionId() !== sessionId) return;
 			if (fields === null) {
 				// proposal_cleared event from DELETE / accept
@@ -1600,8 +1656,28 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 			}
 			const plugin = PROPOSAL_TYPE_REGISTRY[type];
 			const prev = state.activeProposals[type];
-			const merged = plugin.mergeFields(prev?.fields ?? {}, fields);
+			const hasServerRev = typeof serverRev === "number" && serverRev > 0;
 			const isFirstEmit = prev == null;
+			const prevRev = prev?.rev ?? 0;
+			// Finding 1 — server-stamped revisions are the source of truth for
+			// CONTENT, not just the rev number. The decision is delegated to the
+			// pure `shouldApplyProposalUpdate` policy (pinned by
+			// tests/proposal-update-policy.test.ts) so the slot + form-mirror stay
+			// strictly monotonic w.r.t. the server rev. Two stale cases are dropped:
+			//   • A no-serverRev tool-use/transcript rescan (streaming === false)
+			//     carries the ORIGINAL propose_* fields, stale once a later seed/edit
+			//     has stamped a newer rev into the slot (prevRev > 0). By message_end
+			//     the server seed/edit has already applied identical-or-newer content,
+			//     so skipping the non-streaming final/replay fire is harmless.
+			//   • A server event whose serverRev < prevRev is an out-of-order older
+			//     rehydrate/seed racing in AFTER a newer stamped edit; applying it
+			//     would regress the content while the rev clamp keeps the rev high.
+			// Live streaming partials and first-emit / pre-server (prevRev === 0)
+			// still flow through so revision previews update in place.
+			if (!shouldApplyProposalUpdate({ hasServerRev, serverRev, prevRev, streaming: streaming === true, isFirstEmit })) {
+				return;
+			}
+			const merged = plugin.mergeFields(prev?.fields ?? {}, fields);
 			// Inline-comments: a new proposal body invalidates any pending
 			// annotations because character offsets won't survive a rewrite.
 			// Only fires for goal/role/staff and only on a true content change
@@ -1627,10 +1703,10 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 			// must never synthesize revision numbers or a streamed proposal can race
 			// ahead of the immutable snapshot counter and make the current tool card
 			// look stale. Legacy no-rev paths keep the existing rev (or 0 = unknown).
-			const nextRev = (typeof serverRev === "number" && serverRev > 0)
-				? Math.trunc(serverRev)
-				: (prev?.rev ?? 0);
-		const slot: ProposalSlot = {
+			const nextRev = hasServerRev
+				? Math.max(Math.trunc(serverRev as number), prevRev)
+				: prevRev;
+			const slot: ProposalSlot = {
 				sessionId,
 				fields: merged,
 				streaming: false,
@@ -1692,6 +1768,23 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 					isAssistant: isMatchingAssistant,
 					isMobile: !isDesktop(),
 				});
+			}
+			// Form-mirror gap closure: the goal-ASSISTANT panel (goalPreviewPanel)
+			// renders from the legacy form-mirror state (previewTitle/previewSpec/
+			// previewCwd), which the legacy onGoalProposal callback only writes on
+			// the propose_* tool-use scan. edit_proposal frames, off-screen/rehydrated
+			// proposals, and dedup-skipped replays reach the slot only through this
+			// unified path. Mirror the merged goal fields here so those paths update
+			// the panel too. Respects the *Edited flags exactly like the legacy
+			// callback so in-progress user edits are never clobbered. Runs on every
+			// non-dismissed goal proposal (first-emit, revision, edit, rehydrate).
+			if (type === "goal" && state.assistantType === "goal") {
+				const g = merged as { title?: string; spec?: string; cwd?: string; workflow?: string };
+				if (!state.previewTitleEdited && typeof g.title === "string") state.previewTitle = g.title;
+				if (!state.previewSpecEdited && typeof g.spec === "string") state.previewSpec = g.spec;
+				if (!state.previewCwdEdited && g.cwd) state.previewCwd = g.cwd;
+				if (g.workflow) setSelectedWorkflowId(g.workflow);
+				saveGoalDraft(sessionId);
 			}
 			renderApp();
 		};
@@ -2070,7 +2163,16 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 			if (state.assistantType === "goal") {
 				const restored = await restoreGoalDraft(sessionId);
 				if (isStale()) return;
-				if (!restored) {
+				// The unified onProposal slot is the source of truth for the proposal
+				// CONTENT (populated by the WS-auth `proposal_update {rehydrate}`
+				// broadcast on every fresh/boot connect). restoreGoalDraft may have just
+				// clobbered the form-mirror the goal-assistant panel reads from with a
+				// stale/empty persisted draft — e.g. an OFF-SCREEN proposal whose client
+				// draft was saved (empty) while the panel was inactive. Mirror the slot
+				// into the form-mirror (shared with the fast path), respecting the
+				// *Edited flags so a genuine in-progress user edit always wins.
+				const reconciled = reconcileGoalSlotIntoFormMirror(sessionId);
+				if (!reconciled && !restored) {
 					state.assistantTab = "chat";
 					// A 404 goal draft (the debounced PUT hadn't landed before reload)
 					// must NOT clobber a slot the WS-auth `proposal_update`
@@ -2429,8 +2531,6 @@ async function acceptProvisionalProjectProposal(): Promise<void> {
 	const projectId = session?.projectId;
 	if (!projectId) return;
 
-	const { promoteProject, fetchProjects, gatewayFetch } = await import("./api.js");
-
 	// Promote the provisional project
 	const promoted = await promoteProject(projectId, typeof fields.name === "string" ? fields.name : "");
 	if (!promoted) return;
@@ -2453,7 +2553,6 @@ async function acceptProvisionalProjectProposal(): Promise<void> {
 				const details = Array.isArray(data?.details) && data.details.length > 0
 					? data.details.map((d: any) => d?.message ?? String(d)).join("\n")
 					: "";
-				const { showConnectionError } = await import("./dialogs.js");
 				showConnectionError(
 					data?.error || `Config write failed (${res.status})`,
 					details || (data?.error ?? ""),
@@ -2477,7 +2576,6 @@ async function acceptProvisionalProjectProposal(): Promise<void> {
 	if (proposal.sessionId) {
 		deleteProjectDraft(proposal.sessionId);
 		// Slice E: drop the on-disk proposal file once accepted.
-		const { deleteProposalFile } = await import("./proposal-helpers.js");
 		void deleteProposalFile(proposal.sessionId, "project");
 	}
 
@@ -2492,7 +2590,6 @@ async function acceptProvisionalProjectProposal(): Promise<void> {
  * Project Assistant" button after Apply Changes.
  */
 export async function terminateProjectAssistantSession(sessionId: string): Promise<void> {
-	const { gatewayFetch } = await import("./api.js");
 	try {
 		uncacheSession(sessionId);
 		if (activeSessionId() === sessionId) {
@@ -2532,7 +2629,6 @@ async function acceptRegisteredProjectProposal(): Promise<void> {
 	const projectId = session?.projectId;
 	if (!projectId) return;
 
-	const { gatewayFetch, fetchProjects } = await import("./api.js");
 	const fieldNameStr = typeof fields.name === "string" ? fields.name : "";
 
 	// 1. Rename via PUT /api/projects/:id if a name is supplied.
@@ -2563,7 +2659,6 @@ async function acceptRegisteredProjectProposal(): Promise<void> {
 				const details = Array.isArray(data?.details) && data.details.length > 0
 					? data.details.map((d: any) => d?.message ?? String(d)).join("\n")
 					: "";
-				const { showConnectionError } = await import("./dialogs.js");
 				showConnectionError(
 					data?.error || `Config write failed (${res.status})`,
 					details || (data?.error ?? ""),
@@ -2587,8 +2682,12 @@ async function acceptRegisteredProjectProposal(): Promise<void> {
 	// Persist the accepted flag in the on-disk draft so it survives reload.
 	saveProjectDraft(propSessionId);
 	// Slice E: drop the on-disk proposal file once accepted.
-	const { deleteProposalFile } = await import("./proposal-helpers.js");
 	void deleteProposalFile(propSessionId, "project");
+	// Notify the proposing agent that the change is now live so it can
+	// continue its task without polling. Mid-session only — provisional
+	// (project-assistant) flow terminates the session, so notifying there
+	// is a no-op.
+	void notifyProposalDecision(propSessionId, "project", "accepted", fieldNameStr || "(unnamed)");
 	renderApp();
 }
 
@@ -2631,6 +2730,33 @@ export function backToSessions(): void {
 	setHashRoute("landing");
 	renderApp();
 	refreshSessions();
+}
+
+// ============================================================================
+// MUTATION-APPROVAL CHAT CARDS — Phase 5b
+//
+// Server emits `mutation_pending {goalId, requestId, kind, summary}` when a
+// post-freeze plan-mutation lands in the approval queue. Client renders an
+// inline card in the chat with Approve / Reject buttons. On the WS reply
+// `mutation_decided`, we flip the card to a decided state.
+// ============================================================================
+
+export function handleMutationPendingEvent(msg: { goalId: string; requestId: string; kind: "fix-up" | "expansion" | "restructure" | "criteria-drop"; summary: string }): void {
+	if (!state.remoteAgent) return;
+	state.remoteAgent.appendMutationPendingCard({
+		goalId: msg.goalId,
+		requestId: msg.requestId,
+		kind: msg.kind,
+		summary: msg.summary,
+	});
+}
+
+export function handleMutationDecidedEvent(msg: { goalId: string; requestId: string; decision: "approve" | "reject" }): void {
+	if (!state.remoteAgent) return;
+	state.remoteAgent.markMutationDecided(msg.requestId, msg.decision);
+	// Best-effort: refresh the dashboard so the Plan tab reflects the
+	// applied/rejected mutation immediately.
+	import("./goal-dashboard.js").then(m => m.notifyGoalEventForDashboard?.()).catch(() => {});
 }
 
 export function disconnectGateway(): void {

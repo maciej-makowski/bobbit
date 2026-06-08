@@ -35,8 +35,9 @@ import { closeReviewWorkspaceTabs, selectReviewWorkspaceTab, selectSensiblePanel
 import { clearPersistedReviewDocuments, openMarkdownReviewDocument, removePersistedReviewDocument, restorePersistedReviewDocuments } from "./review-sources.js";
 import { showFaviconBadge } from "./favicon-badge.js";
 import { needsHumanAttentionOnIdleTransition, needsImmediateHumanAttention } from "./notification-policy.js";
-import { scheduleGateStatusRefreshForGoal } from "./api.js";
+import { scheduleGateStatusRefreshForGoal, refreshSessions } from "./api.js";
 import { shouldRefreshGateStatusForEvent } from "./gate-status-events.js";
+import { handleMutationPendingEvent, handleMutationDecidedEvent } from "./session-manager.js";
 import { dispatchVerificationEvent } from "./verification-event-bus.js";
 import { createSystemNotification } from "./custom-messages.js";
 import { clearAnnotations, clearAllAnnotations, isReviewSubmitted, clearReviewSubmitted, initAnnotationStore } from "../ui/components/review/AnnotationStore.js";
@@ -52,6 +53,33 @@ import {
 	type CompactionTrigger,
 } from "./compaction-types.js";
 import type { AutoRetryPendingEvent } from "../server/ws/protocol.js";
+
+// ───────────────────────────────────────────────────────────
+// Goal-state subscription fanout — additive bridge so renderer-level
+// custom elements (e.g. <children-goal-state-pill>) can subscribe to
+// `goal_state_changed` / `goal_child_spawned` events without coupling to
+// the dashboard or adding a DOM event type. See subgoals design doc.
+// ───────────────────────────────────────────────────────────
+
+export interface GoalStateChangeEvent {
+	goalId?: string;
+	type?: string;
+}
+
+const _goalStateSubscribers = new Set<(evt: GoalStateChangeEvent) => void>();
+
+/** Subscribe to goal_state_changed / goal_child_spawned WS broadcasts.
+ *  Returns an unsubscribe function. Safe to call any number of times. */
+export function subscribeGoalStateChanges(cb: (evt: GoalStateChangeEvent) => void): () => void {
+	_goalStateSubscribers.add(cb);
+	return () => { _goalStateSubscribers.delete(cb); };
+}
+
+function notifyGoalStateSubscribers(evt: GoalStateChangeEvent): void {
+	for (const cb of _goalStateSubscribers) {
+		try { cb(evt); } catch { /* swallow — one bad subscriber must not break the rest */ }
+	}
+}
 
 /** Maps propose_* tool suffix → callback name on RemoteAgent (legacy path).
  *  Slice E will replace this lookup with a flat ProposalType allow-list and
@@ -295,6 +323,14 @@ export class RemoteAgent {
 	// Tracks tool_use block IDs that have already been processed as proposals,
 	// preventing re-fires on message re-scan (reconnect, refresh).
 	private _processedProposalIds = new Set<string>();
+
+	// Tracks the tool_use block ID of the proposal currently STREAMING for each
+	// tag (e.g. "goal_proposal"). Set on every streaming delta; cleared when the
+	// stream finalizes (message_end) or the turn ends. Used by
+	// dismissStreamingProposal() so a mid-stream Dismiss can suppress the rest of
+	// the in-flight tool block — without it, the next (content-grown) delta would
+	// fail the content-fingerprint dismissal check and re-populate the panel.
+	private _streamingProposalBlockIdByTag: Record<string, string> = {};
 
 	// Task timing — track when the agent started working so we can
 	// notify the user if a long task finishes while the tab is hidden.
@@ -1100,6 +1136,7 @@ export class RemoteAgent {
 		for (const k of Object.keys(state.proposalStreamingByTag)) {
 			state.proposalStreamingByTag[k] = false;
 		}
+		this._streamingProposalBlockIdByTag = {};
 	}
 
 	/** Drain any pending out-of-order events whose predecessor has now arrived. */
@@ -1607,6 +1644,44 @@ export class RemoteAgent {
 				this.onGoalSetupEvent?.();
 				break;
 
+			case "goal_state_changed":
+			case "goal_child_spawned":
+			case "cost_changed": {
+				// Phase 5b: bump dashboard plan-tab re-render and re-fetch the
+				// goal list so the sidebar nesting + tree-cost reflect the change.
+				// Throttling lives inside the dashboard (`schedulePlanRerender`).
+				import("./goal-dashboard.js").then(m => m.notifyGoalEventForDashboard?.()).catch(() => {});
+				refreshSessions();
+				// Fan out to any renderer-level subscribers (e.g. <children-goal-state-pill>).
+				notifyGoalStateSubscribers({ goalId: (msg as any).goalId, type: msg.type });
+				break;
+			}
+
+			case "goal_spec_changed": {
+				const payload = msg as { goalId: string; ts: number };
+				import("./goal-dashboard.js")
+					.then(m => m.notifyGoalSpecEditedForDashboard?.(payload.goalId, payload.ts))
+					.catch(() => {});
+				// Also bump the regular goal-event path so the goal list re-fetches
+				// (spec is part of the goal record).
+				refreshSessions();
+				break;
+			}
+
+			case "mutation_pending": {
+				// Phase 5b: synthesise a chat-bubble card asking the user to
+				// approve / reject the pending plan mutation. The UI surfaces it
+				// via a dedicated proposal-style entry in state.activeProposals.
+				try { handleMutationPendingEvent(msg as any); } catch { /* ignore */ }
+				break;
+			}
+
+			case "mutation_decided": {
+				// Cleanup: drop any pending mutation card for this requestId.
+				try { handleMutationDecidedEvent(msg as any); } catch { /* ignore */ }
+				break;
+			}
+
 			case "task_changed": {
 				const task = msg.task as any;
 				if (task && !task._deleted) {
@@ -1857,6 +1932,9 @@ export class RemoteAgent {
 			const tagKey = `${proposalType}_proposal`;
 			if (streaming) {
 				state.proposalStreamingByTag[tagKey] = true;
+				// Record the in-flight block so a mid-stream Dismiss can suppress
+				// the rest of THIS tool block (see dismissStreamingProposal).
+				if (blockId) this._streamingProposalBlockIdByTag[tagKey] = blockId;
 			}
 			// Slice E gap-closure: run the unified onProposal BEFORE the legacy
 			// per-type callback so plugin.mergeFields sees the un-mutated prev
@@ -1875,6 +1953,7 @@ export class RemoteAgent {
 			if (!streaming && blockId) {
 				this._processedProposalIds.add(blockId);
 				state.proposalStreamingByTag[tagKey] = false;
+				delete this._streamingProposalBlockIdByTag[tagKey];
 				// Persist to sessionStorage so it survives page refresh
 				if (this._sessionId) {
 					try {
@@ -1889,6 +1968,25 @@ export class RemoteAgent {
 			const msgId = message.id || "";
 			if (msgId) this._toolProposalMessageIds.add(msgId);
 		}
+	}
+
+	/**
+	 * Dismiss the proposal currently STREAMING for `tagKey` (e.g. "goal_proposal").
+	 *
+	 * The persistent dismissal in `markProposalDismissed` is a content-fingerprint
+	 * match. During streaming the proposal body grows on every delta, so a
+	 * fingerprint captured at click time no longer matches the next delta and the
+	 * panel re-populates. To make a mid-stream Dismiss stick we add the active
+	 * streaming tool-block id to the processed set: every subsequent streaming
+	 * delta AND the final message_end fire for that block are then skipped by the
+	 * dedup guard in `_checkToolProposals`. No-op when nothing is streaming for the
+	 * tag (callers gate on `isProposalStreaming`).
+	 */
+	dismissStreamingProposal(tagKey: string): void {
+		const blockId = this._streamingProposalBlockIdByTag[tagKey];
+		if (blockId) this._processedProposalIds.add(blockId);
+		delete this._streamingProposalBlockIdByTag[tagKey];
+		state.proposalStreamingByTag[tagKey] = false;
 	}
 
 	/** Check an assistant message for legacy XML proposal blocks and fire the matching callback.
@@ -2080,6 +2178,19 @@ export class RemoteAgent {
 				prefs.playAgentFinishSound === false ? "false" : "true";
 		}
 
+		// Apply subgoalsEnabled — default OFF. See subgoals-flag.ts. Mirror
+		// unconditionally: the broadcast sends the full prefs object, so an
+		// unset pref is absent and must normalize to "false" (not retain stale).
+		document.documentElement.dataset.subgoalsEnabled =
+			prefs.subgoalsEnabled === true ? "true" : "false";
+		// Apply maxNestingDepth — default 3 when unset/invalid.
+		if ("maxNestingDepth" in prefs) {
+			document.documentElement.dataset.maxNestingDepth =
+				(typeof prefs.maxNestingDepth === "number" && Number.isFinite(prefs.maxNestingDepth))
+					? String(prefs.maxNestingDepth)
+					: "3";
+		}
+
 		// Apply shortcuts
 		if ("shortcuts" in prefs) {
 			import("./shortcut-registry.js").then((m) => m.loadSavedBindings());
@@ -2095,6 +2206,27 @@ export class RemoteAgent {
 		}
 		this.apply({ type: "system-notification", message: notif });
 		this.emit({ type: "message_end", message: notif });
+	}
+
+	/** Phase 5b: append a `mutation-pending` chat card. Dedupe by `requestId`. */
+	public appendMutationPendingCard(opts: { goalId: string; requestId: string; kind: "fix-up" | "expansion" | "restructure" | "criteria-drop"; summary: string }): void {
+		const card: any = {
+			role: "mutation-pending",
+			goalId: opts.goalId,
+			requestId: opts.requestId,
+			kind: opts.kind,
+			summary: opts.summary,
+			timestamp: new Date().toISOString(),
+			id: `mut_${opts.requestId}`,
+		};
+		this.apply({ type: "mutation-pending", message: card });
+		this.emit({ type: "message_end", message: card });
+	}
+
+	/** Phase 5b: update a `mutation-pending` card to its decided state. */
+	public markMutationDecided(requestId: string, decision: "approve" | "reject"): void {
+		const id = `mut_${requestId}`;
+		this.apply({ type: "mutation-update", messageId: id, patch: { decided: decision === "approve" ? "approved" : "rejected" } });
 	}
 
 	private handleAgentEvent(event: any) {
@@ -2149,6 +2281,7 @@ export class RemoteAgent {
 				for (const k of Object.keys(state.proposalStreamingByTag)) {
 					state.proposalStreamingByTag[k] = false;
 				}
+				this._streamingProposalBlockIdByTag = {};
 
 				// Notify: beep + favicon badge — only when the human is actually needed.
 				// Team members/delegates escalate to their parent silently; team leads
