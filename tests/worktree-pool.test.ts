@@ -75,15 +75,31 @@ describe("WorktreePool — Phase 3 claim sequence", () => {
 			}
 			assert.equal(pool.size, 1, "pool should have one entry after fill");
 
+			// Capture the SPECIFIC pool branch we are about to claim. After claim()
+			// the pool drops to 0/targetSize and auto-refill asynchronously creates a
+			// NEW `pool/_pool-<id>` branch — so a generic "no pool/_pool- branch left"
+			// assertion races that refill (~1-in-3 flake). We instead prove the
+			// claimed entry's ORIGINAL branch was renamed away, which is the test's
+			// actual intent; a fresh auto-refill pool branch is correct behavior.
+			const { stdout: poolBranchesBefore } = await execFile("git", ["branch", "--list", "pool/_pool-*"], { cwd: repo });
+			const originalPoolBranch = poolBranchesBefore
+				.split("\n")
+				.map(l => l.replace(/^[*+]?\s+/, "").trim())
+				.find(l => l.startsWith("pool/_pool-"));
+			assert.ok(originalPoolBranch, "should have captured the original pool branch before claim");
+
 			const claim = await pool.claim("session/abcd1234");
 			assert.ok(claim, "claim should succeed");
 			assert.equal(claim!.branchName, "session/abcd1234");
 			assert.equal(claim!.degraded, false);
 
-			// Verify the branch was renamed (no `pool/_pool-*` branch left).
+			// Verify the branch was renamed: the target exists and the ORIGINAL
+			// claimed pool branch is gone. A fresh auto-refill `pool/_pool-<id>` may
+			// legitimately be present (correct pool behavior, not a leak), so we
+			// assert against the captured name rather than the generic prefix.
 			const { stdout: branchList } = await execFile("git", ["branch", "--list"], { cwd: repo });
 			assert.ok(branchList.includes("session/abcd1234"), "target branch should exist");
-			assert.ok(!branchList.includes("pool/_pool-"), "pool branch should be gone");
+			assert.ok(!branchList.includes(originalPoolBranch!), `claimed pool branch ${originalPoolBranch} should be renamed away`);
 
 			// Verify the directory was moved (path basename is the flattened slug).
 			assert.equal(path.basename(claim!.worktreePath), "session-abcd1234");
