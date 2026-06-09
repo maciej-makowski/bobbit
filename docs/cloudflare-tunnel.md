@@ -6,6 +6,8 @@ All deployment artifacts referenced here live in [`deploy/cloudflare/`](../deplo
 
 > **Follow the sections in order.** Section 2 (edge TLS) and Section 3 (host Node) are the two most likely failure points and must be settled **before** you touch any of the plumbing.
 
+> **Prefer a guided install?** `npm run setup-cloudflare-tunnel` (Section 5) walks you through the host-side setup interactively — dependency checks, hostname/runtime/port prompts, scaffolding `~/.config/cloudflared/config.yml`, and installing the units — then prints the manual Cloudflare-panel steps. It surfaces the two key decisions below (edge TLS in Section 2, host Node in Section 3) as prompts/warnings rather than deciding for you, so read those sections first.
+
 ---
 
 ## 1. Overview & architecture
@@ -45,28 +47,39 @@ Both services start at boot and survive logout because `setup.sh` enables **ling
 
 ## 2. KEY DECISION — edge TLS coverage (do this FIRST)
 
-The goal's literal target hostname, `bobbit.z13.maciej.dev`, is a **second-level subdomain** (`bobbit` under `z13` under the apex `maciej.dev`). This is a trap.
+**Recommended default: use the first-level hostname `bobbit-z13.maciej.dev`** — it is covered for free by Cloudflare Universal SSL and needs no paid add-on. The deploy artifacts ship this as their default. The rest of this section explains *why*, and what it costs if you instead need a deeper, second-level name like `bobbit.z13.maciej.dev`.
 
-Per Cloudflare's [Universal SSL documentation](https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/): on a **full-setup** zone (Cloudflare is authoritative for the domain — the usual case for a personal domain moved onto Cloudflare nameservers), free Universal SSL covers only the **apex** and **first-level** subdomains (e.g. `maciej.dev` and `www.maciej.dev`). A leaf certificate for a second-level name like `bobbit.z13.maciej.dev` will **not** be issued. The result: after every other piece is correct, the browser still gets a **TLS handshake error at the edge** — because Cloudflare has no cert to present for that host.
+Per Cloudflare's [Universal SSL documentation](https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/): on a **full-setup** zone (Cloudflare is authoritative for the domain — the usual case for a personal domain moved onto Cloudflare nameservers), free Universal SSL covers only the **apex** and **first-level** subdomains (e.g. `maciej.dev` and `www.maciej.dev`). A leaf certificate for a **second-level** name like `bobbit.z13.maciej.dev` (`bobbit` under `z13` under the apex `maciej.dev`) will **not** be issued. The result: after every other piece is correct, the browser still gets a **TLS handshake error at the edge** — because Cloudflare has no cert to present for that host. That is the trap this section exists to steer you around.
 
 **Decide your cert path before any plumbing.** Pick exactly one:
 
 | Option | Cert path | Cost | What to do |
 |---|---|---|---|
-| **A — first-level hostname** *(recommended fallback)* | Covered by free Universal SSL on a full-setup zone | **Free** | Use **`bobbit-z13.maciej.dev`** as `<HOSTNAME>` everywhere. Nothing else changes. |
+| **A — first-level hostname** *(recommended default)* | Covered by free Universal SSL on a full-setup zone | **Free** | Use **`bobbit-z13.maciej.dev`** as `<HOSTNAME>` everywhere. This is the artifacts' default — nothing else changes. |
 | **B — Total TLS** | Auto-issues certs for all hostnames, including deeper subdomains | Paid (ACM) | Enable Total TLS on the zone; keep `bobbit.z13.maciej.dev`. |
 | **C — Advanced Certificate** | Manually scope an ACM cert | Paid (ACM) | Order an advanced cert covering `*.z13.maciej.dev` (or the exact host). |
 | **D — partial (CNAME) setup** | Each proxied hostname gets its own cert *regardless of depth* | Free | Only if the zone is/becomes a partial setup — not the assumed topology here. |
 
-All artifacts use a single hostname value, so switching between options is a **one-line change**. The example config ([`config.yml.example`](../deploy/cloudflare/config.yml.example)) defaults to `bobbit.z13.maciej.dev`; throughout this runbook that value is written as **`<HOSTNAME>`**. If you choose option A, set `<HOSTNAME> = bobbit-z13.maciej.dev` in `config.yml`, in the `cloudflared tunnel route dns` command, and in the Access application — and you are done with TLS for free.
+All artifacts use a single hostname value, so switching between options is a **one-line change**. The example config ([`config.yml.example`](../deploy/cloudflare/config.yml.example)) defaults to the first-level **`bobbit-z13.maciej.dev`** (option A), and `npm run setup-cloudflare-tunnel` proposes the same default; throughout this runbook that value is written as **`<HOSTNAME>`**. Keeping option A means you are done with TLS for free. If you must use a second-level name like `bobbit.z13.maciej.dev`, first enable Total TLS (option B) or order an Advanced Certificate (option C), then set `<HOSTNAME>` to it in `config.yml`, in the `cloudflared tunnel route dns` command, and in the Access application.
 
 ---
 
-## 3. Prerequisites — host Node 20+ (the most likely failure point)
+## 3. Prerequisites — Node 20+ (the most likely failure point)
 
-Bobbit needs **Node.js 20 or newer on the HOST**. On Fedora Silverblue the base image ships **no Node**, and the interactive dev environment lives inside a **toolbox** container. **The toolbox Node does NOT count** — `bobbit.service` is a systemd `--user` unit that runs on the host, outside the toolbox, so its `ExecStart` must resolve a `node` that exists on the host.
+Bobbit needs **Node.js 20 or newer**. On Fedora Silverblue the base image ships **no Node**, and the interactive dev environment lives inside a **toolbox** container. `bobbit.service` is a systemd `--user` unit that runs on the host. By default it resolves Node **on the host**, so a host Node is required — **the toolbox Node does NOT count for the default runtime**. You can opt into a toolbox-provided Node instead (see *Runtime selection* below), but the host runtime is the more robust default.
 
-`setup.sh` probes for a host Node (it checks `$NODE_BIN_DIR/node`, then `node` on `PATH`) and **fails loudly with remediation text** if none ≥ v20 is found — it never silently falls back to the toolbox.
+For the default host runtime, `setup.sh` probes for a host Node (it checks `$NODE_BIN_DIR/node`, then `node` on `PATH`) and **fails loudly with remediation text** if none ≥ v20 is found — it never silently falls back to the toolbox. For `RUNTIME=toolbox` it instead probes for `node` ≥ v20 *inside* the named container and fails the same way if it is missing.
+
+### Runtime selection: `RUNTIME=host` (default) vs `RUNTIME=toolbox`
+
+Both `setup.sh` and the interactive `npm run setup-cloudflare-tunnel` accept a `RUNTIME` option that decides where the service finds Node:
+
+- **`RUNTIME=host` (default, recommended).** Node is resolved on the host from `$NODE_BIN_DIR` (default `~/.local/node/bin`) or `PATH`. The unit's `ExecStart` runs `./run` directly (the `<EXEC_PREFIX>` placeholder is empty). Install a host Node by either method below.
+- **`RUNTIME=toolbox` (opt-in).** Set `TOOLBOX_CONTAINER=<name>`; `setup.sh` validates Node ≥ 20 *inside* that container and wraps the unit's `ExecStart` in a `toolbox run -c <container> ` prefix (rendered into the `<EXEC_PREFIX>` placeholder), so the service launches `./run` through the toolbox. No host Node install is needed.
+
+  **Why host is the default:** the toolbox runtime couples a long-lived, boot-started `--user` service to the toolbox/Podman container lifecycle and to `XDG_RUNTIME_DIR`, which is fragile at boot (start ordering, runtime-dir availability). It is convenient when you already keep Node only in a toolbox, but the host runtime decouples the service from toolbox and Podman and is the more robust choice for an always-on deployment. The design doc records this trade-off in full ([`docs/design/cloudflare-tunnel.md`](design/cloudflare-tunnel.md)).
+
+The two host-Node install methods below apply to `RUNTIME=host`.
 
 ### Recommended: portable Node tarball under `~/.local`
 
@@ -117,6 +130,8 @@ With a fresh `dist/` present, the `./run` launcher used by `bobbit.service` skip
 
 These six steps touch live Cloudflare state and/or place secrets, so they are performed by hand, **on the host**. Replace `<HOSTNAME>` with the value you chose in Section 2.
 
+> `npm run setup-cloudflare-tunnel` prints these same steps at the end of its run, and — only when the `cloudflared` CLI is installed — offers a strictly opt-in (default **No**) shortcut to run steps 1–3 (`tunnel login` / `create` / `route dns`) for you. Step 4 (the Access application) is **dashboard-only** and is never scripted.
+
 1. **Authenticate to the zone** (opens a browser; pick the `maciej.dev` zone):
    ```bash
    cloudflared tunnel login
@@ -141,9 +156,53 @@ These six steps touch live Cloudflare state and/or place secrets, so they are pe
 
 ---
 
-## 5. Running `setup.sh`
+## 5. Running the installer
 
-[`setup.sh`](../deploy/cloudflare/setup.sh) handles the non-interactive plumbing. Run it **on the host** (it is not allowed inside a toolbox):
+There are two entry points, both **host-only** (they refuse to run inside a toolbox):
+
+- **`npm run setup-cloudflare-tunnel`** — the **recommended** interactive installer ([`setup-tunnel.sh`](../deploy/cloudflare/setup-tunnel.sh)). It guides you through the host-side setup, scaffolds `~/.config/cloudflared/config.yml`, installs the units (by delegating to `setup.sh`), and prints the remaining manual Cloudflare-panel steps.
+- **`setup.sh`** — the lower-level, non-interactive engine ([`setup.sh`](../deploy/cloudflare/setup.sh)) that actually renders and installs the units. The interactive command calls it under the hood; you can also run it directly if you would rather hand-manage `config.yml`.
+
+Both are **idempotent** — safe to re-run at any time.
+
+### Quick start: `npm run setup-cloudflare-tunnel` (recommended)
+
+Run it **on the host** (not inside a toolbox):
+
+```bash
+flatpak-spawn --host npm run setup-cloudflare-tunnel
+# or, from a host shell already:
+npm run setup-cloudflare-tunnel
+# or invoke the script directly:
+bash deploy/cloudflare/setup-tunnel.sh
+```
+
+What it does, in order:
+
+1. **Host guard + dependency checks.** Refuses to run inside a toolbox (`$TOOLBOX_PATH` set). Verifies the required host tools — **`podman`**, **`systemctl --user`**, and **`loginctl`** — and aborts if any is missing. `cloudflared` is checked too but only **warns** if absent (it is needed only for the manual steps).
+2. **Prompts for configuration** (press Enter to accept each `[default]`):
+
+   | Prompt | Env pre-seed | Default |
+   |---|---|---|
+   | Public hostname | `CF_HOSTNAME` | `bobbit-z13.maciej.dev` |
+   | Cloudflare tunnel name | `TUNNEL_NAME` | `bobbit-z13` |
+   | Bobbit loopback port | `PORT` | `3001` |
+   | Bobbit source checkout dir | `CHECKOUT_DIR` | git toplevel |
+   | Bobbit project cwd | `BOBBIT_CWD` | `CHECKOUT_DIR` |
+   | Node runtime (`host`/`toolbox`) | `RUNTIME` | `host` |
+   | Toolbox container (only if `RUNTIME=toolbox`) | `TOOLBOX_CONTAINER` | first listed container |
+   | Host Node bin dir (only if `RUNTIME=host`) | `NODE_BIN_DIR` | `$HOME/.local/node/bin` |
+
+   Any prompt whose env var is already set is **skipped** (the value is echoed as "from env"). Pass **`--yes`** / **`-y`** (or `ASSUME_DEFAULTS=1`) to accept every default without prompting, and **`--help`** / **`-h`** to print usage and exit with no side effects.
+3. **Warns on a 2nd-level subdomain.** If the hostname looks like a 2nd-level (or deeper) name — the free Universal SSL caveat from Section 2 — it prints the warning and asks you to confirm before continuing (declining aborts). Non-interactively the warning is advisory only.
+4. **Scaffolds `~/.config/cloudflared/config.yml`** from [`config.yml.example`](../deploy/cloudflare/config.yml.example) with your chosen hostname and port substituted, leaving `<TUNNEL_ID>` as a placeholder (the tunnel does not exist yet). If a `config.yml` already exists it prompts before overwriting.
+5. **Installs the units by delegating to `setup.sh`**, passing your answers through as `CHECKOUT_DIR`, `BOBBIT_CWD`, `NODE_BIN_DIR`, `RUNTIME`, `TOOLBOX_CONTAINER`, and `PORT`. `setup.sh` performs the authoritative Node ≥ 20 probe (host or toolbox — see Section 3), renders the units, reloads systemd, enables linger, and starts both services.
+6. **Prints the remaining manual Cloudflare-panel steps** (Section 4) — `tunnel login`, `create`, `route dns`, the **Access application** (panel-only), and wiring the credentials JSON + `<TUNNEL_ID>` into `config.yml`.
+7. **Optional, strictly opt-in:** if the `cloudflared` CLI is installed, it offers (default **No**) to run `cloudflared tunnel login` / `create` / `route dns` for you right then. It **never** runs the Access-application step — that is dashboard-only and cannot be scripted.
+
+### `setup.sh` — the non-interactive engine
+
+[`setup.sh`](../deploy/cloudflare/setup.sh) does the non-interactive plumbing and is the single source of truth for rendering and installing the units. The interactive command above calls it; run it directly when you prefer to manage `config.yml` yourself. Run it **on the host** (it is not allowed inside a toolbox):
 
 ```bash
 flatpak-spawn --host deploy/cloudflare/setup.sh
@@ -154,28 +213,33 @@ deploy/cloudflare/setup.sh
 It is **idempotent** — safe to re-run at any time. What it does:
 
 - **Toolbox guard.** If `$TOOLBOX_PATH` is set it refuses to run and prints the `flatpak-spawn --host` invocation. (The units must be installed into the *host's* config dirs, not the toolbox's.)
-- **Host Node probe.** Verifies a host `node` ≥ v20 exists (see Section 3); on failure it prints the portable-tarball and rpm-ostree remediation and exits non-zero.
-- **Installs the two units**, substituting placeholders into `bobbit.service` via a temp file (the repo template is never edited in place):
+- **Node probe (host or toolbox).** For `RUNTIME=host` (default) it verifies a host `node` ≥ v20 (checks `$NODE_BIN_DIR/node`, then `node` on `PATH`); for `RUNTIME=toolbox` it verifies `node` ≥ v20 *inside* `$TOOLBOX_CONTAINER`. On failure it prints the matching remediation and exits non-zero — see Section 3.
+- **Installs the two units**, substituting placeholders into `bobbit.service` via a temp file (the repo template is never edited in place) — including `<PORT>` and `<EXEC_PREFIX>` (empty for the host runtime, `toolbox run -c <container> ` for the toolbox runtime):
   - `~/.config/systemd/user/bobbit.service`
   - `~/.config/containers/systemd/cloudflared.container` (the Podman generator turns this into `cloudflared.service` on `daemon-reload`)
 - **`systemctl --user daemon-reload`**, then **`loginctl enable-linger "$USER"`** so the services run at boot and survive logout.
 - **Enables and starts both services**: `systemctl --user enable --now bobbit.service`, then `systemctl --user start cloudflared.service`. If `cloudflared` fails to start because the real `config.yml`/credentials aren't in place yet, it prints a warning telling you to complete the Section 4 steps and re-run the start.
 - **Echoes the remaining manual Cloudflare steps** (Section 4) with exact commands and a `systemctl --user status` hint.
 
-### Environment overrides
+#### Environment overrides
 
-`setup.sh` honors three env vars (it derives sensible defaults otherwise):
+`setup.sh` honors these env vars (it derives sensible defaults otherwise); `npm run setup-cloudflare-tunnel` collects the same values interactively and exports them before calling `setup.sh`:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `CHECKOUT_DIR` | `git rev-parse --show-toplevel` | Absolute path to your Bobbit source checkout (sets `WorkingDirectory` + `ExecStart`). |
 | `BOBBIT_CWD` | `$CHECKOUT_DIR` | Default agent working directory (`--cwd`); point it at a projects dir if desired. |
-| `NODE_BIN_DIR` | `$HOME/.local/node/bin` | Host Node `bin` dir prepended to the unit's `PATH`. |
+| `NODE_BIN_DIR` | `$HOME/.local/node/bin` | Host Node `bin` dir prepended to the unit's `PATH` (host runtime). |
+| `PORT` | `3001` | Loopback port Bobbit binds (`--port`) and the ingress `service:` targets. |
+| `RUNTIME` | `host` | `host` (default) or `toolbox` — where the service finds Node (see Section 3). |
+| `TOOLBOX_CONTAINER` | _(unset)_ | Required when `RUNTIME=toolbox`; the container whose Node runs the service. |
+| `EXEC_PREFIX` | _(empty)_ | Prefix prepended to `ExecStart`; set automatically to `toolbox run -c <container> ` for the toolbox runtime (rarely set by hand). |
 
-Example:
+Example (non-interactive, toolbox runtime, custom port):
 
 ```bash
-CHECKOUT_DIR=$HOME/src/bobbit BOBBIT_CWD=$HOME/projects \
+RUNTIME=toolbox TOOLBOX_CONTAINER=fedora-toolbox-39 PORT=3002 \
+  CHECKOUT_DIR=$HOME/src/bobbit BOBBIT_CWD=$HOME/projects \
   flatpak-spawn --host deploy/cloudflare/setup.sh
 ```
 
@@ -220,7 +284,7 @@ The `/ws/*` upgrade is being blocked or stripped. Check that the Access applicat
 **cloudflared can't reach the origin (502 / "connection refused" in cloudflared logs).**
 - **Wrong networking.** The quadlet must use `Network=host`. Do **not** rewrite the ingress to `host.containers.internal` — that resolves to the host gateway bridge IP, not loopback, and Bobbit in localhost mode listens only on `127.0.0.1`.
 - **Bobbit not running.** Check `systemctl --user status bobbit.service`.
-- **Wrong port.** Ingress `service:` must be `http://127.0.0.1:3001`, matching Bobbit's `--port 3001`.
+- **Wrong port.** Ingress `service:` must point at the port Bobbit binds — `http://127.0.0.1:3001` by default, or `http://127.0.0.1:<PORT>` if you chose a different `PORT` in the installer (it must match `bobbit.service`'s `--port`).
 
 **Bobbit prompts for a token = it is NOT in localhost mode.**
 This is the most important failure to recognize. Bobbit only skips its own auth when bound to a loopback literal. Check `bobbit.service`'s `ExecStart`:
@@ -248,6 +312,8 @@ journalctl --user -u bobbit.service -e
 journalctl --user -u cloudflared.service -e
 podman logs systemd-cloudflared      # the quadlet-managed container
 ```
+
+**Re-running the installer.** `setup.sh` and `npm run setup-cloudflare-tunnel` are both idempotent. If a unit drifted or you changed a value (hostname, port, runtime, checkout dir), re-run the installer to re-render and reinstall the units — e.g. `flatpak-spawn --host npm run setup-cloudflare-tunnel` (it will not overwrite an existing `~/.config/cloudflared/config.yml` without asking). Then `systemctl --user daemon-reload` and restart the affected service.
 
 ---
 
@@ -277,6 +343,6 @@ You may also delete the Access application from the Zero Trust dashboard and rem
 
 ## See also
 
-- [`deploy/cloudflare/`](../deploy/cloudflare/) — the artifacts (`config.yml.example`, `cloudflared.container`, `bobbit.service`, `setup.sh`).
+- [`deploy/cloudflare/`](../deploy/cloudflare/) — the artifacts (`config.yml.example`, `cloudflared.container`, `bobbit.service`, `setup.sh`, and the interactive `setup-tunnel.sh` behind `npm run setup-cloudflare-tunnel`).
 - [`docs/design/cloudflare-tunnel.md`](design/cloudflare-tunnel.md) — design rationale, decisions, and file-by-file spec.
 - [Networking](networking.md) — how Bobbit binds, TLS defaults, and other remote-access options.
