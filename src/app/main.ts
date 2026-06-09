@@ -30,10 +30,15 @@ import {
 } from "./state.js";
 import { gatewayFetch, refreshSessions, resetPrPollThrottle } from "./api.js";
 import { getRouteFromHash, setHashRoute } from "./routing.js";
-import { authenticateGateway, connectToSession, createAndConnectSession, terminateSession, applyProjectPalette, flushAndTeardownDraft } from "./session-manager.js";
+import { authenticateGateway, connectToSession, createAndConnectSession, terminateSession, applyProjectPalette, flushAndTeardownDraft, flushPendingDraft } from "./session-manager.js";
 import { migrateLegacyVisitedMap } from "./render-helpers.js";
 import { installPwaLifecycleRecovery, markAppBooted } from "./pwa-lifecycle.js";
-import { doRenderApp, workspaceSessionId } from "./render.js";
+import { doRenderApp, showHeaderToast, workspaceSessionId } from "./render.js";
+import { renderTool } from "../ui/tools/index.js";
+import { navigateSidebar, expandActiveSidebarItem, installKeyboardNavOverrideClearListener } from "./sidebar-nav.js";
+import { toggleRolePicker } from "./sidebar.js";
+import { startNewGoalFlow } from "./goal-entry.js";
+import { toggleShowArchived, toggleShowBusy, toggleShowRead } from "../ui/components/sidebar-filters.js";
 import { PROPOSAL_TYPES } from "./proposal-registry.js";
 // goal-dashboard is dynamic-imported lazily to keep it out of the main chunk.
 // See docs/design/ui-bundle-size-reduction.md (Task A).
@@ -77,6 +82,25 @@ loadPersistedPanelWorkspace(state);
 // state.goals can also force them into the expanded state (the normal
 // auto-expand path only fires for goals the server has confirmed).
 (window as any).__bobbitExpandedGoals = expandedGoals;
+
+// E2E test hook: expose renderTool() and lit-html's render() so browser-based
+// tests can mount renderers directly without going through the session
+// pipeline. Used by tests/e2e/ui/children-tool-renderers.spec.ts.
+(window as any).__bobbitRenderTool = renderTool;
+import("lit").then(m => { (window as any).__bobbitLitRender = m.render; }).catch(() => {});
+
+// E2E test hook: re-drive pack-renderer reconciliation (extension-host §4a) the
+// SAME way a marketplace install/uninstall does (marketplace-page.ts), so browser
+// E2E can assert the running UI reconciles (stale pack renderer removed, built-in
+// restored) WITHOUT a page reload. Used by tests/e2e/ui/extension-host.spec.ts.
+(window as any).__bobbitReconcilePackRenderers = async () => {
+	const [{ fetchTools }, { registerPackRenderers }] = await Promise.all([
+		import("./api.js"),
+		import("./pack-renderers.js"),
+	]);
+	const pid = state.activeProjectId ?? undefined;
+	registerPackRenderers(await fetchTools(pid), pid);
+};
 
 function hasActiveProposalPanel(): boolean {
 	return PROPOSAL_TYPES.some((type) => state.activeProposals[type] != null);
@@ -193,6 +217,54 @@ async function handleHashChange(): Promise<void> {
 				await refreshSessions();
 			}
 		} else if (route.view === "goal-dashboard" && route.goalId) {
+			// Preserve prior UI state so a missing goal can keep the current view.
+			const prevSelectedSessionId = state.selectedSessionId;
+			const prevGoalDashboardId = state.goalDashboardId;
+			const prevAppView = state.appView;
+
+			// Refresh sessions first so state.goals contains the latest active,
+			// archived, and cross-project goal data before we try to resolve.
+			await refreshSessions();
+
+			// Resolve the goal: in-state first, then fall back to a per-id API
+			// fetch (covers cross-project and freshly-spawned goals not yet in
+			// the local goals list).
+			let gdGoal: any = state.goals.find(g => g.id === route.goalId) || null;
+			if (!gdGoal) {
+				try {
+					const res = await gatewayFetch(`/api/goals/${route.goalId}`);
+					if (res.ok) {
+						const fetched: any = await res.json().catch(() => null);
+						if (fetched && fetched.id) {
+							gdGoal = fetched;
+							// Merge into state.goals so the sidebar can reflect
+							// the target project on the upcoming render.
+							const idx = state.goals.findIndex(g => g.id === fetched.id);
+							if (idx >= 0) state.goals[idx] = { ...state.goals[idx], ...fetched };
+							else state.goals.push(fetched);
+						}
+					}
+				} catch { /* ignore — handled below */ }
+			}
+
+			if (!gdGoal) {
+				// Goal can't be resolved anywhere — toast and stay on prior view.
+				showHeaderToast(`Goal no longer exists (id=${route.goalId.slice(0, 8)})`);
+				state.selectedSessionId = prevSelectedSessionId;
+				state.goalDashboardId = prevGoalDashboardId;
+				state.appView = prevAppView;
+				// Restore the hash to the previous concrete route when possible,
+				// rather than leaving the bad #/goal/<id> in the URL bar. Use
+				// replaceState-style routing so we don't recurse through handleHashChange.
+				if (prevSelectedSessionId) {
+					setHashRoute("session", prevSelectedSessionId, true);
+				} else if (prevGoalDashboardId) {
+					setHashRoute("goal-dashboard", prevGoalDashboardId, true);
+				}
+				renderApp();
+				return;
+			}
+
 			if (state.remoteAgent) {
 				state.remoteAgent.disconnect();
 				state.remoteAgent = null;
@@ -200,9 +272,10 @@ async function handleHashChange(): Promise<void> {
 			}
 			state.selectedSessionId = null;
 			state.goalDashboardId = route.goalId;
-			// Apply palette for the goal's project
-			const gdGoal = state.goals.find(g => g.id === route.goalId);
-			applyProjectPalette(gdGoal?.projectId);
+			// Apply palette for the goal's project. applyProjectPalette also
+			// updates state.activeProjectId, which keeps the sidebar/breadcrumb
+			// pointed at the right project for cross-project navigation.
+			applyProjectPalette(gdGoal.projectId);
 			state.appView = "authenticated";
 			loadDashboardData(route.goalId);
 			renderApp();
@@ -281,7 +354,6 @@ async function handleHashChange(): Promise<void> {
 			// Settings is the single home for managing them.
 			const projectId = state.activeProjectId || (state.projects[0]?.id ?? null);
 			if (projectId) {
-				const { setHashRoute } = await import("./routing.js");
 				setHashRoute("settings", `${projectId}/workflows`, true);
 				return;
 			}
@@ -461,6 +533,22 @@ async function initApp() {
 		try {
 			await waitForGateway(savedUrl, savedToken);
 
+			// Register pack-contributed tool renderers (extension-host §4a). Fire-and-
+			// forget so it never blocks boot; re-driven from /api/tools metadata so it
+			// survives reload. A zero-pack install resolves to an empty list (no-op).
+			void (async () => {
+				try {
+					const { reconcilePackRenderersForProject } = await import("./pack-renderers.js");
+					// Thread the active project so a project-scope pack's renderer
+					// metadata + Blob fetch resolve the same winner (design §4b). May be
+					// null this early in boot; server/global-scope packs still register,
+					// and connecting to a session re-drives this with the SESSION's
+					// project (session-manager) so a reload / deep-link into a session
+					// whose project differs from the active/default resolves correctly.
+					await reconcilePackRenderersForProject(state.activeProjectId ?? undefined);
+				} catch { /* non-fatal — built-in renderers are unaffected */ }
+			})();
+
 			// Load saved preferences (palette, timestamps, AI gateway)
 			try {
 				const prefRes = await gatewayFetch("/api/preferences");
@@ -479,6 +567,14 @@ async function initApp() {
 					// Apply playAgentFinishSound — default ON when unset.
 					document.documentElement.dataset.playAgentFinishSound =
 						prefs.playAgentFinishSound === false ? "false" : "true";
+					// Apply subgoalsEnabled — default OFF (only explicit true opts in).
+					document.documentElement.dataset.subgoalsEnabled =
+						prefs.subgoalsEnabled === true ? "true" : "false";
+					// Apply maxNestingDepth — default 3 when unset/invalid.
+					document.documentElement.dataset.maxNestingDepth =
+						(typeof prefs.maxNestingDepth === "number" && Number.isFinite(prefs.maxNestingDepth))
+							? String(prefs.maxNestingDepth)
+							: "3";
 				}
 			} catch {}
 
@@ -520,7 +616,6 @@ async function initApp() {
 			} else if (route.view === "workflows") {
 				const projectId = state.activeProjectId || (state.projects[0]?.id ?? null);
 				if (projectId) {
-					const { setHashRoute } = await import("./routing.js");
 					setHashRoute("settings", `${projectId}/workflows`, true);
 					return;
 				}
@@ -557,7 +652,6 @@ async function initApp() {
 	// Sidebar keyboard navigation. Source of truth for the row order is the
 	// rendered DOM (so search filters, collapsed sections, and archived view
 	// are honoured automatically). See src/app/sidebar-nav.ts.
-	const { navigateSidebar, expandActiveSidebarItem, installKeyboardNavOverrideClearListener } = await import("./sidebar-nav.js");
 	installKeyboardNavOverrideClearListener();
 
 	// MIGRATED shortcuts (all allowInInput: true to preserve existing behavior)
@@ -578,9 +672,8 @@ async function initApp() {
 			{ key: "n", ctrlOrMeta: false, shift: true, alt: true },
 		],
 		allowInInput: true,
-		handler: async () => {
+		handler: () => {
 			if (state.appView !== "authenticated") return;
-			const { toggleRolePicker } = await import("./sidebar.js");
 			// Synthesize a click event targeting the new-session button area
 			const chevron = document.querySelector("[title='New session with role']");
 			const syntheticEvent = new MouseEvent("click", { bubbles: true });
@@ -729,10 +822,8 @@ async function initApp() {
 		id: "new-goal", label: "New goal", category: "Goals",
 		defaultBindings: [{ key: "g", ctrlOrMeta: false, shift: false, alt: true }],
 		handler: () => {
-			import("./goal-entry.js").then(({ startNewGoalFlow }) => {
-				const anchor = document.querySelector("[data-new-goal-trigger]") as HTMLElement | null;
-				startNewGoalFlow(anchor);
-			});
+			const anchor = document.querySelector("[data-new-goal-trigger]") as HTMLElement | null;
+			startNewGoalFlow(anchor);
 		},
 	});
 
@@ -749,8 +840,7 @@ async function initApp() {
 		id: "ui.toggle-show-archived", label: "Toggle Show Archived", category: "UI",
 		defaultBindings: [{ key: "a", ctrlOrMeta: false, shift: true, alt: true }],
 		allowInInput: true,
-		handler: async () => {
-			const { toggleShowArchived } = await import("../ui/components/sidebar-filters.js");
+		handler: () => {
 			toggleShowArchived();
 		},
 	});
@@ -759,8 +849,7 @@ async function initApp() {
 		id: "ui.toggle-show-busy", label: "Toggle Show Busy", category: "UI",
 		defaultBindings: [{ key: "b", ctrlOrMeta: false, shift: true, alt: true }],
 		allowInInput: true,
-		handler: async () => {
-			const { toggleShowBusy } = await import("../ui/components/sidebar-filters.js");
+		handler: () => {
 			toggleShowBusy();
 		},
 	});
@@ -769,8 +858,7 @@ async function initApp() {
 		id: "ui.toggle-show-read", label: "Toggle Show Read", category: "UI",
 		defaultBindings: [{ key: "r", ctrlOrMeta: false, shift: true, alt: true }],
 		allowInInput: true,
-		handler: async () => {
-			const { toggleShowRead } = await import("../ui/components/sidebar-filters.js");
+		handler: () => {
 			toggleShowRead();
 		},
 	});
@@ -826,6 +914,14 @@ async function initApp() {
 			// Apply playAgentFinishSound — default ON when unset.
 			document.documentElement.dataset.playAgentFinishSound =
 				prefs.playAgentFinishSound === false ? "false" : "true";
+			// Apply subgoalsEnabled — default OFF (only explicit true opts in).
+			document.documentElement.dataset.subgoalsEnabled =
+				prefs.subgoalsEnabled === true ? "true" : "false";
+			// Apply maxNestingDepth — default 3 when unset/invalid.
+			document.documentElement.dataset.maxNestingDepth =
+				(typeof prefs.maxNestingDepth === "number" && Number.isFinite(prefs.maxNestingDepth))
+					? String(prefs.maxNestingDepth)
+					: "3";
 			// Reload shortcuts if changed
 			if (prefs.shortcuts) {
 				await loadSavedBindings();
@@ -862,6 +958,6 @@ if (import.meta.hot) {
 	import.meta.hot.on('vite:beforeFullReload', () => {
 		sessionStorage.setItem('bobbit-hot-reload', '1');
 		// Flush any pending draft so the message editor content survives the reload
-		import("./session-manager.js").then(m => m.flushPendingDraft());
+		flushPendingDraft();
 	});
 }

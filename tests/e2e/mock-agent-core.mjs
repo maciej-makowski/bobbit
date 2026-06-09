@@ -56,6 +56,8 @@
  *  STAFF_PROPOSAL_PARITY[_EDIT]        → UX-parity matrix triggers
  *  EDITABLE_PROPOSAL_INITIAL / EDITABLE_PROPOSAL_EDIT
  *                                      → editable-proposals seed/edit
+ *  GOAL_PROPOSAL_REV2                  → 2nd propose_goal (different title/spec)
+ *  GOAL_EDITABLE_EDIT                  → edit_proposal type:"goal" (Mode A repro)
  *  (See _decideToolAction / respondToPrompt for the full matcher table.)
  *
  * UI primitives
@@ -360,6 +362,63 @@ export class MockAgentCore {
 			};
 		}
 
+		// Goal revision (2nd propose_goal with a different title/spec) — used by
+		// goal-proposal-revision-autoupdate.spec.ts (Failure Mode A). Must precede
+		// the generic `goal_proposal` matcher below because the trigger string
+		// contains the "GOAL_PROPOSAL" substring. The spec deliberately retains the
+		// "It validates the goal creation UI." sentence so the GOAL_EDITABLE_EDIT
+		// edit trigger (below) can apply cleanly after a revision as well as after
+		// the initial proposal.
+		if (text.includes("GOAL_PROPOSAL_REV2")) {
+			return {
+				tool: "propose_goal",
+				input: {
+					title: "Revised Goal Title",
+					workflow: "general",
+					spec: "Revised body for revision two.\nIt validates the goal creation UI.",
+				},
+				output: "Revised goal proposal submitted.",
+			};
+		}
+		// Goal edit_proposal trigger — sibling to EDITABLE_PROPOSAL_EDIT (project)
+		// but targeting type:"goal". Drives the deterministic Failure Mode A repro:
+		// `edit_proposal` is not a `propose_*` tool, so the legacy onGoalProposal
+		// callback never fires and only the unified proposal_update {source:"edit"}
+		// path runs. `old_text` is a substring present in both the initial
+		// GOAL_PROPOSAL spec and the GOAL_PROPOSAL_REV2 spec so the edit applies
+		// cleanly regardless of whether a revision preceded it.
+		if (text.includes("GOAL_EDITABLE_EDIT")) {
+			return {
+				tool: "edit_proposal",
+				input: {
+					type: "goal",
+					old_text: "It validates the goal creation UI.",
+					new_text: "EDITED SPEC BODY for Mode A repro.",
+				},
+				output: "Goal proposal edited.",
+			};
+		}
+
+		// Goal proposal pre-filled with the Sub-goals tab fields — used by
+		// goal-proposal-subgoal-prefill.spec.ts to assert the agent can set
+		// everything a human sets on that tab. Must precede the generic
+		// goal_proposal matcher (it contains the "GOAL_PROPOSAL" substring).
+		if (text.includes("GOAL_PROPOSAL_SUBGOAL_PREFILL")) {
+			return {
+				tool: "propose_goal",
+				input: {
+					title: "Prefilled Goal",
+					workflow: "general",
+					spec: "A goal whose Sub-goals tab is pre-filled by the agent.",
+					subgoalsAllowed: true,
+					maxNestingDepth: 2,
+					divergencePolicy: "autonomous",
+					maxConcurrentChildren: 4,
+				},
+				output: "Proposal submitted. Waiting for user response.",
+			};
+		}
+
 		if (lower.includes("goal_proposal") || lower.includes("goal proposal")) {
 			return {
 				tool: "propose_goal",
@@ -413,6 +472,15 @@ export class MockAgentCore {
 		}
 
 		if (lower.includes("mock_error")) return { mockError: true };
+
+		// Extension-host litmus (tests/e2e/ui/extension-host.spec.ts): emit a
+		// `sample_action` tool call so the retry-demo pack's PACK renderer mounts in
+		// the live session view. The toolId is STABLE so the browser E2E can write a
+		// matching transcript line for the action endpoint's toolUseId-ownership
+		// check (design §5 iii) and the rendered ctx.toolUseId == the persisted id.
+		if (text.includes("SAMPLE_ACTION_TOOL")) {
+			return { tool: "sample_action", input: {}, output: "sample action tool executed", toolId: "tu-sample-1" };
+		}
 
 		// Autonomous skill activation: drives the activate_skill tool path.
 		// Trigger phrase: "please activate_skill <name> [args...]" (case-insensitive).
@@ -1690,7 +1758,10 @@ export class MockAgentCore {
 	}
 
 	async _handleSingleTool(toolAction) {
-		const toolId = `tool_${Date.now()}`;
+		// Honor an explicit stable toolId when provided (extension-host litmus), else
+		// the default per-call id. A stable id lets a test correlate the rendered
+		// tool block with the persisted transcript entry.
+		const toolId = toolAction.toolId || `tool_${Date.now()}`;
 		this.emit({ type: "tool_execution_start", toolName: toolAction.tool, toolId, input: toolAction.input });
 
 		// Run the actual tool effect against the real filesystem / shell where

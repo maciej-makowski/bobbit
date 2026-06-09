@@ -3,7 +3,7 @@
  *
  * Assembles a merged model list from:
  * 1. Built-in providers (from pi-ai getProviders()/getModels())
- * 2. AI Gateway models (if configured, live fetch via discoverAigwModels())
+ * 2. Gateway models (enabled named/typed gateways, live fetch via discoverGatewayModels())
  * 3. Custom local providers (Ollama, LM Studio, vLLM, llama.cpp)
  *
  * Served via GET /api/models with a 5-second TTL cache.
@@ -15,7 +15,16 @@ import https from "node:https";
 import { getProviders, getModels } from "@earendil-works/pi-ai";
 import type { PreferencesStore } from "./preferences-store.js";
 import { globalAuthPath } from "../bobbit-dir.js";
-import { inferMeta, discoverAigwModels, getAigwUrl } from "./aigw-manager.js";
+import {
+	inferMeta,
+	discoverGatewayModels,
+	listGateways,
+	getEnabledGateways,
+	isExclusiveMode,
+	isClaudeId,
+	stripProviderPrefix,
+	bedrockRoutesForType,
+} from "./aigw-manager.js";
 import { getOpenAIModelAdditions } from "./openai-model-additions.js";
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -37,34 +46,13 @@ export interface ApiModel {
 	authenticated: boolean;
 }
 
-/** Optional per-model metadata for manual custom-provider models. */
-export interface ManualModelConfig {
-	id: string;
-	name: string;
-	contextWindow?: number;
-	maxTokens?: number;
-	reasoning?: boolean;
-	input?: ("text" | "image")[];
-}
-
 export interface CustomProviderConfig {
 	id: string;
 	name: string;
-	type:
-		| "ollama"
-		| "lmstudio"
-		| "llama.cpp"
-		| "vllm"
-		| "manual"
-		| "openai-completions"
-		| "openai-responses"
-		| "anthropic-messages"
-		| "openai-images"
-		| "gemini-images"
-		| "google-imagen";
+	type: "ollama" | "lmstudio" | "llama.cpp" | "vllm" | "manual" | "openai-images" | "gemini-images" | "google-imagen";
 	baseUrl: string;
 	apiKey?: string;
-	models?: ManualModelConfig[];
+	models?: Array<{ id: string; name: string }>;
 }
 
 // ── Cache ──────────────────────────────────────────────────────────
@@ -108,14 +96,13 @@ export async function getAvailableModels(prefs: PreferencesStore): Promise<ApiMo
 
 /**
  * Simple version tracking — hash relevant preference keys.
- * We use a string hash of aigw.url + customProviders + providerKeys to detect changes.
+ * We use a string hash of modelGateways + customProviders + providerKeys to detect changes.
  */
 function getPrefsVersion(prefs: PreferencesStore): number {
 	const all = prefs.getAll();
 	let hash = 0;
 	const str = JSON.stringify([
-		all["aigw.url"],
-		all["aigw.exclusive"],
+		all["modelGateways"],
 		all["customProviders"],
 		...Object.keys(all).filter(k => k.startsWith("providerKey.")).sort(),
 	]);
@@ -143,19 +130,21 @@ function builtInNumber(modelId: string, explicitValue: unknown, inferredValue: n
 
 async function assembleModels(prefs: PreferencesStore): Promise<ApiModel[]> {
 	const results: ApiModel[] = [];
-	const aigwUrl = getAigwUrl(prefs);
+	const gateways = listGateways(prefs);
+	const enabled = getEnabledGateways(prefs);
 
-	// When an AI Gateway is configured, it is treated as the single egress path
-	// by default — built-in upstream providers (anthropic, openai, bedrock, ...)
-	// are hidden because in a secure-zone deployment they can't be reached
-	// directly. Users who need to see built-ins alongside the gateway (e.g. for
-	// local development against a real API key AND a dev gateway) can opt out
-	// by setting `aigw.exclusive` to false in preferences.
-	// Custom local providers (Ollama, LM Studio) are always shown because they
-	// live on the user's own machine, not behind the gateway.
-	const aigwExclusive = aigwUrl ? (prefs.get("aigw.exclusive") as boolean | undefined) ?? true : false;
+	// Exclusivity is DERIVED from gateway types (see aigw-manager.ts::isExclusiveMode
+	// and docs/design/multi-gateway-providers.md §4): any enabled `aigw`-type
+	// gateway makes the setup exclusive. In exclusive mode the enterprise gateway
+	// is the single egress path — built-in upstream providers (anthropic, openai,
+	// bedrock, ...) AND `openai-compatible` gateways are suppressed because in a
+	// secure-zone deployment they can't be reached directly. In merged mode
+	// built-ins + all enabled `openai-compatible` gateways contribute together.
+	// Custom local providers (Ollama, LM Studio) are always shown (both modes)
+	// because they live on the user's own machine, not behind the gateway.
+	const exclusive = isExclusiveMode(gateways);
 
-	if (!aigwExclusive) {
+	if (!exclusive) {
 		// 1. Built-in providers from pi-ai
 		try {
 			const providers = getProviders();
@@ -192,38 +181,40 @@ async function assembleModels(prefs: PreferencesStore): Promise<ApiModel[]> {
 		}
 	}
 
-	// 2. AI Gateway models (if configured)
-	if (aigwUrl) {
+	// 2. Gateway models — loop the enabled gateways. In exclusive mode only
+	// `aigw`-type gateways contribute (matching the built-in suppression above);
+	// `openai-compatible` gateways are skipped.
+	for (const g of enabled) {
+		if (exclusive && g.type !== "aigw") continue;
 		try {
-			const aigwModels = await discoverAigwModels(aigwUrl);
-			// IMPORTANT: Claude models get their provider prefix stripped and are
-			// routed through bedrock-converse-stream by configureAigw() when writing
-			// models.json. The agent's rpc `set_model` does a strict equality match
-			// against that file, so the IDs we return here MUST match the stripped
-			// form — otherwise picking a Claude model from the UI silently fails
-			// (the agent rejects with "Model not found", the error is swallowed,
-			// and the next prompt goes to the previously bound model).
-			const isClaudeModel = (id: string) => id.toLowerCase().includes("claude");
-			const stripPrefix = (id: string) => { const i = id.indexOf("/"); return i >= 0 ? id.slice(i + 1) : id; };
-			for (const m of aigwModels) {
-				const normalizedId = isClaudeModel(m.id) ? stripPrefix(m.id) : m.id;
-				const meta = inferMeta(normalizedId);
+			const discovered = await discoverGatewayModels(g);
+			// Claude→Bedrock routing is a property of the `aigw` TYPE only
+			// (bedrockRoutesForType). An `openai-compatible` gateway exposing a model
+			// literally named `claude-*` must NEVER be Bedrock-routed.
+			// For Bedrock-routed ids the provider prefix is stripped to match the
+			// `providers[name]` block written by syncGatewaysModelsJson — the agent's
+			// rpc `set_model` does a strict equality match against that file, so a
+			// mismatch silently falls back to the previously bound model (#13/#14).
+			for (const m of discovered) {
+				const bedrock = bedrockRoutesForType(g.type) && isClaudeId(m.id);
+				const id = bedrock ? stripProviderPrefix(m.id) : m.id;
+				const meta = inferMeta(id);
 				results.push({
-					id: normalizedId,
+					id,
 					name: m.name,
-					provider: "aigw",
-					api: isClaudeModel(m.id) ? "bedrock-converse-stream" : (m.api || "openai-completions"),
-					baseUrl: aigwUrl,
+					provider: g.name,
+					api: bedrock ? "bedrock-converse-stream" : (m.api || "openai-completions"),
+					baseUrl: g.url,
 					contextWindow: Math.max(meta.contextWindow, m.contextWindow || 0),
 					maxTokens: Math.max(meta.maxTokens, m.maxTokens || 0),
 					reasoning: meta.reasoning || m.reasoning || false,
 					input: meta.input || ["text"],
 					cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					authenticated: true, // aigw is always authenticated (no key needed)
+					authenticated: true, // gateways are always authenticated (no key needed)
 				});
 			}
 		} catch (err) {
-			console.error("[model-registry] Failed to discover AI Gateway models:", err);
+			console.error(`[model-registry] Failed to discover gateway "${g.name}" models:`, err);
 		}
 	}
 
@@ -348,56 +339,23 @@ async function discoverFromSingleConfig(config: CustomProviderConfig): Promise<A
 		case "llama.cpp":
 		case "vllm":
 			return discoverOpenAICompatModelsServer(config);
-		// Manual text providers store their models (with optional metadata) on the
-		// config. The UI persists these as openai-completions/openai-responses/
-		// anthropic-messages; "manual" is the legacy alias. All route here — before
-		// this, only "manual" was handled and the UI's openai-completions providers
-		// silently produced zero models (pinned by custom-provider-manual-metadata.test.ts).
 		case "manual":
-		case "openai-completions":
-		case "openai-responses":
-		case "anthropic-messages":
-			return mapManualModels(config);
+			return (config.models || []).map(m => ({
+				id: m.id,
+				name: m.name || m.id,
+				provider: config.name || config.id,
+				api: "openai-completions" as const,
+				baseUrl: `${config.baseUrl}/v1`,
+				contextWindow: 8192,
+				maxTokens: 4096,
+				reasoning: false,
+				input: ["text"] as ("text" | "image")[],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				authenticated: true,
+			}));
 		default:
 			return [];
 	}
-}
-
-/** Default metadata for manual models when fields are absent (backward compatible). */
-const MANUAL_DEFAULT_CONTEXT = 8192;
-const MANUAL_DEFAULT_MAX_TOKENS = 4096;
-
-function positiveIntOr(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
-
-function normalizeInput(value: unknown): ("text" | "image")[] {
-	if (!Array.isArray(value)) return ["text"];
-	const filtered = value.filter((v): v is "text" | "image" => v === "text" || v === "image");
-	return filtered.length > 0 ? filtered : ["text"];
-}
-
-function manualApiForType(type: CustomProviderConfig["type"]): string {
-	if (type === "openai-responses") return "openai-responses";
-	if (type === "anthropic-messages") return "anthropic-messages";
-	return "openai-completions";
-}
-
-function mapManualModels(config: CustomProviderConfig): ApiModel[] {
-	const api = manualApiForType(config.type);
-	return (config.models || []).map(m => ({
-		id: m.id,
-		name: m.name || m.id,
-		provider: config.name || config.id,
-		api,
-		baseUrl: `${config.baseUrl}/v1`,
-		contextWindow: positiveIntOr(m.contextWindow, MANUAL_DEFAULT_CONTEXT),
-		maxTokens: positiveIntOr(m.maxTokens, MANUAL_DEFAULT_MAX_TOKENS),
-		reasoning: m.reasoning ?? false,
-		input: normalizeInput(m.input),
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		authenticated: true,
-	}));
 }
 
 async function discoverOllamaModelsServer(config: CustomProviderConfig): Promise<ApiModel[]> {

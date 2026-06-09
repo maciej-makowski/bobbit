@@ -7,7 +7,7 @@ import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { Select, type SelectOption } from "@mariozechner/mini-lit/dist/Select.js";
 import { html } from "lit";
 import { live } from "lit/directives/live.js";
-import { ArrowLeft, Brain, Check, FlaskConical, Gauge, Image as ImageIcon, Loader2, Plus, RotateCcw, Sparkles, Trash2, X } from "lucide";
+import { ArrowLeft, Brain, Bug, Check, FlaskConical, Image as ImageIcon, Loader2, Plus, RotateCcw, Sparkles, Trash2, X } from "lucide";
 import {
 	getShortcuts,
 	formatBinding,
@@ -40,6 +40,7 @@ import { setConfigScope, getConfigScope } from "./config-scope.js";
 import { gatewayFetch, fetchSandboxStatus, fetchHarnessStatus, requestHarnessRestart, removeProject, fetchProjects, searchStats, searchRebuild, orphanedIndexRows, cleanupOrphanedIndexRows, type SearchStats, type OrphanedIndexRows } from "./api.js";
 import { applyProjectPalette } from "./session-manager.js";
 import { setPerfInstrumentationEnabled, isPerfInstrumentationEnabled } from "./boot-timing.js";
+import { isClientDebugEnabled, setClientDebugEnabled } from "./client-debug.js";
 import { dispatchIndexEvent } from "./components/search-status-dot.js";
 import "./components/search-status-dot.js";
 import { openOAuthDialog } from "./dialogs.js";
@@ -47,7 +48,7 @@ import { componentToEditState, buildSavePayload, type ComponentEditState } from 
 import { ModelSelector } from "../ui/dialogs/ModelSelector.js";
 import { getSupportedThinkingLevels, clampThinkingLevel, type ThinkingLevel } from "../shared/thinking-levels.js";
 import { ImageModelSelector, type ImageGenerationModel } from "../ui/dialogs/ImageModelSelector.js";
-import { AigwModelsDialog } from "../ui/dialogs/AigwModelsDialog.js";
+import { AigwModelsDialog, type AigwModelEntry } from "../ui/dialogs/AigwModelsDialog.js";
 
 type SettingsTab = SettingsTabId;
 const DEFAULT_TAB: SettingsTab = "shortcuts";
@@ -107,6 +108,11 @@ let _listening = false;
 let settingsShowTimestamps = false;
 let settingsShowTimestampsLoaded = false;
 let settingsPlayFinishSound = true;
+let settingsSubgoalsEnabled = true;
+let settingsMaxNestingDepth: number | null = null;
+const MAX_NESTING_DEPTH_DEFAULT = 3;
+const MAX_NESTING_DEPTH_MIN = 1;
+const MAX_NESTING_DEPTH_MAX = 10;
 let harnessStatusLoaded = false;
 let harnessRestartAvailable = false;
 let harnessRestartState: "idle" | "requesting" | "requested" | "error" = "idle";
@@ -954,16 +960,23 @@ function loadHarnessStatus(): void {
 	});
 }
 
-async function togglePerfInstrumentation(): Promise<void> {
-	settingsPerfInstrumentation = !settingsPerfInstrumentation;
-	// Arm/disarm the NEXT reload immediately via the localStorage mirror; the
-	// current page is already past its boot marks.
-	setPerfInstrumentationEnabled(settingsPerfInstrumentation);
+async function toggleDebugMode(): Promise<void> {
+	const on = !isClientDebugEnabled();
+	// Single switch (dev-harness only). Turns on:
+	//   • the floating DBG button → dumps a client diagnostics report into the
+	//     composer (see client-debug.ts), and
+	//   • boot-timing perf instrumentation, so the report's Performance section
+	//     has the boot waterfall (and the on-disk sink still records).
+	// Both flags are localStorage-backed and persist across reload; the perf
+	// server preference is mirrored so a fresh browser re-arms correctly.
+	setClientDebugEnabled(on);
+	settingsPerfInstrumentation = on;
+	setPerfInstrumentationEnabled(on);
 	renderApp();
 	try {
 		await gatewayFetch("/api/preferences", {
 			method: "PUT",
-			body: JSON.stringify({ devPerfInstrumentation: settingsPerfInstrumentation }),
+			body: JSON.stringify({ devPerfInstrumentation: on }),
 		});
 	} catch { /* the localStorage mirror still governs the next reload */ }
 }
@@ -986,8 +999,8 @@ async function requestSettingsRestart(): Promise<void> {
 	renderApp();
 }
 
-function renderPerfInstrumentationToggle() {
-	const on = settingsPerfInstrumentation;
+function renderDebugModeToggle() {
+	const on = isClientDebugEnabled();
 	return html`
 		<button
 			class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border transition-colors ${on
@@ -995,12 +1008,12 @@ function renderPerfInstrumentationToggle() {
 				: "border-border bg-background text-foreground hover:bg-secondary"}"
 			role="switch"
 			aria-checked=${on ? "true" : "false"}
-			data-testid="perf-instrumentation-toggle"
-			@click=${togglePerfInstrumentation}
-			title="Record reload performance stats to .bobbit/state/boot-timing.jsonl on each full reload. Applies on the next reload."
+			data-testid="debug-mode-toggle"
+			@click=${toggleDebugMode}
+			title="Debug mode: show the floating DBG button (dumps a client diagnostics report — environment, viewport/safe-area, performance, app state — into the composer) and record boot-timing perf stats. Applies on the next reload."
 		>
-			${icon(Gauge, "xs")}
-			<span>Perf ${on ? "On" : "Off"}</span>
+			${icon(Bug, "xs")}
+			<span>Debug ${on ? "On" : "Off"}</span>
 		</button>
 	`;
 }
@@ -1015,7 +1028,7 @@ function renderHarnessRestartControl() {
 			${harnessRestartState === "error" && harnessRestartError ? html`
 				<span class="text-xs text-destructive max-w-[40vw] sm:max-w-[18rem] truncate" title=${harnessRestartError}>${harnessRestartError}</span>
 			` : ""}
-			${renderPerfInstrumentationToggle()}
+			${renderDebugModeToggle()}
 			<button
 				class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground hover:bg-secondary transition-colors disabled:opacity-60 disabled:pointer-events-none"
 				?disabled=${requesting || requested}
@@ -1435,13 +1448,25 @@ function renderPaletteTab() {
 
 // ── Models tab ──
 
-let aigwUrl = "";
-let aigwStatus: "idle" | "testing" | "saving" | "removing" = "idle";
-let aigwError = "";
-let aigwConfigured = false;
-let aigwConfiguredUrl = "";
-let aigwModels: Array<{ id: string; name: string; contextWindow: number; maxTokens: number; reasoning: boolean }> = [];
-let aigwExclusive = true; // hide built-in providers while gateway is configured
+// AI Gateway list editor (multi-gateway). See docs/design/multi-gateway-providers.md §7.
+// Each row is a named, typed, OpenAI-compatible gateway. Exclusivity is DERIVED
+// server-side from type: any ENABLED `aigw`-type gateway shadows built-in cloud
+// providers AND every `openai-compatible` gateway (a singleton enterprise gateway).
+type SettingsGatewayType = "aigw" | "openai-compatible";
+interface SettingsGateway {
+	id: string;
+	name: string;
+	url: string;
+	type: SettingsGatewayType;
+	enabled: boolean;
+}
+let gateways: SettingsGateway[] = [];
+let gatewaysSaving = false;
+let gatewaysError = "";                                            // top-level Save/validation error (e.g. 400 from PUT)
+let gatewayRowStatus: Record<string, "idle" | "testing"> = {};    // keyed by row id
+let gatewayRowError: Record<string, string> = {};                 // keyed by row id
+let gatewayRowNotice: Record<string, string> = {};               // keyed by row id ("N models found")
+let gatewayModelsByName: Record<string, AigwModelEntry[]> = {};   // discovered models, keyed by gateway name
 // Preferences
 let prefSessionModel = "";   // "provider/modelId" e.g. "aigw/claude-sonnet-4-6" or "anthropic/claude-sonnet-4-6"
 let prefReviewModel = "";    // same format
@@ -1505,8 +1530,14 @@ function imageModelIsAvailable(pref: string): boolean {
 	return allImageModels.some((m) => `${m.provider}/${m.id}` === pref);
 }
 
+/** Combined list of every discovered gateway's models (legacy "view models" link). */
+function combinedGatewayModels(): AigwModelEntry[] {
+	return Object.values(gatewayModelsByName).flat();
+}
+
 function openAigwModelsDialog(): void {
-	AigwModelsDialog.open(aigwModels);
+	const anyAigw = gateways.some((g) => g.enabled && g.type === "aigw");
+	AigwModelsDialog.open(combinedGatewayModels(), anyAigw ? "aigw" : "openai-compatible");
 }
 
 function loadModelsState(): void {
@@ -1514,20 +1545,16 @@ function loadModelsState(): void {
 	_modelsLoaded = true;
 	(async () => {
 		try {
-			const [statusRes, prefsRes, modelsRes, imageModelsRes] = await Promise.all([
-				gatewayFetch("/api/aigw/status"),
+			const [gatewaysRes, prefsRes, modelsRes, imageModelsRes] = await Promise.all([
+				gatewayFetch("/api/aigw/gateways"),
 				gatewayFetch("/api/preferences"),
 				gatewayFetch("/api/models"),
 				gatewayFetch("/api/image-models"),
 			]);
-			if (statusRes.ok) {
-				const data = await statusRes.json();
-				aigwConfigured = data.configured;
-				if (data.configured) {
-					aigwConfiguredUrl = data.url;
-					aigwUrl = data.url;
-					aigwModels = data.models || [];
-				}
+			if (gatewaysRes.ok) {
+				const data = await gatewaysRes.json().catch(() => ({}));
+				if (Array.isArray(data?.gateways)) gateways = data.gateways.map(normalizeGatewayRow);
+				void loadGatewayModels(); // best-effort: populate "view models" after reload
 			}
 			if (prefsRes.ok) {
 				const prefs = await prefsRes.json();
@@ -1538,7 +1565,6 @@ function loadModelsState(): void {
 				prefSessionThinking = prefs["default.sessionThinkingLevel"] || "";
 				prefReviewThinking = prefs["default.reviewThinkingLevel"] || "";
 				prefNamingThinking = prefs["default.namingThinkingLevel"] || "";
-				aigwExclusive = prefs["aigw.exclusive"] !== false; // default true
 			}
 			if (modelsRes.ok) {
 				const models = await modelsRes.json();
@@ -1612,111 +1638,157 @@ async function setNamingThinking(value: string): Promise<void> {
 	renderApp();
 }
 
-async function testAigwConnection(): Promise<void> {
-	if (!aigwUrl.trim()) return;
-	aigwStatus = "testing";
-	aigwError = "";
+/** Generate a stable client-side row id (server fills missing ids on save too). */
+function newGatewayRowId(): string {
+	try {
+		if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+	} catch { /* fall through */ }
+	return `gw-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** Coerce a raw server/test row into a well-formed SettingsGateway. */
+function normalizeGatewayRow(g: any): SettingsGateway {
+	const type: SettingsGatewayType = g?.type === "aigw" ? "aigw" : "openai-compatible";
+	return {
+		id: typeof g?.id === "string" && g.id ? g.id : newGatewayRowId(),
+		name: typeof g?.name === "string" ? g.name : "",
+		url: typeof g?.url === "string" ? g.url : "",
+		type,
+		enabled: g?.enabled !== false,
+	};
+}
+
+/** True when the pending (unsaved) editor state would put the server in exclusive mode. */
+function gatewaysExclusivePending(): boolean {
+	return gateways.some((g) => g.enabled && g.type === "aigw");
+}
+
+function addGatewayRow(): void {
+	gateways = [...gateways, { id: newGatewayRowId(), name: "", url: "", type: "openai-compatible", enabled: true }];
+	gatewaysError = "";
+	renderApp();
+}
+
+function removeGatewayRow(id: string): void {
+	gateways = gateways.filter((g) => g.id !== id);
+	delete gatewayRowStatus[id];
+	delete gatewayRowError[id];
+	delete gatewayRowNotice[id];
+	gatewaysError = "";
+	renderApp();
+}
+
+/** Update enable/type (re-renders so the exclusivity warning recomputes). */
+function updateGatewayRow(id: string, patch: Partial<SettingsGateway>): void {
+	gateways = gateways.map((g) => (g.id === id ? { ...g, ...patch } : g));
+	gatewaysError = "";
+	delete gatewayRowError[id];
+	renderApp();
+}
+
+/**
+ * Update a free-text field (name/url) WITHOUT re-rendering, so the caret does
+ * not jump while the user types. The next render (Test / Save / toggle) reflects
+ * the value via the `live()` binding.
+ */
+function setGatewayField(id: string, field: "name" | "url", value: string): void {
+	gateways = gateways.map((g) => (g.id === id ? { ...g, [field]: value } : g));
+}
+
+async function testGatewayRow(id: string): Promise<void> {
+	const gw = gateways.find((g) => g.id === id);
+	if (!gw || !gw.url.trim()) return;
+	gatewayRowStatus[id] = "testing";
+	delete gatewayRowError[id];
+	delete gatewayRowNotice[id];
 	renderApp();
 	try {
 		const res = await gatewayFetch("/api/aigw/test", {
 			method: "POST",
-			body: JSON.stringify({ url: aigwUrl.trim() }),
+			body: JSON.stringify({ url: gw.url.trim(), type: gw.type }),
 		});
-		const data = await res.json();
-		if (!res.ok) {
-			aigwError = data.error || `HTTP ${res.status}`;
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok || !data?.ok) {
+			gatewayRowError[id] = data?.error || `HTTP ${res.status}`;
 		} else {
-			aigwModels = data.models || [];
-			aigwError = "";
+			const models: AigwModelEntry[] = Array.isArray(data.models) ? data.models : [];
+			if (gw.name.trim()) gatewayModelsByName[gw.name.trim()] = models;
+			gatewayRowNotice[id] = `${models.length} model${models.length === 1 ? "" : "s"} found`;
 		}
 	} catch (err: any) {
-		aigwError = err.message || "Connection failed";
+		gatewayRowError[id] = err?.message || "Connection failed";
 	}
-	aigwStatus = "idle";
+	gatewayRowStatus[id] = "idle";
 	renderApp();
 }
 
-async function saveAigwConfig(): Promise<void> {
-	if (!aigwUrl.trim()) return;
-	aigwStatus = "saving";
-	aigwError = "";
+async function saveGatewaysList(): Promise<void> {
+	gatewaysSaving = true;
+	gatewaysError = "";
 	renderApp();
 	try {
-		const res = await gatewayFetch("/api/aigw/configure", {
-			method: "POST",
-			body: JSON.stringify({ url: aigwUrl.trim() }),
-		});
-		const data = await res.json();
-		if (!res.ok) {
-			aigwError = data.error || `HTTP ${res.status}`;
-		} else {
-			aigwConfigured = true;
-			aigwConfiguredUrl = aigwUrl.trim();
-			aigwModels = data.models || [];
-			aigwError = "";
-		}
-	} catch (err: any) {
-		aigwError = err.message || "Save failed";
-	}
-	aigwStatus = "idle";
-	renderApp();
-}
-
-async function setAigwExclusive(value: boolean): Promise<void> {
-	aigwExclusive = value;
-	// Default is true — persist only the explicit "false" override, clear otherwise.
-	try {
-		await gatewayFetch("/api/preferences", {
+		const payload = gateways.map((g) => ({
+			id: g.id,
+			name: g.name.trim(),
+			url: g.url.trim(),
+			type: g.type,
+			enabled: g.enabled,
+		}));
+		const res = await gatewayFetch("/api/aigw/gateways", {
 			method: "PUT",
-			body: JSON.stringify({ "aigw.exclusive": value ? null : false }),
+			body: JSON.stringify({ gateways: payload }),
 		});
-	} catch {}
-	// Refresh the selector lists used on this page (registry cache is keyed on prefs version).
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok) {
+			// Surface the server validation message (e.g. an aigw-type row not named
+			// "aigw", a duplicate name, a built-in-provider collision, bad charset).
+			gatewaysError = data?.error || `HTTP ${res.status}`;
+		} else {
+			if (Array.isArray(data.gateways)) gateways = data.gateways.map(normalizeGatewayRow);
+			if (data.modelsByGateway && typeof data.modelsByGateway === "object") {
+				gatewayModelsByName = {};
+				for (const [name, models] of Object.entries(data.modelsByGateway)) {
+					gatewayModelsByName[name] = Array.isArray(models) ? (models as AigwModelEntry[]) : [];
+				}
+			}
+			gatewayRowError = {};
+			gatewayRowNotice = {};
+			// Refresh the page's model lists so the picker preview reflects the change.
+			await refreshAllModels();
+		}
+	} catch (err: any) {
+		gatewaysError = err?.message || "Save failed";
+	}
+	gatewaysSaving = false;
+	renderApp();
+}
+
+async function refreshAllModels(): Promise<void> {
 	try {
 		const res = await gatewayFetch("/api/models");
 		if (res.ok) {
 			const models = await res.json();
 			if (Array.isArray(models)) allModels = models;
 		}
-	} catch {}
-	renderApp();
+	} catch { /* best-effort */ }
 }
 
-async function refreshAigwModels(): Promise<void> {
-	aigwStatus = "testing";
-	aigwError = "";
-	renderApp();
-	try {
-		const res = await gatewayFetch("/api/aigw/refresh", { method: "POST" });
-		const data = await res.json();
-		if (!res.ok) {
-			aigwError = data.error || `HTTP ${res.status}`;
-		} else {
-			aigwModels = data.models || [];
-			aigwError = "";
-		}
-	} catch (err: any) {
-		aigwError = err.message || "Refresh failed";
-	}
-	aigwStatus = "idle";
-	renderApp();
+function openGatewayModels(gw: SettingsGateway): void {
+	AigwModelsDialog.open(gatewayModelsByName[gw.name.trim()] || [], gw.type);
 }
 
-async function removeAigwConfig(): Promise<void> {
-	aigwStatus = "removing";
-	aigwError = "";
-	renderApp();
-	try {
-		await gatewayFetch("/api/aigw/configure", { method: "DELETE" });
-		aigwConfigured = false;
-		aigwConfiguredUrl = "";
-		aigwUrl = "";
-		aigwModels = [];
-		aigwError = "";
-	} catch (err: any) {
-		aigwError = err.message || "Remove failed";
-	}
-	aigwStatus = "idle";
+/** Best-effort: populate `gatewayModelsByName` for enabled rows after a fresh load. */
+async function loadGatewayModels(): Promise<void> {
+	const enabled = gateways.filter((g) => g.enabled && g.name.trim());
+	if (enabled.length === 0) return;
+	await Promise.all(enabled.map(async (g) => {
+		try {
+			const res = await gatewayFetch(`/api/aigw/gateways/${encodeURIComponent(g.name.trim())}/status`);
+			if (!res.ok) return;
+			const data = await res.json().catch(() => ({}));
+			if (Array.isArray(data?.models)) gatewayModelsByName[g.name.trim()] = data.models;
+		} catch { /* gateway may be unreachable — ignore */ }
+	}));
 	renderApp();
 }
 
@@ -1964,10 +2036,14 @@ function renderImageModelRow(
 }
 
 // Exported for fixture tests (tests/settings-models-tab-redesign.spec.ts).
+// Accepts both the new gateway-list opts and the legacy single-URL opts
+// (`aigwConfigured`/`aigwUrl`/`aigwModels`); the legacy ones are mapped onto the
+// new gateway-list state so existing fixtures keep exercising the same surfaces.
 export function __testResetModelsTab(opts: {
+	gateways?: SettingsGateway[];
 	aigwConfigured?: boolean;
 	aigwUrl?: string;
-	aigwModels?: Array<{ id: string; name: string; contextWindow: number; maxTokens: number; reasoning: boolean }>;
+	aigwModels?: AigwModelEntry[];
 	allModels?: Array<{ id: string; provider: string; reasoning: boolean }>;
 	allImageModels?: ImageGenerationModel[];
 	prefSessionModel?: string;
@@ -1976,10 +2052,20 @@ export function __testResetModelsTab(opts: {
 	prefImageModel?: string;
 } = {}): void {
 	_modelsLoaded = true; // skip the fetcher
-	aigwConfigured = opts.aigwConfigured ?? false;
-	aigwConfiguredUrl = opts.aigwUrl ?? "";
-	aigwUrl = opts.aigwUrl ?? "";
-	aigwModels = opts.aigwModels ?? [];
+	gatewayRowStatus = {};
+	gatewayRowError = {};
+	gatewayRowNotice = {};
+	gatewaysError = "";
+	gatewaysSaving = false;
+	gatewayModelsByName = {};
+	if (opts.gateways) {
+		gateways = opts.gateways.map(normalizeGatewayRow);
+	} else if (opts.aigwUrl) {
+		gateways = [normalizeGatewayRow({ name: "aigw", url: opts.aigwUrl, type: "aigw", enabled: opts.aigwConfigured !== false })];
+	} else {
+		gateways = [];
+	}
+	if (opts.aigwModels) gatewayModelsByName.aigw = opts.aigwModels;
 	allModels = opts.allModels ?? [];
 	allImageModels = opts.allImageModels ?? [];
 	prefSessionModel = opts.prefSessionModel ?? "";
@@ -1993,105 +2079,149 @@ export function __testResetModelsTab(opts: {
 	modelTestInFlight = {};
 }
 
+function renderGatewayRow(g: SettingsGateway, busy: boolean) {
+	const rowBusy = busy || gatewayRowStatus[g.id] === "testing";
+	const err = gatewayRowError[g.id];
+	const notice = gatewayRowNotice[g.id];
+	const models = gatewayModelsByName[g.name.trim()] || [];
+	return html`
+		<div
+			class="flex flex-col gap-2 p-3 rounded-md border border-border bg-card"
+			data-testid="gateway-row"
+			data-gateway-id=${g.id}
+		>
+			<div class="flex flex-wrap items-center gap-2">
+				<input
+					type="checkbox"
+					class="shrink-0"
+					title="Enable / disable this gateway"
+					data-testid="gateway-enabled-checkbox"
+					.checked=${live(g.enabled)}
+					?disabled=${busy}
+					@change=${(e: Event) => updateGatewayRow(g.id, { enabled: (e.target as HTMLInputElement).checked })}
+				/>
+				<input
+					type="text"
+					class="w-28 px-2 py-1.5 rounded-md border border-input bg-background text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+					placeholder="name"
+					data-testid="gateway-name-input"
+					.value=${live(g.name)}
+					?disabled=${busy}
+					@input=${(e: Event) => setGatewayField(g.id, "name", (e.target as HTMLInputElement).value)}
+				/>
+				<input
+					type="text"
+					class="flex-1 min-w-[12rem] px-2 py-1.5 rounded-md border border-input bg-background text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+					placeholder="http://gateway-host:port"
+					data-testid="gateway-url-input"
+					.value=${live(g.url)}
+					?disabled=${busy}
+					@input=${(e: Event) => setGatewayField(g.id, "url", (e.target as HTMLInputElement).value)}
+				/>
+				<select
+					class="px-2 py-1.5 rounded-md border border-input bg-background text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+					data-testid="gateway-type-select"
+					?disabled=${busy}
+					@change=${(e: Event) => updateGatewayRow(g.id, { type: (e.target as HTMLSelectElement).value as SettingsGatewayType })}
+				>
+					<option value="openai-compatible" ?selected=${g.type === "openai-compatible"}>openai-compatible</option>
+					<option value="aigw" ?selected=${g.type === "aigw"}>aigw</option>
+				</select>
+				<button
+					class="px-2.5 py-1.5 text-sm rounded-md border border-input bg-background text-foreground hover:bg-secondary transition-colors disabled:opacity-50"
+					title="Test gateway connection"
+					data-testid="gateway-test-btn"
+					?disabled=${rowBusy || !g.url.trim()}
+					@click=${() => testGatewayRow(g.id)}
+				>${gatewayRowStatus[g.id] === "testing" ? "Testing..." : "Test"}</button>
+				<button
+					class="px-2.5 py-1.5 text-sm rounded-md border border-destructive text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-50"
+					title="Remove gateway"
+					data-testid="gateway-remove-btn"
+					?disabled=${busy}
+					@click=${() => removeGatewayRow(g.id)}
+				>Remove</button>
+			</div>
+			${err ? html`<div class="text-xs text-destructive" data-testid="gateway-row-error">${err}</div>` : ""}
+			${!err && (notice || models.length > 0) ? html`
+				<div class="text-xs text-muted-foreground flex items-center gap-2">
+					${notice ? html`<span>${notice}</span>` : ""}
+					${models.length > 0 ? html`
+						<button
+							class="underline underline-offset-2 hover:text-foreground"
+							data-testid="gateway-view-models-btn"
+							@click=${() => openGatewayModels(g)}
+						>View models… (${models.length})</button>
+					` : ""}
+				</div>
+			` : ""}
+		</div>
+	`;
+}
+
 export function renderModelsTab() {
 	loadModelsState();
 
-	const busy = aigwStatus !== "idle";
-	const hasModels = aigwModels.length > 0;
+	const busy = gatewaysSaving;
+	const exclusivePending = gatewaysExclusivePending();
+	const combined = combinedGatewayModels();
+	const hasModels = combined.length > 0;
 
 	return html`
 		<div class="flex flex-col gap-6" data-testid="models-tab">
 
-			<!-- AI Gateway section -->
+			<!-- AI Gateways section -->
 			<div class="flex flex-col gap-4" data-testid="aigw-section">
-				<h3 class="text-sm font-semibold text-foreground">AI Gateway</h3>
+				<h3 class="text-sm font-semibold text-foreground">AI Gateways</h3>
 				<p class="text-sm text-muted-foreground">
-					Connect to an AI Gateway for on-prem LLM access through a single
-					OpenAI-compatible endpoint. When configured, only gateway models are shown.
+					Connect to one or more OpenAI-compatible gateways for LLM access — an
+					enterprise <code>aigw</code> endpoint, or local providers such as ollama
+					or llama-swap. Each gateway's <code>name</code> is its provider in the model picker.
 				</p>
 
-				<!-- URL input -->
-				<div class="flex flex-col gap-2">
-					<label class="text-sm font-medium text-foreground">Gateway URL</label>
-					<div class="flex gap-2">
-						<input
-							type="text"
-							class="flex-1 px-3 py-2 rounded-md border border-input bg-background text-foreground text-sm
-								focus:outline-none focus:ring-2 focus:ring-ring"
-							placeholder="http://gateway-host/v1"
-							.value=${aigwUrl}
-							?disabled=${busy}
-							@input=${(e: Event) => { aigwUrl = (e.target as HTMLInputElement).value; }}
-						/>
-						<button
-							class="px-3 py-2 text-sm rounded-md border border-input bg-background text-foreground
-								hover:bg-secondary transition-colors disabled:opacity-50"
-							title="Test gateway connection"
-							?disabled=${busy || !aigwUrl.trim()}
-							@click=${testAigwConnection}
-						>${aigwStatus === "testing" ? "Testing..." : "Test"}</button>
+				${exclusivePending ? html`
+					<div
+						class="text-sm text-foreground bg-warning/10 border border-warning/30 px-3 py-2 rounded-md leading-relaxed"
+						data-testid="gateway-exclusivity-warning"
+					>
+						⚠️ An AI Gateway (<code>aigw</code>) provider is enabled. While active,
+						built-in cloud providers and other OpenAI-compatible gateways are
+						<strong>ignored</strong> — only <code>aigw</code> models are available.
+						Disable it to use local/built-in providers.
 					</div>
+				` : ""}
+
+				<div class="flex flex-col gap-3" data-testid="gateways-editor">
+					${gateways.length === 0 ? html`
+						<p class="text-xs text-muted-foreground italic">
+							No gateways configured — built-in cloud providers are used.
+						</p>
+					` : ""}
+					${gateways.map((g) => renderGatewayRow(g, busy))}
 				</div>
 
-				<!-- Error -->
-				${aigwError ? html`
-					<div class="text-sm text-destructive bg-destructive/10 px-3 py-2 rounded-md">
-						${aigwError}
+				${gatewaysError ? html`
+					<div class="text-sm text-destructive bg-destructive/10 px-3 py-2 rounded-md" data-testid="gateways-error">
+						${gatewaysError}
 					</div>
 				` : ""}
 
-				<!-- Status badge -->
-				${aigwConfigured ? html`
-					<div class="flex items-center gap-2 px-3 py-2 rounded-md bg-green-500/10 border border-green-500/20">
-						<span class="w-2 h-2 rounded-full bg-green-500"></span>
-						<span class="text-sm text-foreground">Connected to <code class="text-xs">${aigwConfiguredUrl}</code></span>
-					</div>
-					<label class="flex items-start gap-2 text-sm text-foreground cursor-pointer">
-						<input
-							type="checkbox"
-							class="mt-0.5"
-							.checked=${aigwExclusive}
-							?disabled=${busy}
-							@change=${(e: Event) => setAigwExclusive((e.target as HTMLInputElement).checked)}
-						/>
-						<span class="flex flex-col">
-							<span>Hide built-in providers while the gateway is configured</span>
-							<span class="text-xs text-muted-foreground">
-								When enabled (default), the model picker only shows gateway models
-								and local custom providers. Turn this off for local dev when you
-								want direct API access alongside a dev gateway.
-							</span>
-						</span>
-					</label>
-				` : ""}
-
-				<!-- Action buttons -->
 				<div class="flex gap-2">
 					<button
-						class="px-4 py-2 text-sm rounded-md bg-primary text-primary-foreground
-							hover:bg-primary/90 transition-colors disabled:opacity-50"
-						title="Save gateway configuration"
-						?disabled=${busy || !aigwUrl.trim()}
-						@click=${saveAigwConfig}
-					>${aigwStatus === "saving" ? "Saving..." : aigwConfigured ? "Update" : "Enable Gateway"}</button>
-					${aigwConfigured ? html`
-						<button
-							class="px-4 py-2 text-sm rounded-md border border-destructive text-destructive
-								hover:bg-destructive/10 transition-colors disabled:opacity-50"
-							title="Disconnect gateway"
-							?disabled=${busy}
-							@click=${removeAigwConfig}
-						>${aigwStatus === "removing" ? "Removing..." : "Disconnect"}</button>
-						<button
-							class="px-4 py-2 text-sm rounded-md border border-input bg-background text-foreground
-								hover:bg-secondary transition-colors disabled:opacity-50"
-							title="Refresh available models"
-							?disabled=${busy}
-							@click=${refreshAigwModels}
-						>Refresh Models</button>
-					` : ""}
+						class="px-3 py-2 text-sm rounded-md border border-input bg-background text-foreground hover:bg-secondary transition-colors disabled:opacity-50"
+						title="Add a gateway"
+						data-testid="gateways-add-btn"
+						?disabled=${busy}
+						@click=${addGatewayRow}
+					>＋ Add gateway</button>
+					<button
+						class="px-4 py-2 text-sm rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+						title="Save gateways"
+						data-testid="gateways-save-btn"
+						?disabled=${busy}
+						@click=${saveGatewaysList}
+					>${busy ? "Saving..." : "Save"}</button>
 				</div>
-
 			</div>
 
 			<!-- Default model preferences -->
@@ -2135,7 +2265,7 @@ export function renderModelsTab() {
 							class="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
 							data-testid="view-aigw-models-btn"
 							@click=${openAigwModelsDialog}
-						>View available models… (${aigwModels.length})</button>
+						>View available models… (${combined.length})</button>
 					</div>
 				` : ""}
 			</div>
@@ -2172,6 +2302,10 @@ function loadGeneralSettings() {
 					settingsShowTimestamps = !!prefs.showTimestamps;
 					// Default ON when unset — only an explicit `false` opts out.
 					settingsPlayFinishSound = prefs.playAgentFinishSound !== false;
+					// Subgoals (Experimental) — default OFF; only an explicit `true` enables. See docs/nested-goals.md.
+					settingsSubgoalsEnabled = prefs.subgoalsEnabled === true;
+					const rawDepth = prefs.maxNestingDepth;
+					settingsMaxNestingDepth = (typeof rawDepth === "number" && Number.isFinite(rawDepth)) ? rawDepth : null;
 					const raw = prefs.skillsCatalogBudget;
 					settingsSkillsCatalogBudget = (typeof raw === "number" && Number.isFinite(raw)) ? raw : null;
 					settingsGithubTrustedHosts = Array.isArray(prefs.githubTrustedHosts)
@@ -2294,6 +2428,49 @@ async function togglePlayFinishSound(): Promise<void> {
 	} catch {}
 }
 
+async function setMaxNestingDepth(raw: number): Promise<void> {
+	if (!Number.isFinite(raw)) return;
+	let n = Math.floor(raw);
+	if (n < MAX_NESTING_DEPTH_MIN) n = MAX_NESTING_DEPTH_MIN;
+	if (n > MAX_NESTING_DEPTH_MAX) n = MAX_NESTING_DEPTH_MAX;
+	settingsMaxNestingDepth = n;
+	document.documentElement.dataset.maxNestingDepth = String(n);
+	renderApp();
+	try {
+		await gatewayFetch("/api/preferences", {
+			method: "PUT",
+			body: JSON.stringify({ maxNestingDepth: n }),
+		});
+	} catch {}
+}
+
+async function resetMaxNestingDepth(): Promise<void> {
+	settingsMaxNestingDepth = null;
+	document.documentElement.dataset.maxNestingDepth = String(MAX_NESTING_DEPTH_DEFAULT);
+	renderApp();
+	try {
+		await gatewayFetch("/api/preferences", {
+			method: "PUT",
+			body: JSON.stringify({ maxNestingDepth: null }),
+		});
+	} catch {}
+}
+
+async function toggleSubgoalsEnabled(): Promise<void> {
+	settingsSubgoalsEnabled = !settingsSubgoalsEnabled;
+	// Apply synchronously to the dataset so the six client-side gate sites
+	// (workflow picker, Plan/Children tabs, sidebar nesting, mutation card)
+	// flip without waiting on the preferences_changed broadcast.
+	document.documentElement.dataset.subgoalsEnabled = settingsSubgoalsEnabled ? "true" : "false";
+	renderApp();
+	try {
+		await gatewayFetch("/api/preferences", {
+			method: "PUT",
+			body: JSON.stringify({ subgoalsEnabled: settingsSubgoalsEnabled }),
+		});
+	} catch {}
+}
+
 function setSidebarFontScaleStop(stopIndex: number): void {
 	const clampedIndex = Math.max(0, Math.min(SIDEBAR_FONT_SCALE_STOPS.length - 1, Math.round(stopIndex)));
 	const value = SIDEBAR_FONT_SCALE_STOPS[clampedIndex].value;
@@ -2376,6 +2553,56 @@ function renderGeneralTab() {
 				<p class="text-xs text-muted-foreground ml-6">
 					Play a short notification beep when an agent finishes its turn.
 				</p>
+			</div>
+			<div class="flex flex-col gap-1.5">
+				<label class="flex items-center gap-2 cursor-pointer">
+					<input
+						type="checkbox"
+						class="w-4 h-4 rounded border-input accent-primary cursor-pointer"
+						data-testid="general-subgoals-enabled"
+						.checked=${settingsSubgoalsEnabled}
+						@change=${toggleSubgoalsEnabled}
+					/>
+					<span class="text-sm font-medium text-foreground">Subgoals</span>
+					<span
+						class="ml-1 text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200"
+						data-testid="experimental-pill"
+					>Experimental</span>
+				</label>
+				<p class="text-xs text-muted-foreground ml-6">
+					Enable nested goals (parent / child / DAG subgoals). Surfaces the
+					<code>parent</code> workflow, the nine <code>Children</code> tools,
+					the Plan tab DAG, and the Children tab on the goal dashboard.
+					Currently experimental — behaviour may change.
+				</p>
+			</div>
+			<div class="flex flex-col gap-1.5 ${settingsSubgoalsEnabled ? '' : 'opacity-50'}">
+				<span class="text-sm font-medium text-foreground">Max subgoal depth</span>
+				<p class="text-xs text-muted-foreground">
+					Maximum nesting depth for subgoal trees. Depth 3 = root → child → grandchild.
+					Setting this higher risks runaway spawning. System setting is the ceiling —
+					per-goal overrides can only tighten, not loosen. Range: ${MAX_NESTING_DEPTH_MIN}–${MAX_NESTING_DEPTH_MAX}.
+				</p>
+				<div class="flex items-center gap-3">
+					<input
+						type="number"
+						min="${MAX_NESTING_DEPTH_MIN}"
+						max="${MAX_NESTING_DEPTH_MAX}"
+						step="1"
+						data-testid="general-max-nesting-depth"
+						class="w-24 px-2 py-1 rounded border border-input bg-background text-sm"
+						.value=${String(settingsMaxNestingDepth ?? MAX_NESTING_DEPTH_DEFAULT)}
+						?disabled=${!settingsSubgoalsEnabled}
+						@change=${(e: Event) => setMaxNestingDepth(Number((e.target as HTMLInputElement).value))}
+					/>
+					<span class="text-xs text-muted-foreground">${settingsMaxNestingDepth === null ? "(default)" : ""}</span>
+					<button
+						class="text-xs text-muted-foreground hover:text-foreground underline"
+						data-testid="general-max-nesting-depth-reset"
+						?disabled=${settingsMaxNestingDepth === null || !settingsSubgoalsEnabled}
+						@click=${resetMaxNestingDepth}
+					>Reset to default</button>
+				</div>
 			</div>
 			<div class="flex flex-col gap-1.5">
 				<span class="text-sm font-medium text-foreground">Skills catalog budget</span>

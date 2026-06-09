@@ -85,7 +85,7 @@ export interface GatewaySession {
 	consecutiveErrorTurns?: number;
 }
 
-export type GoalState = "todo" | "in-progress" | "complete" | "shelved";
+export type GoalState = "todo" | "in-progress" | "complete" | "shelved" | "blocked";
 
 export interface Goal {
 	id: string;
@@ -110,6 +110,28 @@ export interface Goal {
 	reattemptOf?: string;
 	/** Whether team agents should run in Docker sandbox */
 	sandboxed?: boolean;
+	/** Nested-goals fields (Phase 1 data model). All optional; lazy-migrated. */
+	parentGoalId?: string;
+	rootGoalId?: string;
+	mergeTarget?: "master" | "parent";
+	divergencePolicy?: "strict" | "balanced" | "autonomous";
+	maxConcurrentChildren?: number;
+	acceptanceCriteria?: string[];
+	spawnedFromPlanId?: string;
+	/** Sibling planIds this child depends on (Phase 5 — explicit DAG). */
+	dependsOnPlanIds?: string[];
+	/** Set on goal_spawn_child to the spawning team-lead session id. Used
+	 *  by the sidebar to nest sub-goals under their spawning session so
+	 *  collapsing the team-lead also hides the sub-goals it owns. */
+	spawnedBySessionId?: string;
+	paused?: boolean;
+	replanCount?: number;
+	/** Plan-tab enrichment (Phase 5c). Sourced ONLY from `GET /descendants`
+	 *  (`enrichDescendantsForPlan`), never from the live goal feed. Carried
+	 *  onto pooled goals by `dashboardGoalPool()` so both live and archived
+	 *  nodes can render gate status / conflict pills. */
+	gateStatus?: "pending" | "running" | "passed" | "failed";
+	mergeConflict?: boolean;
 	workflow?: {
 		id: string;
 		name: string;
@@ -786,6 +808,7 @@ export const GOAL_STATE_LABELS: Record<GoalState, string> = {
 	"in-progress": "In Progress",
 	"complete": "Complete",
 	"shelved": "Shelved",
+	"blocked": "Blocked",
 };
 
 // ============================================================================
@@ -809,6 +832,14 @@ export function getSidebarData(): SidebarData {
 	if (_sidebarDataCache && _sidebarCacheKey === key) return _sidebarDataCache;
 
 	const staffSessionIds = new Set<string>(state.staffList.map((s) => s.currentSessionId).filter((id): id is string => Boolean(id)));
+	// Exclude *staff-agent* sessions (the permanent sessions owned by staff
+	// agents in state.staffList) — they render under the dedicated Staff header.
+	// These are matched purely by `staffSessionIds`: staff-agent sessions are
+	// created with `assistantType: undefined` (see staff-manager's createSession
+	// calls), so do NOT also filter on `assistantType === "staff"` — that value
+	// only ever belongs to the ephemeral *staff-creation assistant* (the wand),
+	// which must appear in the Sessions bucket exactly like the goal/role/tool/
+	// project creation assistants do.
 	const ungroupedSessions = state.gatewaySessions.filter((s) => !s.goalId && !s.teamGoalId && !s.delegateOf && !s.parentSessionId && !staffSessionIds.has(s.id)).sort((a, b) => a.createdAt - b.createdAt);
 	const sortedGoals = [...state.goals].sort((a, b) => a.createdAt - b.createdAt);
 	const liveGoals = sortedGoals.filter(g => !g.archived);

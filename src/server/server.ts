@@ -1,6 +1,6 @@
 import { exec, execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -8,7 +8,7 @@ import path from "node:path";
 
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { bobbitStateDir, bobbitConfigDir, getProjectRoot } from "./bobbit-dir.js";
+import { bobbitStateDir, bobbitConfigDir, getProjectRoot, globalAgentDir } from "./bobbit-dir.js";
 import { recordBootTiming, readBootTimings, BOOT_TIMING_FILE } from "./dev-boot-timing.js";
 import { touchGatewayRestartSentinel } from "./harness-signal.js";
 import { isSetupComplete } from "./setup-status.js";
@@ -25,12 +25,24 @@ import { paceAndSend, PACE_TIMEOUT_MS } from "./replay-pacing.js";
 import { discoverSlashSkills, discoverSlashSkillsResolved, getSkillDirectories, getSlashSkill, buildSlashSkillPrompt, invalidateSlashSkillsCache, type SkillMarketContext } from "./skills/slash-skills.js";
 import { enumerateFiles } from "./skills/file-enumeration.js";
 import { TeamManager, GateDependencyError } from "./agent/team-manager.js";
+import { tryHandleNestedGoalRoute, listDescendants } from "./agent/nested-goal-routes.js";
+import { walkGoalSubtree, cascadeSubtree as cascadeGoalSubtree } from "./agent/goal-subtree.js";
+import type { Workflow } from "./agent/workflow-store.js";
+import { buildDefaultWorkflows, buildParentWorkflow } from "./state-migration/seed-default-workflows.js";
+import { readSubgoalNestingPrefs, checkCanSpawnChild, inheritedChildOverrides, clampMaxDepth } from "./agent/subgoal-nesting-limit.js";
+import { GoalPausedError, requireAncestorsNotPaused } from "./agent/goal-paused-guard.js";
+import { collectDescendants, enrichDescendantsForPlan } from "./agent/goal-descendants.js";
+import { computeTreeCost } from "./agent/cost-tracker.js";
+import { backfillLegacyCostGoalIds, backfillLegacyCostGoalIdsFromTranscripts } from "./agent/cost-backfill.js";
 import { checkGateDependencies } from "./agent/gate-dependency-check.js";
 import { shouldCreateWorktree } from "./agent/worktree-decision.js";
 import { resolveWorktreeSupport } from "./agent/worktree-support.js";
 import { RoleStore } from "./agent/role-store.js";
 import { RoleManager } from "./agent/role-manager.js";
 import { ToolManager, copyDirRecursive, __resetToolScanCache } from "./agent/tool-manager.js";
+import { ActionDispatcher, ActionError, resolveActionToolManager } from "./extension-host/action-dispatcher.js";
+import { authorizeActionRequest, transcriptHasToolUse, type ActionGuardSession } from "./extension-host/action-guard.js";
+import { createServerHostApi } from "./extension-host/server-host-api.js";
 import { buildGateStatusSummary } from "./gate-status-summary.js";
 import { buildGateVerificationSnapshot, UnknownVerificationStepError } from "./gate-verification-snapshot.js";
 import {
@@ -178,6 +190,7 @@ import { resolveSandboxCloneSource, type SandboxCloneSource } from "./agent/sand
 import { validateSandboxMounts } from "./agent/sandbox-mounts.js";
 import { SandboxTokenStore, type SandboxScope } from "./auth/sandbox-token.js";
 import { CookieStore, issueIfMissing as issueCookieIfMissing, tryAuth as cookieTryAuth } from "./auth/cookie.js";
+import { authorizeChildrenMutation } from "./auth/children-mutation-authz.js";
 import { handlePreviewRequest } from "./preview/content-route.js";
 import { handlePrWalkthroughApiRoute } from "./pr-walkthrough/routes.js";
 import { WalkthroughAgentManager } from "./pr-walkthrough/walkthrough-agent-manager.js";
@@ -187,7 +200,24 @@ import { isSandboxAllowed } from "./auth/sandbox-guard.js";
 import * as previewMount from "./preview/mount.js";
 import * as previewArtifacts from "./preview/artifacts.js";
 import { broadcastPreviewChanged, subscribePreviewChanged } from "./preview/events.js";
-import { configureAigw, removeAigw, getAigwUrl, discoverAigwModels, proxyRequest, startupAigwCheck, writeContextWindowOverrides, inferMeta } from "./agent/aigw-manager.js";
+import {
+	discoverAigwModels,
+	discoverGatewayModels,
+	proxyRequest,
+	startupAigwCheck,
+	writeContextWindowOverrides,
+	inferMeta,
+	listGateways,
+	getEnabledGateways,
+	getGatewayByName,
+	saveGateways,
+	migrateGatewayPrefs,
+	syncGatewaysModelsJson,
+	isClaudeId,
+	stripProviderPrefix,
+	type ModelGateway,
+	type AigwModel,
+} from "./agent/aigw-manager.js";
 import { writeOpenAIModelAdditions } from "./agent/openai-model-additions.js";
 import { ReviewAnnotationStore, type ReviewAnnotation } from "./review-annotation-store.js";
 import { getAvailableModels, discoverModelsForConfig, invalidateModelCache } from "./agent/model-registry.js";
@@ -200,6 +230,7 @@ import { archiveProjectBobbitDir, ArchiveError } from "./agent/bobbit-archive.js
 import { ProjectContextManager } from "./agent/project-context-manager.js";
 import { resolveProjectForRequest } from "./agent/resolve-project.js";
 import { GoalManager } from "./agent/goal-manager.js";
+import { computePlanFreezeUpdate } from "./agent/parent-workflow-freeze.js";
 import { detectHostTokens, resolveHostTokenValue, sandboxTokenPolicyAllowsCodexAuth } from "./agent/host-tokens.js";
 import type { PersistedGoal } from "./agent/goal-store.js";
 import type { GateResetResult } from "./agent/gate-store.js";
@@ -264,6 +295,20 @@ function clampRoleThinking(value: unknown, modelStr: string | undefined): string
 	const modelId = modelStr.slice(slash + 1);
 	const meta = inferMeta(modelId);
 	return clampThinkingLevel(known, { id: modelId, provider, reasoning: meta.reasoning });
+}
+
+/**
+ * Shape a gateway's freshly-discovered models for an API response (the legacy
+ * configure/refresh/status shims + the per-gateway refresh/status endpoints).
+ * Mirrors what the model registry surfaces: an `aigw`-type gateway prefix-strips
+ * Claude ids and tags them `bedrock-converse-stream`; an `openai-compatible`
+ * gateway returns raw ids untouched (never Bedrock-routed, even for `claude-*`).
+ */
+function shapeGatewayModelsForDisplay(gateway: ModelGateway, models: AigwModel[]): AigwModel[] {
+	if (gateway.type !== "aigw") return models;
+	return models.map((m) =>
+		isClaudeId(m.id) ? { ...m, id: stripProviderPrefix(m.id), api: "bedrock-converse-stream" } : m,
+	);
 }
 
 async function deleteRemoteGoalBranches(
@@ -843,6 +888,10 @@ export function createGateway(config: GatewayConfig) {
 	const roleManager = new RoleManager(roleStore);
 	const toolManager = new ToolManager(configDir);
 	toolManager.generateDetailDocs(stateDir);
+	// Extension host (design docs/design/extension-host.md §4b): the action
+	// dispatcher lives for the gateway process lifetime; its module cache is
+	// dropped synchronously by invalidateResolverCaches() on pack mutations.
+	const actionDispatcher = new ActionDispatcher(toolManager);
 	const groupPolicyStore = new ToolGroupPolicyStore(configDir);
 	const sandboxTokenStore = new SandboxTokenStore();
 	const cookieStore = new CookieStore(stateDir);
@@ -859,6 +908,7 @@ export function createGateway(config: GatewayConfig) {
 		prStatusStore,
 	});
 	sessionManager.sandboxTokenStore = sandboxTokenStore;
+
 	// Wire sessionManager into the project context manager so the search
 	// orphan filter can resolve sessions across projects (live, dormant,
 	// archived). The registry is already passed via the constructor.
@@ -876,6 +926,15 @@ export function createGateway(config: GatewayConfig) {
 	// scoped only — no system layer, no builtin layer.
 	roleStore.setBuiltins(builtinConfigProvider.getRoles());
 	groupPolicyStore.setBuiltins(builtinConfigProvider.getToolGroupPolicies());
+	// Wire the system-scope Subgoals feature gate into the policy cascade.
+	// Without this, getSubgoalsEnabled() returns false unconditionally and
+	// every tool in the `Children` group (goal_spawn_child, goal_merge_child,
+	// goal_pause, goal_resume, goal_plan_propose, goal_set_policy,
+	// goal_archive_child, goal_plan_status, goal_decide_mutation) resolves to
+	// `never` at policy time — silently dropped from every team-lead's tool
+	// surface. See docs/design/subgoals-experimental-toggle.md.
+	// Production deviation from PR #497: subgoals default ON — unset reads as enabled.
+	groupPolicyStore.setSubgoalsEnabledGetter(() => preferencesStore.get("subgoalsEnabled") === true);
 
 	const configCascade = new ConfigCascade(builtinConfigProvider, {
 		getRoles: () => roleStore.getAllLocal(),
@@ -1074,6 +1133,21 @@ export function createGateway(config: GatewayConfig) {
 				return;
 			}
 
+			// Reject oversized request bodies up front — before auth, dispatch,
+			// or any handler buffers/parses the body (Sec-2). A declared
+			// Content-Length over the cap is refused with a definitive 413;
+			// chunked/streamed bodies without a length are bounded by the
+			// streaming cap inside readBody().
+			if (bodyLimitExceeded(req.headers["content-length"])) {
+				res.writeHead(413, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({
+					error: "Request body too large",
+					code: "BODY_TOO_LARGE",
+					limit: MAX_REQUEST_BODY_BYTES,
+				}));
+				return;
+			}
+
 			// Public endpoints — no auth required (CA cert is inherently public).
 			const isPublicEndpoint = url.pathname === "/api/ca-cert" && req.method === "GET";
 
@@ -1136,7 +1210,7 @@ export function createGateway(config: GatewayConfig) {
 			// Enable via BOBBIT_TIMING_LOG=1 to print "[timing] METHOD path ms" for each API call.
 			const _timingEnabled = process.env.BOBBIT_TIMING_LOG === "1";
 			const _timingStart = _timingEnabled ? performance.now() : 0;
-			await handleApiRoute(url, req, res, sessionManager, config, colorStore, prStatusStore, teamManager, roleManager, toolManager, projectContextManager, bgProcessManager, staffManager, verificationHarness, preferencesStore, projectConfigStore, groupPolicyStore, broadcastToGoal, broadcastToAll, sandboxManager, projectRegistry, configCascade, sandboxScope, sandboxTokenStore, reviewAnnotationStore, broadcastToSession, roleStore, inboxManager, prWalkthroughAgentManager, marketplaceSourceStore, marketplaceInstaller);
+			await handleApiRoute(url, req, res, sessionManager, config, colorStore, prStatusStore, teamManager, roleManager, toolManager, projectContextManager, bgProcessManager, staffManager, verificationHarness, preferencesStore, projectConfigStore, groupPolicyStore, broadcastToGoal, broadcastToAll, sandboxManager, projectRegistry, configCascade, sandboxScope, sandboxTokenStore, reviewAnnotationStore, broadcastToSession, roleStore, inboxManager, prWalkthroughAgentManager, marketplaceSourceStore, marketplaceInstaller, cookieStore, actionDispatcher);
 			if (_timingEnabled) {
 				const dur = performance.now() - _timingStart;
 				if (dur >= 100) console.log(`[timing] ${req.method} ${url.pathname}${url.search} ${dur.toFixed(1)}ms`);
@@ -1557,12 +1631,17 @@ export function createGateway(config: GatewayConfig) {
 	return {
 		server,
 		sessionManager,
+		/** @internal Exposed for in-process E2E tests to drive supervisor-respawn directly. */
+		teamManager,
 		bgProcessManager,
 		projectContextManager,
 		async start(): Promise<number> {
 			// Check internet and auto-configure AI Gateway if offline
 			// Runs before session restore so models.json is written before
 			// any agent subprocesses start.
+			// Migrate legacy single-URL aigw prefs → modelGateways list first
+			// (idempotent; startupAigwCheck also migrates internally).
+			migrateGatewayPrefs(preferencesStore);
 			await startupAigwCheck(preferencesStore);
 			writeContextWindowOverrides();
 			writeOpenAIModelAdditions();
@@ -1723,6 +1802,23 @@ export function createGateway(config: GatewayConfig) {
 			await sessionManager.restoreSessions();
 			prWalkthroughAgentManager.restore();
 
+			// One-shot legacy cost backfill: stamp `goalId` on cost entries
+			// that pre-date the forward-stamp fix (commit a4050f59). Runs
+			// once per project context after sessions are restored so the
+			// resolver can see live PersistedSession records. Idempotent.
+			const agentSessionsRoot = path.join(globalAgentDir(), "sessions");
+			try {
+				for (const ctx of projectContextManager.all()) {
+					backfillLegacyCostGoalIds({
+						costTracker: ctx.costTracker,
+						sessionManager,
+						agentSessionsRoot,
+					});
+				}
+			} catch (err) {
+				console.warn("[cost-backfill] boot backfill failed (non-fatal):", err);
+			}
+
 			// NOTE: Orphaned worktree cleanup and non-interactive session cleanup
 			// are no longer automatic on startup. Use the Settings → Maintenance UI
 			// or the /api/maintenance/* endpoints to preview and clean up manually.
@@ -1752,6 +1848,26 @@ export function createGateway(config: GatewayConfig) {
 			// through the cold path (full createWorktree + npm ci).
 			const runBootBackgroundTasks = async (): Promise<void> => {
 				const t0 = Date.now();
+
+				// Transcript-pass backfill — lazy, fire-and-forget after listen().
+				// Runs *after* the synchronous sidecar pass so it only touches entries
+				// that pass could not resolve. Bounded per-project (50 lines / 64 KiB
+				// per file, 30s total) and confidence-gated (see extractTranscriptGoalId).
+				// Bumps the cost-tracker generation when it stamps anything, which
+				// invalidates cached tree-cost rollups for the next request.
+				const transcriptBackfillTask = (async () => {
+					for (const ctx of projectContextManager.all()) {
+						try {
+							await backfillLegacyCostGoalIdsFromTranscripts({
+								costTracker: ctx.costTracker,
+								agentSessionsRoot,
+								goals: ctx.goalStore.getAll(),
+							});
+						} catch (err) {
+							console.warn("[cost-backfill] transcript-pass failed (non-fatal):", err);
+						}
+					}
+				})();
 
 				const sweeperTask = (async () => {
 					const tStart = Date.now();
@@ -1849,8 +1965,7 @@ export function createGateway(config: GatewayConfig) {
 						}
 					}));
 				})();
-
-				await Promise.all([sweeperTask, poolInitTask]);
+				await Promise.all([transcriptBackfillTask, sweeperTask, poolInitTask]);
 				console.log(`[boot] background tasks complete in ${Date.now() - t0}ms`);
 			};
 
@@ -1929,6 +2044,19 @@ export function createGateway(config: GatewayConfig) {
 			throw new Error(`All ports ${config.port}-${maxPort} in use`);
 		},
 		async shutdown() {
+			// Stop accepting NEW connections AND forcibly terminate existing
+			// keep-alive connections BEFORE we tear down the state stores.
+			// Without this, an HTTP/1.1 keep-alive connection from the client
+			// can still deliver a request to handleApiRoute mid-shutdown (e.g.
+			// during the awaits below), after projectContextManager.closeAll()
+			// has emptied the contexts map — producing spurious `Goal "X" not
+			// found in any project` errors. It also matters for the test
+			// crash/restart path: a stale keep-alive connection on the OLD
+			// server's accept() fd survives port reuse and routes new requests
+			// to the OLD (already torn down) handler closure. Forcibly closing
+			// connections forces clients to reconnect to the NEW server.
+			try { (server as { closeAllConnections?: () => void }).closeAllConnections?.(); } catch { /* best-effort */ }
+			server.close();
 			clearInterval(cleanupInterval);
 			triggerEngine.stop();
 			inboxNudger.stop();
@@ -1944,7 +2072,6 @@ export function createGateway(config: GatewayConfig) {
 				await sandboxManager.shutdownAll();
 			}
 			await sessionManager.cleanupSandboxNetwork();
-			server.close();
 		},
 	};
 }
@@ -2129,10 +2256,13 @@ async function handleApiRoute(
 	prWalkthroughAgentManager?: WalkthroughAgentManager,
 	marketplaceSourceStore?: MarketplaceSourceStore,
 	marketplaceInstaller?: MarketplaceInstaller,
+	cookieStore?: CookieStore,
+	actionDispatcher?: ActionDispatcher,
 ) {
 	// These are always wired by the sole caller; the optional markers are only to avoid
 	// touching every existing signature site.
 	const serverRoleStore = roleStore!;
+	const dispatcher = actionDispatcher!;
 	/** Serialize a cascade-resolved item with origin/overrides + market-pack tags (design §5.2). */
 	const withOrigin = (r: { item: Record<string, unknown>; origin: unknown; overrides?: unknown; originPackId?: string | null; originPackName?: string | null }): Record<string, unknown> => ({
 		...r.item,
@@ -2148,15 +2278,26 @@ async function handleApiRoute(
 	// marketplace pack-list mutation (design §9.1 / finding #1) so newly
 	// installed/updated/removed market-pack tool roots are re-scanned (Windows
 	// coarse-mtime can otherwise serve a stale scan after a re-copy update).
-	const invalidateResolverCaches = (): void => { invalidateSlashSkillsCache(); __resetToolScanCache(); };
+	const invalidateResolverCaches = (): void => { invalidateSlashSkillsCache(); __resetToolScanCache(); dispatcher.invalidate(); };
 	const json = (data: unknown, status = 200) => {
 		res.writeHead(status, { "Content-Type": "application/json" });
 		res.end(JSON.stringify(data));
 	};
 	const jsonError = (status: number, err: unknown, extra?: Record<string, unknown>) => {
 		const e = err instanceof Error ? err : new Error(String(err));
-		json({ error: e.message, stack: e.stack, ...extra }, status);
+		// Log stack trace server-side only; do not send it to clients to avoid
+		// leaking host paths, source line numbers, and implementation details.
+		console.error(`[api] ${status} error:`, e.stack ?? e.message);
+		json({ error: e.message, ...extra }, status);
 	};
+
+	/** Subgoals feature gate. Writes 403 SUBGOALS_DISABLED + returns false when off. */
+	function requireSubgoalsEnabled(): boolean {
+		// Subgoals default OFF (aligned with PR #497) — only an explicit `true` enables.
+		if (preferencesStore.get("subgoalsEnabled") === true) return true;
+		json({ error: "Subgoals are disabled", code: "SUBGOALS_DISABLED" }, 403);
+		return false;
+	}
 
 	if (await handlePrWalkthroughApiRoute(url, req, res, {
 		defaultCwd: config.defaultCwd,
@@ -2334,7 +2475,7 @@ async function handleApiRoute(
 			status: "ok",
 			sessions: sessionManager.listSessions().length,
 			localhost: isLocalhost,
-			aigw: !!getAigwUrl(preferencesStore),
+			aigw: getEnabledGateways(preferencesStore).length > 0,
 			setupComplete: isSetupComplete(),
 			orphanedTranscripts: sessionManager.orphanedTranscriptsCount,
 		});
@@ -2547,7 +2688,6 @@ async function handleApiRoute(
 		json(tokens);
 		return;
 	}
-
 	// ── Project Detection & Browse ────────────────────────────────────
 
 	// GET /api/projects/preflight?path=<absolute>
@@ -4200,6 +4340,109 @@ async function handleApiRoute(
 		}
 	}
 
+	// ── Nested-goal endpoints ─────────────────────────────────────
+	// REST surface for the team-lead-only `goal_*` tools. Implementation in
+	// `nested-goal-routes.ts`. Cascade-affecting routes require explicit
+	// `cascade` (422 otherwise). UI is the cascade-policy authority.
+	if (await tryHandleNestedGoalRoute(req, url, {
+		projectContextManager,
+		verificationHarness,
+		teamManager,
+		sessionManager,
+		// Always wired by the sole caller (see handleApiRoute optional-param note).
+		cookieStore: cookieStore!,
+		requireSubgoalsEnabled,
+		getGoalAcrossProjects,
+		getGoalManagerForGoal,
+		readBody,
+		json,
+		jsonError,
+		broadcastToAll,
+		getSubgoalNestingPrefs: () => readSubgoalNestingPrefs((k) => preferencesStore.get(k)),
+	})) return;
+
+	// GET /api/goals/:goalId/descendants — live + archived descendants for the Plan tab.
+	// Feeds dashboardDescendants in goal-dashboard.ts so archived children render in the DAG
+	// and contribute to tree-cost rollups. Without this route, the Plan tab silently drops
+	// every archived/completed child.
+	const goalDescendantsMatch = url.pathname.match(/^\/api\/goals\/([^/]+)\/descendants$/);
+	if (goalDescendantsMatch && req.method === "GET") {
+		const goalId = goalDescendantsMatch[1];
+		const goal = getGoalAcrossProjects(goalId);
+		if (!goal) { json({ error: "Goal not found" }, 404); return; }
+		if (!goal.projectId) { json({ goals: [] }); return; }
+		const ctx = projectContextManager.getContextForGoal(goalId);
+		if (!ctx) { json({ error: "Goal project context not found" }, 404); return; }
+		// getAll() returns both live and archived.
+		const allGoals = ctx.goalStore.getAll();
+		// Enrich each descendant with the Plan-tab data contract: `mergeConflict`
+		// (durable, from the goal record) and `gateStatus` (aggregated from the
+		// child's workflow gates). The frontend consumes these exact names.
+		const enriched = enrichDescendantsForPlan(collectDescendants(goalId, allGoals), {
+			getGatesForGoal: (gid) => ctx.gateStore.getGatesForGoal(gid),
+			hasActiveVerification: (gid) => verificationHarness.getActiveVerifications(gid).length > 0,
+		});
+		json({ goals: enriched });
+		return;
+	}
+
+	// GET /api/goals/:goalId/tree-cost — cost rollup across descendant tree (live + archived).
+	const goalTreeCostMatch = url.pathname.match(/^\/api\/goals\/([^/]+)\/tree-cost$/);
+	if (goalTreeCostMatch && req.method === "GET") {
+		if (!requireSubgoalsEnabled()) return;
+		const goalId = goalTreeCostMatch[1];
+		const goal = getGoalAcrossProjects(goalId);
+		if (!goal) { json({ error: "Goal not found" }, 404); return; }
+		// Dashboard tree-cost is intentionally rooted at the REQUESTED goal,
+		// not its topmost ancestor (`goal.rootGoalId`). Opening a subgoal's
+		// dashboard must show the rollup of that subgoal + its descendants only;
+		// using `rootGoalId` would leak the whole project's grand total down to
+		// every descendant view. `computeTreeCost` consumes `walkGoalSubtree`
+		// for the descendant walk — do not add another traversal helper here.
+		// Pinned by tests/api-goals-tree-cost.test.ts and
+		// tests/e2e/ui/tree-cost-rollup.spec.ts — do not "fix" this back to
+		// `goal.rootGoalId ?? goal.id` without tripping those tests.
+		if (!goal.projectId) {
+			json({ rootGoalId: goalId, totalCostUsd: 0, totalTokensIn: 0, totalTokensOut: 0, breakdown: [] });
+			return;
+		}
+		const ctx = projectContextManager.getContextForGoal(goalId);
+		if (!ctx) { json({ error: "Goal project context not found" }, 404); return; }
+		const allGoals = ctx.goalStore.getAll();
+		const costTracker = sessionManager.getCostTracker(goal.projectId);
+		const result = computeTreeCost(
+			goalId,
+			allGoals,
+			costTracker,
+			(gid) => sessionManager.getAllSessionIdsForGoal(gid),
+		);
+		// Surface the unattributable legacy bucket (cost entries whose
+		// `goalId` could not be recovered by the boot backfill). NOT added
+		// to `totalCostUsd` — it's an informational residual, separate from
+		// the selected goal's subtree. Hidden entirely when empty.
+		const legacy = costTracker.getUnattributableLegacyCostWithMetadata();
+		if (legacy.totalCost > 0 || legacy.inputTokens > 0 || legacy.outputTokens > 0) {
+			const payload: {
+				goalId: string;
+				title: string;
+				costUsd: number;
+				tokensIn: number;
+				tokensOut: number;
+				firstSeenAt?: number;
+			} = {
+				goalId: "__unattributable__",
+				title: "Unattributable (legacy)",
+				costUsd: legacy.totalCost,
+				tokensIn: legacy.inputTokens,
+				tokensOut: legacy.outputTokens,
+			};
+			if (typeof legacy.firstSeenAt === "number") payload.firstSeenAt = legacy.firstSeenAt;
+			(result as typeof result & { unattributableLegacy?: unknown }).unattributableLegacy = payload;
+		}
+		json(result);
+		return;
+	}
+
 	// ── Goal endpoints ─────────────────────────────────────────────
 
 	// GET /api/goals
@@ -4315,17 +4558,211 @@ async function handleApiRoute(
 				}
 			}
 			const targetGoalManager = targetCtx.goalManager;
-			// Resolve workflow through the config cascade (builtin → server → project)
-			const cascadeWorkflows = configCascade.resolveWorkflows(targetProjectId);
-			const resolvedWorkflow = cascadeWorkflows.find(r => r.item.id === workflowId)?.item;
+			// Handle parentGoalId — depth cap validation (same gate as goal_spawn_child).
+			const parentGoalId = (body?.parentGoalId && typeof body.parentGoalId === "string") ? body.parentGoalId.trim() : undefined;
+			let resolvedParentGoal: PersistedGoal | undefined;
+			if (parentGoalId) {
+				// Parent MUST be in the same project context — cross-project hierarchy
+				// would corrupt the parentGoalId chain because createGoal only walks
+				// its own store. Reject cross-project parents with a clear 422.
+				resolvedParentGoal = targetGoalManager.getGoal(parentGoalId);
+				if (!resolvedParentGoal) {
+					const crossProject = getGoalAcrossProjects(parentGoalId);
+					if (crossProject) {
+						json({ error: "Parent goal belongs to a different project. Select a parent in the same project.", code: "PARENT_CROSS_PROJECT" }, 422);
+					} else {
+						json({ error: "Parent goal not found", code: "PARENT_NOT_FOUND" }, 422);
+					}
+					return;
+				}
+				// S1 SECURITY: creating a child via `POST /api/goals` with a
+				// `parentGoalId` is a Children mutation — it spawns and can
+				// auto-start a child team under another goal. It MUST be
+				// authorized like the other Children verbs BEFORE anything is
+				// created/started; previously this path validated parent
+				// existence + nesting + pause then created the child with NO
+				// authz, letting any shared-bearer-token holder (incl. a
+				// non-team-lead agent) drive child creation under an arbitrary
+				// goal and bypass the Children tool policy + per-session secret
+				// binding. This is an OPERATOR-class verb: the proposal UI drives
+				// it (verified human cookie accepted), otherwise the AUTHENTIC
+				// caller (derived server-side from the unforgeable per-session
+				// secret, never the public spawning-session header) must match
+				// the team-lead of the parent's ROOT goal. See
+				// children-mutation-authz.ts.
+				{
+					const h = req.headers as Record<string, string | string[] | undefined>;
+					const readHeader = (n: string): string | undefined => {
+						const v = h[n.toLowerCase()];
+						const s = Array.isArray(v) ? v[0] : v;
+						return typeof s === "string" && s.trim() ? s.trim() : undefined;
+					};
+					const rootGoalId = resolvedParentGoal.rootGoalId ?? resolvedParentGoal.id;
+					const authz = authorizeChildrenMutation({
+						mutationClass: "operator",
+						isHumanOperator: cookieTryAuth(req, cookieStore!),
+						// Derive the AUTHENTIC caller from the per-session secret,
+						// never the forgeable public spawning-session header.
+						authenticCallerSessionId: sessionManager.sessionSecretStore.resolveSessionIdBySecret(
+							readHeader("x-bobbit-session-secret"),
+						),
+						teamLeadSessionId: teamManager.getTeamState(rootGoalId)?.teamLeadSessionId,
+					});
+					if (!authz.ok) {
+						json({
+							error: "Caller session is not the team-lead for this goal",
+							code: "NOT_TEAM_LEAD",
+							goalId: parentGoalId,
+						}, 403);
+						return;
+					}
+				}
+				// Pause-cascade (Finding 1): refuse to create/auto-start a child
+				// under a paused parent OR any paused ancestor. Mirrors the
+				// guarantee `/spawn-child` and the harness `runSubgoalStep` already
+				// enforce — `POST /api/goals` with `parentGoalId` previously
+				// bypassed it entirely (validated parent existence + nesting, then
+				// created + auto-started the child). The walk is cycle-guarded.
+				try {
+					requireAncestorsNotPaused(
+						parentGoalId,
+						(id) => targetGoalManager.getGoal(id) ?? getGoalAcrossProjects(id),
+					);
+				} catch (err) {
+					if (err instanceof GoalPausedError) {
+						json({ error: err.message, code: err.code, goalId: err.goalId }, 409);
+						return;
+					}
+					throw err;
+				}
+				const prefs = readSubgoalNestingPrefs((k) => preferencesStore.get(k));
+				const nestResult = checkCanSpawnChild(
+					resolvedParentGoal,
+					prefs,
+					(id) => targetGoalManager.getGoal(id) ?? getGoalAcrossProjects(id),
+				);
+				if (!nestResult.ok) {
+					if (nestResult.code === "SUBGOALS_DISABLED") {
+						json({ error: "Subgoals are disabled", code: "SUBGOALS_DISABLED" }, 422);
+						return;
+					}
+					if (nestResult.code === "NESTING_DEPTH_EXCEEDED") {
+						json({
+							error: `Nesting depth cap reached: ${nestResult.currentDepth} / ${nestResult.maxDepth}`,
+							code: "NESTING_DEPTH_EXCEEDED",
+							currentDepth: nestResult.currentDepth,
+							maxDepth: nestResult.maxDepth,
+						}, 422);
+						return;
+					}
+				}
+			}
+			// Cascade: body.workflow (inline snapshot) → workflowId lookup → auto-seed → first match.
+			let resolvedWorkflow: Workflow | undefined;
+			let resolvedWorkflowId = workflowId;
+			const inlineWorkflow = body?.workflow;
+			if (inlineWorkflow && typeof inlineWorkflow === "object") {
+				resolvedWorkflow = inlineWorkflow as Workflow;
+				resolvedWorkflowId = (inlineWorkflow as { id?: string }).id || workflowId;
+			} else {
+				// Layer 1: cascade lookup (only when workflowId given).
+				if (workflowId) {
+					const cascadeWorkflows = configCascade.resolveWorkflows(targetProjectId);
+					resolvedWorkflow = cascadeWorkflows.find(r => r.item.id === workflowId)?.item;
+					// Layer 1b: cascade miss — fall through to project store directly.
+					if (!resolvedWorkflow) {
+						resolvedWorkflow = targetCtx.workflowStore.get(workflowId);
+					}
+				}
+				// Layer 2: store is empty → auto-seed defaults.
+				if (!resolvedWorkflow && targetCtx.workflowStore.getAll().length === 0) {
+					const projName = resolved.project.name || "project";
+					const seeds = buildDefaultWorkflows(projName);
+					seeds.parent = buildParentWorkflow();
+					for (const wf of Object.values(seeds)) {
+						targetCtx.workflowStore.put(wf as unknown as Workflow);
+					}
+					console.log(`[api] Auto-seeded ${Object.keys(seeds).length} default workflows for project "${projName}" on first goal creation`);
+					if (workflowId) {
+						resolvedWorkflow = targetCtx.workflowStore.get(workflowId);
+					} else {
+						resolvedWorkflow = targetCtx.workflowStore.get("general") ?? targetCtx.workflowStore.getAll()[0];
+						resolvedWorkflowId = resolvedWorkflow?.id || "general";
+					}
+				}
+				// Layer 3: explicit id given, store non-empty, still unknown → friendly 400.
+				if (workflowId && !resolvedWorkflow && targetCtx.workflowStore.getAll().length > 0) {
+					const available = targetCtx.workflowStore.getAll().map(w => w.id);
+					jsonError(400, new Error(`Workflow "${workflowId}" not found`), {
+						error: `Workflow "${workflowId}" not found. Available: ${available.join(", ")}`,
+						code: "WORKFLOW_NOT_FOUND",
+						workflowId,
+						available,
+					});
+					return;
+				}
+			}
+			// Resolve per-goal subgoal-nesting overrides.
+			//
+			// Two inputs: the parent's effective inherited ceiling (if any) and the
+			// explicit body values from the proposal form. Rules:
+			//   - System pref is the global ceiling (subgoalsEnabled gate + maxDepth cap).
+			//   - For child goals the parent's effective values are also a ceiling.
+			//   - Explicit body values can only tighten/disable, never exceed the ceiling.
+			// Helpers from subgoal-nesting-limit.ts compute the ceiling so this stays
+			// the single source of truth.
+			const nestingPrefs = readSubgoalNestingPrefs((k) => preferencesStore.get(k));
+			const inheritedNesting = (parentGoalId && resolvedParentGoal)
+				? inheritedChildOverrides(resolvedParentGoal, nestingPrefs)
+				: undefined;
+			const ceilSubgoalsAllowed = inheritedNesting
+				? inheritedNesting.subgoalsAllowed
+				: nestingPrefs.subgoalsEnabled;
+			const ceilMaxNestingDepth = inheritedNesting
+				? inheritedNesting.maxNestingDepth
+				: nestingPrefs.maxNestingDepth;
+			const bodySubgoalsAllowedRaw = body?.subgoalsAllowed;
+			const bodyMaxNestingDepthRaw = body?.maxNestingDepth;
+			let effSubgoalsAllowed: boolean | undefined = inheritedNesting?.subgoalsAllowed;
+			if (typeof bodySubgoalsAllowedRaw === "boolean") {
+				// body=false always wins (disable always allowed); body=true only if
+				// the ceiling permits it. System/parent OFF blocks the explicit true.
+				effSubgoalsAllowed = bodySubgoalsAllowedRaw && ceilSubgoalsAllowed;
+			}
+			let effMaxNestingDepth: number | undefined = inheritedNesting?.maxNestingDepth;
+			if (typeof bodyMaxNestingDepthRaw === "number" && Number.isFinite(bodyMaxNestingDepthRaw)) {
+				effMaxNestingDepth = Math.min(clampMaxDepth(bodyMaxNestingDepthRaw), ceilMaxNestingDepth);
+			}
+			const bodyInlineRoles = (body?.inlineRoles && typeof body.inlineRoles === "object" && !Array.isArray(body.inlineRoles))
+				? body.inlineRoles as Record<string, import("./agent/role-store.js").Role>
+				: undefined;
+			// Root-only orchestration policy. Only honoured for top-level goals
+			// (no parentGoalId); children inherit the root's values. Mirrors the
+			// validation in PATCH /api/goals/:id/policy.
+			const isRootGoalCreate = parentGoalId === undefined;
+			let effDivergencePolicy: "strict" | "balanced" | "autonomous" | undefined;
+			if (isRootGoalCreate && (body?.divergencePolicy === "strict" || body?.divergencePolicy === "balanced" || body?.divergencePolicy === "autonomous")) {
+				effDivergencePolicy = body.divergencePolicy;
+			}
+			let effMaxConcurrentChildren: number | undefined;
+			if (isRootGoalCreate && typeof body?.maxConcurrentChildren === "number" && Number.isFinite(body.maxConcurrentChildren)) {
+				const n = Math.floor(body.maxConcurrentChildren);
+				if (n >= 1 && n <= 8) effMaxConcurrentChildren = n;
+			}
 			const goal = await targetGoalManager.createGoal(title, cwd, {
 				spec,
-				workflowId,
+				workflowId: resolvedWorkflowId,
 				workflowStore: targetCtx.workflowStore,
 				resolvedWorkflow,
 				sandboxed,
 				enabledOptionalSteps,
 				projectId: targetProjectId,
+				parentGoalId,
+				inlineRoles: bodyInlineRoles,
+				subgoalsAllowed: effSubgoalsAllowed,
+				maxNestingDepth: effMaxNestingDepth,
+				divergencePolicy: effDivergencePolicy,
+				maxConcurrentChildren: effMaxConcurrentChildren,
 			});
 			// Set projectId (explicit or auto-detected from cwd)
 			if (targetProjectId) {
@@ -4347,7 +4784,29 @@ async function handleApiRoute(
 			json(goal, 201);
 
 			// Fire-and-forget async worktree setup (and optionally start team)
-			if (goal.setupStatus === "preparing") {
+			if (goal.autoStartTeam && parentGoalId) {
+				// Finding 2 — a child goal auto-start must go through the
+				// unified per-root scheduler so the concurrency cap applies to
+				// the `POST /api/goals` child path too (previously it started
+				// the team with NO permit). At cap the child is parked
+				// `state='blocked'` (capacity-blocked) and started later when a
+				// permit frees; the scheduler handles setup + broadcasts.
+				//
+				// Guard is `state !== "blocked"` (NOT `setupStatus ===
+				// "preparing"`): a data-only / non-git child is created with
+				// `setupStatus === "ready"` (no worktree), so gating on
+				// "preparing" silently skipped the start and its team never ran.
+				// `requestChildStart` → `_startScheduledChildTeam` handles both
+				// "preparing" (setup + start) and "ready" (start-only). A blocked
+				// child (deps unmet) is not started here — it starts on unblock.
+				if (goal.state !== "blocked") {
+					const outcome = verificationHarness.requestChildStart(goal.id);
+					if (outcome === "capacity-blocked") {
+						targetGoalManager.updateGoal(goal.id, { state: "blocked" });
+						broadcastToAll({ type: "goal_state_changed", goalId: goal.id });
+					}
+				}
+			} else if (goal.setupStatus === "preparing") {
 				if (goal.autoStartTeam) {
 					targetGoalManager.setupWorktreeAndStartTeam(goal.id, () => teamManager.startTeam(goal.id)).then(() => {
 						broadcastToAll({ type: "goal_setup_complete", goalId: goal.id });
@@ -4409,6 +4868,190 @@ async function handleApiRoute(
 		return;
 	}
 
+	/**
+	 * Archive a goal (root or cascade). Extracted from the DELETE
+	 * `/api/goals/:id` handler so the parent-scoped
+	 * `DELETE /api/goals/:parentId/archive-child/:childId` route can
+	 * reuse the exact same cascade + mergedManually semantics after
+	 * its parent-child authorization check.
+	 *
+	 * Reads `cascade` / `mergedManually` from `url.searchParams`; writes
+	 * the response via the closed-over `json` helper.
+	 */
+	const archiveGoalEndpoint = async (id: string): Promise<void> => {
+		// `cascade` is REQUIRED — mirrors pause/resume/teardown. The UI is
+		// the cascade-policy authority; api.ts always sends ?cascade=.
+		const cascadeParam = url.searchParams.get("cascade");
+		if (cascadeParam !== "true" && cascadeParam !== "false") {
+			json({ error: "cascade=true|false query parameter is required", code: "CASCADE_REQUIRED" }, 422);
+			return;
+		}
+		const cascade = cascadeParam === "true";
+
+		const rootGoal = getGoalAcrossProjects(id);
+		if (!rootGoal) { json({ error: "Goal not found" }, 404); return; }
+
+		if (!cascade) {
+			const liveDescendants = listDescendants(projectContextManager, id, { includeArchived: false });
+			if (liveDescendants.length > 0) {
+				json({
+					error: `Goal has ${liveDescendants.length} live descendant(s). Re-call with ?cascade=true to archive them all.`,
+					code: "HAS_DESCENDANTS",
+					count: liveDescendants.length,
+				}, 409);
+				return;
+			}
+		}
+
+		const mergedManually = url.searchParams.get("mergedManually") === "true";
+
+		const archiveOne = async (g: import("./agent/goal-store.js").PersistedGoal): Promise<boolean> => {
+			if (g.archived) return false;
+			if (mergedManually && g.id === id && g.state !== "complete") {
+				await getGoalManagerForGoal(g.id).updateGoal(g.id, { state: "complete" });
+			}
+			for (const active of verificationHarness.getActiveVerifications(g.id)) {
+				try {
+					await verificationHarness.cancelStaleVerifications(g.id, active.gateId);
+				} catch (err) {
+					console.error(`[api] archive: error cancelling verification for ${g.id}/${active.gateId}:`, err);
+				}
+			}
+			const goalProjectCtx = projectContextManager.getContextForGoal(g.id);
+			const teamEntry = goalProjectCtx?.teamStore.get(g.id);
+			const agentBranches: string[] = [];
+			if (teamEntry?.agents) {
+				for (const a of teamEntry.agents) {
+					if (a.branch) agentBranches.push(a.branch);
+				}
+			}
+			if (teamEntry?.teamLeadSessionId) {
+				const tl = goalProjectCtx?.sessionStore.get(teamEntry.teamLeadSessionId);
+				if (tl?.branch) agentBranches.push(tl.branch);
+			}
+			if (teamManager.getTeamState(g.id)) {
+				await teamManager.teardownTeam(g.id);
+			}
+			// Finding 2 — terminal event: release any per-root scheduler permit
+			// this child held (or drop it from the capacity queue) so the next
+			// capacity-blocked sibling can start. Best-effort + idempotent.
+			if (g.parentGoalId) {
+				try { verificationHarness.notifyChildTerminal(g.id); } catch (err) {
+					console.warn(`[api] archive: notifyChildTerminal failed for ${g.id} (non-fatal):`, err);
+				}
+			}
+			const gm = getGoalManagerForGoal(g.id);
+			await gm.archiveGoal(g.id);
+			prStatusStore.remove(g.id);
+			const archivedGoal = gm.getGoal(g.id);
+			if (archivedGoal?.repoPath) {
+				deleteRemoteGoalBranches(archivedGoal, agentBranches, archivedGoal.repoPath).catch(err => {
+					console.warn(`[api] archive: remote branch cleanup failed for ${g.id}:`, err);
+				});
+			}
+			return true;
+		};
+
+		if (!cascade) {
+			await archiveOne(rootGoal);
+			json({ ok: true, archived: 1 });
+			return;
+		}
+
+		const ctx = projectContextManager.getContextForGoal(id);
+		const allGoals = ctx?.goalStore.getAll() ?? [];
+		const result = await cascadeGoalSubtree(
+			id,
+			allGoals,
+			{ includeRoot: true, includeArchived: true },
+			{ order: "bottom-up", apply: archiveOne },
+		);
+		const archivedCount = result.processed.filter(p => p.result === true).length;
+		if (result.errors.length > 0) {
+			for (const e of result.errors) {
+				console.error(`[api] archive cascade: ${e.goalId} failed:`, e.error);
+			}
+		}
+		json({
+			ok: true,
+			archived: archivedCount,
+			...(result.errors.length > 0
+				? { errors: result.errors.map(e => ({ goalId: e.goalId, error: e.error.message })) }
+				: {}),
+		});
+	};
+
+	// DELETE /api/goals/:parentId/archive-child/:childId — parent-scoped
+	// archive. Enforces parent-child relationship server-side so a
+	// compromised/buggy team-lead cannot archive arbitrary goals by
+	// supplying their id to the general DELETE /api/goals/:id route.
+	// Pinned by tests/e2e/parent-scoped-archive-child.spec.ts.
+	const archiveChildMatch = url.pathname.match(/^\/api\/goals\/([^/]+)\/archive-child\/([^/]+)$/);
+	if (archiveChildMatch && req.method === "DELETE") {
+		const parentId = archiveChildMatch[1];
+		const childId = archiveChildMatch[2];
+		// Subgoals feature gate — archive-child is a Children mutation.
+		if (!requireSubgoalsEnabled()) return;
+		// S1: archive-child is an OPERATOR Children verb (the web UI drives it),
+		// so a verified human cookie is accepted; otherwise an agent caller must
+		// present a spawning-session header matching the parent goal's
+		// authoritative team-lead. See children-mutation-authz.ts.
+		{
+			const h = req.headers as Record<string, string | string[] | undefined>;
+			const readHeader = (n: string): string | undefined => {
+				const v = h[n.toLowerCase()];
+				const s = Array.isArray(v) ? v[0] : v;
+				return typeof s === "string" && s.trim() ? s.trim() : undefined;
+			};
+			const authz = authorizeChildrenMutation({
+				mutationClass: "operator",
+				isHumanOperator: cookieTryAuth(req, cookieStore!),
+				// S1: derive the AUTHENTIC caller from the per-session secret,
+				// never the forgeable public spawning-session header.
+				authenticCallerSessionId: sessionManager.sessionSecretStore.resolveSessionIdBySecret(
+					readHeader("x-bobbit-session-secret"),
+				),
+				teamLeadSessionId: teamManager.getTeamState(parentId)?.teamLeadSessionId,
+			});
+			if (!authz.ok) {
+				json({
+					error: "Caller session is not the team-lead for this goal",
+					code: "NOT_TEAM_LEAD",
+					goalId: parentId,
+				}, 403);
+				return;
+			}
+		}
+		const parent = getGoalAcrossProjects(parentId);
+		if (!parent) { json({ error: "Parent goal not found" }, 404); return; }
+		const child = getGoalAcrossProjects(childId);
+		if (!child) { json({ error: "Child goal not found" }, 404); return; }
+		// Security: target must be a DIRECT child of the parent. Reject
+		// non-children (siblings, roots, descendants beyond depth 1, or
+		// goals from other project contexts) with 403 before touching state.
+		if (child.parentGoalId !== parentId) {
+			json({
+				error: `Goal ${childId} is not a direct child of ${parentId} (parentGoalId=${child.parentGoalId ?? "null"}).`,
+				code: "NOT_DIRECT_CHILD",
+			}, 403);
+			return;
+		}
+		// Cross-project guard — child must live in the same project context
+		// as the parent. getGoalAcrossProjects can resolve both even when
+		// they belong to different projects, so check explicitly.
+		const parentCtx = projectContextManager.getContextForGoal(parentId);
+		const childCtx = projectContextManager.getContextForGoal(childId);
+		if (!parentCtx || !childCtx || parentCtx !== childCtx) {
+			json({
+				error: `Parent ${parentId} and child ${childId} are not in the same project context.`,
+				code: "PROJECT_MISMATCH",
+			}, 403);
+			return;
+		}
+		await archiveGoalEndpoint(childId);
+		return;
+	}
+
 	// Routes with goal :id parameter
 	const goalMatch = url.pathname.match(/^\/api\/goals\/([^/]+)$/);
 	if (goalMatch) {
@@ -4426,6 +5069,7 @@ async function handleApiRoute(
 			if (putGoal?.archived) { json({ error: "Goal is archived" }, 409); return; }
 			const body = await readBody(req);
 			if (!body) { json({ error: "Missing body" }, 400); return; }
+			const prevSpec = putGoal?.spec ?? "";
 			const goalMgr = getGoalManagerForGoal(id);
 			const ok = await goalMgr.updateGoal(id, {
 				title: body.title,
@@ -4438,61 +5082,27 @@ async function handleApiRoute(
 				reattemptOf: body.reattemptOf,
 			});
 			if (!ok) { json({ error: "Goal not found" }, 404); return; }
+			// Spec-edit notification: emit goal_spec_changed WS event and nudge the team lead.
+			if (typeof body.spec === "string" && body.spec !== prevSpec) {
+				const hash = (s: string) => createHash("sha256").update(s).digest("hex").slice(0, 16);
+				broadcastToAll({
+					type: "goal_spec_changed",
+					goalId: id,
+					prevSpecHash: hash(prevSpec),
+					newSpecHash: hash(body.spec),
+					prevLen: prevSpec.length,
+					newLen: (body.spec as string).length,
+					ts: Date.now(),
+				});
+				try { teamManager.notifyTeamLeadOfSpecChange(id, prevSpec.length, (body.spec as string).length); }
+				catch (err) { console.error(`[api] notifyTeamLeadOfSpecChange failed for ${id}:`, err); }
+			}
 			json({ ok: true });
 			return;
 		}
 
 		if (req.method === "DELETE") {
-			// Cancel any in-flight gate verifications (terminates reviewer sessions)
-			for (const active of verificationHarness.getActiveVerifications(id)) {
-				try {
-					await verificationHarness.cancelStaleVerifications(id, active.gateId);
-				} catch (err) {
-					console.error(`[api] Error cancelling verification for gate ${active.gateId}:`, err);
-				}
-			}
-			// Capture agent branches BEFORE teardown erases the team store entry.
-			// Bug 1 (docs/design/orphan-remote-branch-cleanup.md): teardownTeam
-			// mutates teamEntry.agents in place via dismissRole(), so we must
-			// snapshot the branch names into a fresh string[] now — reading
-			// teamEntry.agents after teardown returns an empty array.
-			const goalProjectCtx = projectContextManager.getContextForGoal(id);
-			const teamEntry = goalProjectCtx?.teamStore.get(id);
-			const agentBranches: string[] = [];
-			if (teamEntry?.agents) {
-				for (const a of teamEntry.agents) {
-					if (a.branch) agentBranches.push(a.branch);
-				}
-			}
-			// Include the team-lead's own session branch if it differs from goal.branch.
-			if (teamEntry?.teamLeadSessionId) {
-				const tl = goalProjectCtx?.sessionStore.get(teamEntry.teamLeadSessionId);
-				if (tl?.branch) agentBranches.push(tl.branch);
-			}
-
-			// Tear down any active team first (dismisses agents, cleans up their worktrees)
-			const teamState = teamManager.getTeamState(id);
-			if (teamState) {
-				try {
-					await teamManager.teardownTeam(id);
-				} catch (err) {
-					console.error(`[api] Error tearing down team for goal ${id}:`, err);
-				}
-			}
-			// Archive instead of hard-delete — tasks, gates, team state remain intact
-			const deleteGoalMgr = getGoalManagerForGoal(id);
-			await deleteGoalMgr.archiveGoal(id);
-
-			// Fire-and-forget: clean up remote branches for this goal
-			const archivedGoal = deleteGoalMgr.getGoal(id);
-			if (archivedGoal?.repoPath) {
-				deleteRemoteGoalBranches(archivedGoal, agentBranches, archivedGoal.repoPath).catch(err => {
-					console.warn(`[api] Remote branch cleanup failed for goal ${id}:`, err);
-				});
-			}
-
-			prStatusStore.remove(id);
-			json({ ok: true });
+			await archiveGoalEndpoint(id);
 			return;
 		}
 	}
@@ -4589,6 +5199,143 @@ async function handleApiRoute(
 			}
 		} catch { /* dir doesn't exist */ }
 		return null;
+	}
+
+	// GET /api/tools/:tool/renderer — serve a PACK tool's pre-built ESM renderer
+	// module bytes (design docs/design/extension-host.md §4a). Admin-bearer ONLY
+	// (enforced before handleApiRoute): serving the module bytes is a static-asset-
+	// equivalent, NOT a capability invocation, so there is deliberately NO
+	// allowedTools check here (that gate is on the ACTION endpoint below). The
+	// renderer file path is re-validated to stay within the tool's group dir.
+	const rendererMatch = url.pathname.match(/^\/api\/tools\/([^/]+)\/renderer$/);
+	if (rendererMatch && req.method === "GET") {
+		const tool = decodeURIComponent(rendererMatch[1]);
+		// Resolve through the PROJECT-scoped tool manager when a projectId is given
+		// (design §4b — same `?? toolManager` fallback as GET /api/tools): a pack
+		// installed at PROJECT scope, or one that shadows a same-named global tool,
+		// must serve the PROJECT winner — never the split-brain server-level one.
+		const rendererProjectId = url.searchParams.get("projectId") || undefined;
+		const rendererTm = resolveActionToolManager(
+			toolManager,
+			rendererProjectId ? projectContextManager.getOrCreate(rendererProjectId)?.toolManager : undefined,
+		);
+		// Resolve the WINNING tool's on-disk location independent of `provider:`
+		// (design §4b — a pack renderer needs no provider). resolveToolLocation
+		// honors the same pack precedence as every other tool resolution.
+		const loc = rendererTm.resolveToolLocation(tool);
+		if (!loc || loc.rendererKind !== "pack" || !loc.rendererFile || !loc.baseDir) {
+			json({ error: "no pack renderer for this tool" }, 404);
+			return;
+		}
+		const groupAbs = path.join(loc.baseDir, loc.groupDir || "");
+		const fileAbs = path.resolve(groupAbs, loc.rendererFile);
+		// Path-traversal re-validation: fileAbs must stay within the group dir.
+		const rel = path.relative(groupAbs, fileAbs);
+		if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+			json({ error: "invalid renderer path" }, 404);
+			return;
+		}
+		let source: string;
+		try {
+			source = fs.readFileSync(fileAbs, "utf-8");
+		} catch {
+			json({ error: "renderer module not found" }, 404);
+			return;
+		}
+		res.writeHead(200, { "Content-Type": "text/javascript", "Cache-Control": "no-cache" });
+		res.end(source);
+		return;
+	}
+
+	// POST /api/tools/:tool/actions/:action — invoke a pack tool's server action
+	// handler (design §4b / §5). The LLM can curl this directly, so the
+	// allowedTools guard here — NOT the agent layer — is the real gate (§5 i).
+	const actionMatch = url.pathname.match(/^\/api\/tools\/([^/]+)\/actions\/([^/]+)$/);
+	if (actionMatch && req.method === "POST") {
+		const tool = decodeURIComponent(actionMatch[1]);
+		const action = decodeURIComponent(actionMatch[2]);
+		const body = (await readBody(req)) ?? {};
+		const headerSessionId = req.headers["x-bobbit-session-id"] as string | string[] | undefined;
+		// Resolve the tool through the SESSION's project-scoped tool manager (design
+		// §4b): the project is derived from the session, NOT from the client, so a
+		// project-scope pack (or a project pack shadowing a global tool) dispatches
+		// the SAME winner the session's tool resolution sees — no split-brain. The
+		// header session id is the canonical identity (the guard rejects a body/header
+		// mismatch or unknown session); resolving from it before the guard is safe
+		// because an invalid session falls back to the server-level manager and the
+		// guard then rejects the request anyway.
+		const actionHeaderSid = Array.isArray(headerSessionId) ? headerSessionId[0] : headerSessionId;
+		const actionSessionProjectId = actionHeaderSid
+			? (sessionManager.getSession(actionHeaderSid)?.projectId
+				?? sessionManager.getPersistedSession(actionHeaderSid)?.projectId)
+			: undefined;
+		const sessionToolManager = resolveActionToolManager(
+			toolManager,
+			actionSessionProjectId ? projectContextManager.getOrCreate(actionSessionProjectId)?.toolManager : undefined,
+		);
+		const info = sessionToolManager.getToolByName(tool);
+
+		// Resolve a session's allowlist (live preferred, else persisted).
+		const resolveSession = (id: string): ActionGuardSession | undefined => {
+			const live = sessionManager.getSession(id);
+			if (live) return { allowedTools: live.allowedTools };
+			const persisted = sessionManager.getPersistedSession(id);
+			if (persisted) return { allowedTools: persisted.allowedTools };
+			return undefined;
+		};
+		// Verify the toolUseId exists in the HEADER-BOUND session's transcript and
+		// was a call of :tool (anti-replay/forgery; §5 iii / iii-b).
+		const verifyToolUse = async (sid: string, toolUseId: string, t: string): Promise<boolean> => {
+			const ps = sessionManager.getPersistedSession(sid);
+			if (!ps?.agentSessionFile) return false;
+			const fsCtx: SessionFsContext = { sandboxed: ps.sandboxed, projectId: ps.projectId };
+			const content = await sessionFileRead(fsCtx, ps.agentSessionFile, sandboxManager);
+			return transcriptHasToolUse(content, toolUseId, t);
+		};
+
+		const guard = await authorizeActionRequest({
+			tool,
+			action,
+			headerSessionId,
+			bodySessionId: (body as { sessionId?: unknown }).sessionId,
+			toolUseId: (body as { toolUseId?: unknown }).toolUseId,
+			resolveSession,
+			actionNames: info?.actionNames,
+			verifyToolUse,
+		});
+		if (!guard.ok) {
+			json({ error: guard.error }, guard.status);
+			return;
+		}
+		// The tool must actually declare an actions module (checked after authz so
+		// an unauthorized caller never learns whether the tool has actions).
+		if (!info?.hasActions) {
+			json({ error: `tool "${tool}" has no actions` }, 404);
+			return;
+		}
+
+		const toolUseId = (body as { toolUseId: string }).toolUseId;
+		const args = (body as { args?: unknown }).args;
+		// The durable v1 Host API has NO gateway.fetch / raw passthrough: the action
+		// endpoint is same-origin and built here, so there is no caller-supplied URL
+		// or Authorization header to sanitize. `ctx.host` carries only the bound
+		// identity (+ frozen Phase-2 stubs).
+		const host = createServerHostApi({
+			sessionId: guard.sessionId,
+			toolUseId,
+		});
+		const start = Date.now();
+		try {
+			const result = await dispatcher.dispatch(tool, action, { host, sessionId: guard.sessionId, toolUseId, tool }, args, sessionToolManager);
+			console.log(`[ext-action] tool=${tool} action=${action} session=${guard.sessionId} toolUseId=${toolUseId} caller=${guard.sessionId} outcome=ok durationMs=${Date.now() - start}`);
+			json(result ?? null);
+		} catch (err) {
+			const status = err instanceof ActionError ? err.status : 500;
+			const message = err instanceof Error ? err.message : String(err);
+			console.warn(`[ext-action] tool=${tool} action=${action} session=${guard.sessionId} toolUseId=${toolUseId} caller=${guard.sessionId} outcome=error(${status}) durationMs=${Date.now() - start}: ${message}`);
+			json({ error: message }, status);
+		}
+		return;
 	}
 
 	// POST /api/tools/:name/customize — copy tool group to a target scope
@@ -5313,53 +6060,51 @@ async function handleApiRoute(
 		return;
 	}
 
-	// ── AI Gateway ──
+	// ── AI Gateway(s) — multi-gateway provider management ──
+	//
+	// Canonical list-management surface (§6 of docs/design/multi-gateway-providers.md):
+	//   GET  /api/aigw/gateways                 → full list (incl. disabled)
+	//   PUT  /api/aigw/gateways                 → replace whole list (validate + sync)
+	//   POST /api/aigw/test                     → discover a URL without saving
+	//   POST /api/aigw/gateways/:name/refresh   → re-discover one gateway + re-sync
+	//   GET  /api/aigw/gateways/:name/status    → per-gateway status + models
+	// Plus backward-compat shims (single-URL era) so existing clients/tests survive:
+	//   GET /api/aigw/status, POST/DELETE /api/aigw/configure, POST /api/aigw/refresh.
+	// Proxy: /api/aigw/:name/v1/* (named) and legacy /api/aigw/v1/* live further below.
 
-	// GET /api/aigw/status — check if aigw is configured
-	if (url.pathname === "/api/aigw/status" && req.method === "GET") {
-		const aigwUrl = getAigwUrl(preferencesStore);
-		if (!aigwUrl) {
-			json({ configured: false });
-		} else {
-			// Discover fresh models instead of reading from preferences cache
-			try {
-				const models = await discoverAigwModels(aigwUrl);
-				json({ configured: true, url: aigwUrl, models });
-			} catch {
-				json({ configured: true, url: aigwUrl, models: [] });
-			}
-		}
+	// GET /api/aigw/gateways — full gateway list (including disabled rows).
+	if (url.pathname === "/api/aigw/gateways" && req.method === "GET") {
+		json({ gateways: listGateways(preferencesStore) });
 		return;
 	}
 
-	// POST /api/aigw/configure — set aigw URL, discover models, write models.json
-	if (url.pathname === "/api/aigw/configure" && req.method === "POST") {
+	// PUT /api/aigw/gateways — replace the whole gateway list, then re-sync
+	// models.json. saveGateways validates (§1) and throws on any violation → 400.
+	if (url.pathname === "/api/aigw/gateways" && req.method === "PUT") {
 		const body = await readBody(req);
-		if (!body?.url || typeof body.url !== "string") {
-			json({ error: "Missing 'url' field" }, 400);
+		const rows = body?.gateways;
+		if (!Array.isArray(rows)) {
+			json({ error: "Missing 'gateways' array" }, 400);
 			return;
 		}
 		try {
-			const models = await configureAigw(body.url, preferencesStore);
+			saveGateways(preferencesStore, rows as ModelGateway[]);
+		} catch (err: any) {
+			json({ error: err?.message || "Invalid gateways" }, 400);
+			return;
+		}
+		try {
+			const modelsByGateway = await syncGatewaysModelsJson(preferencesStore);
 			invalidateModelCache();
 			broadcastPreferencesChanged();
-			json({ ok: true, models });
+			json({ gateways: listGateways(preferencesStore), modelsByGateway });
 		} catch (err: any) {
-			jsonError(502, err, { error: `Failed to configure AI Gateway: ${err.message}` });
+			jsonError(502, err, { error: `Failed to sync gateways: ${err.message}` });
 		}
 		return;
 	}
 
-	// DELETE /api/aigw/configure — remove aigw config
-	if (url.pathname === "/api/aigw/configure" && req.method === "DELETE") {
-		removeAigw(preferencesStore);
-		invalidateModelCache();
-		broadcastPreferencesChanged();
-		json({ ok: true });
-		return;
-	}
-
-	// POST /api/aigw/test — test connection to a URL without saving
+	// POST /api/aigw/test — discover a URL's models without saving anything.
 	if (url.pathname === "/api/aigw/test" && req.method === "POST") {
 		const body = await readBody(req);
 		if (!body?.url || typeof body.url !== "string") {
@@ -5375,18 +6120,118 @@ async function handleApiRoute(
 		return;
 	}
 
-	// POST /api/aigw/refresh — re-discover models from the configured gateway
+	// POST /api/aigw/gateways/:name/refresh — re-discover ONE gateway + re-sync.
+	const gatewayRefreshMatch = url.pathname.match(/^\/api\/aigw\/gateways\/([^/]+)\/refresh$/);
+	if (gatewayRefreshMatch && req.method === "POST") {
+		const name = decodeURIComponent(gatewayRefreshMatch[1]);
+		const gw = getGatewayByName(preferencesStore, name);
+		if (!gw) {
+			json({ error: `Unknown gateway "${name}"` }, 404);
+			return;
+		}
+		try {
+			const raw = await discoverGatewayModels(gw);
+			await syncGatewaysModelsJson(preferencesStore);
+			invalidateModelCache();
+			broadcastPreferencesChanged();
+			json({ models: shapeGatewayModelsForDisplay(gw, raw) });
+		} catch (err: any) {
+			jsonError(502, err);
+		}
+		return;
+	}
+
+	// GET /api/aigw/gateways/:name/status — per-gateway "view models" affordance.
+	const gatewayStatusMatch = url.pathname.match(/^\/api\/aigw\/gateways\/([^/]+)\/status$/);
+	if (gatewayStatusMatch && req.method === "GET") {
+		const name = decodeURIComponent(gatewayStatusMatch[1]);
+		const gw = getGatewayByName(preferencesStore, name);
+		if (!gw) {
+			json({ configured: false });
+			return;
+		}
+		const meta = { configured: true, name: gw.name, url: gw.url, type: gw.type, enabled: gw.enabled };
+		try {
+			const raw = await discoverGatewayModels(gw);
+			json({ ...meta, models: shapeGatewayModelsForDisplay(gw, raw) });
+		} catch {
+			json({ ...meta, models: [] });
+		}
+		return;
+	}
+
+	// ── Backward-compat shims (single-URL era) ──
+
+	// GET /api/aigw/status — legacy: status of the singleton `aigw` gateway (or
+	// the first aigw-type gateway). { configured:false } when none exists.
+	if (url.pathname === "/api/aigw/status" && req.method === "GET") {
+		const gw = getGatewayByName(preferencesStore, "aigw")
+			?? listGateways(preferencesStore).find((g) => g.type === "aigw");
+		if (!gw) {
+			json({ configured: false });
+			return;
+		}
+		try {
+			const models = await discoverAigwModels(gw.url);
+			json({ configured: true, url: gw.url, models });
+		} catch {
+			json({ configured: true, url: gw.url, models: [] });
+		}
+		return;
+	}
+
+	// POST /api/aigw/configure {url} — legacy: upsert the singleton `aigw` gateway,
+	// discover + sync. Mirrors the old configureAigw return shape (Claude ids
+	// prefix-stripped + api=bedrock-converse-stream).
+	if (url.pathname === "/api/aigw/configure" && req.method === "POST") {
+		const body = await readBody(req);
+		if (!body?.url || typeof body.url !== "string") {
+			json({ error: "Missing 'url' field" }, 400);
+			return;
+		}
+		const normalizedUrl = body.url.replace(/\/+$/, "");
+		try {
+			// Discover first so an unreachable gateway yields a 502 (old behavior).
+			const raw = await discoverAigwModels(normalizedUrl);
+			const next = listGateways(preferencesStore).filter((g) => g.name !== "aigw");
+			next.unshift({ id: randomUUID(), name: "aigw", url: normalizedUrl, type: "aigw", enabled: true });
+			saveGateways(preferencesStore, next);
+			await syncGatewaysModelsJson(preferencesStore);
+			invalidateModelCache();
+			broadcastPreferencesChanged();
+			const gw = getGatewayByName(preferencesStore, "aigw")!;
+			json({ ok: true, models: shapeGatewayModelsForDisplay(gw, raw) });
+		} catch (err: any) {
+			jsonError(502, err, { error: `Failed to configure AI Gateway: ${err.message}` });
+		}
+		return;
+	}
+
+	// DELETE /api/aigw/configure — legacy: remove the `aigw` gateway + re-sync.
+	if (url.pathname === "/api/aigw/configure" && req.method === "DELETE") {
+		const next = listGateways(preferencesStore).filter((g) => g.name !== "aigw");
+		saveGateways(preferencesStore, next);
+		await syncGatewaysModelsJson(preferencesStore);
+		invalidateModelCache();
+		broadcastPreferencesChanged();
+		json({ ok: true });
+		return;
+	}
+
+	// POST /api/aigw/refresh — legacy: re-discover the `aigw` gateway + re-sync.
 	if (url.pathname === "/api/aigw/refresh" && req.method === "POST") {
-		const aigwUrl = getAigwUrl(preferencesStore);
-		if (!aigwUrl) {
+		const gw = getGatewayByName(preferencesStore, "aigw")
+			?? listGateways(preferencesStore).find((g) => g.type === "aigw");
+		if (!gw) {
 			json({ error: "No AI Gateway configured" }, 400);
 			return;
 		}
 		try {
-			const models = await configureAigw(aigwUrl, preferencesStore);
+			const raw = await discoverGatewayModels(gw);
+			await syncGatewaysModelsJson(preferencesStore);
 			invalidateModelCache();
 			broadcastPreferencesChanged();
-			json({ models });
+			json({ models: shapeGatewayModelsForDisplay(gw, raw) });
 		} catch (err: any) {
 			jsonError(502, err);
 		}
@@ -5420,17 +6265,15 @@ async function handleApiRoute(
 				}, 404);
 				return;
 			}
-			if (provider !== "aigw") {
+			// Is this provider one of the configured gateways? If not, fall back to
+			// the standard provider-key / direct test path.
+			const gw = getGatewayByName(preferencesStore, provider);
+			if (!gw) {
 				const result = await testModelPreference(preferencesStore, pref);
 				json(result, result.status || (result.ok ? 200 : 502));
 				return;
 			}
-			const aigwUrl = getAigwUrl(preferencesStore);
-			if (!aigwUrl) {
-				json({ ok: false, error: "No AI Gateway configured." });
-				return;
-			}
-			const baseUrl = aigwUrl.replace(/\/+$/, "");
+			const baseUrl = gw.url.replace(/\/+$/, "");
 			const chatUrl = baseUrl.endsWith("/v1") ? `${baseUrl}/chat/completions` : `${baseUrl}/v1/chat/completions`;
 
 			// The aigw registry strips the provider prefix (e.g. "aws/") from Claude
@@ -5489,13 +6332,36 @@ async function handleApiRoute(
 		return;
 	}
 
-	// Proxy: /api/aigw/v1/* → forward to configured aigw URL
-	if (url.pathname.startsWith("/api/aigw/v1/") && getAigwUrl(preferencesStore)) {
-		const aigwUrl = getAigwUrl(preferencesStore)!;
-		const subPath = url.pathname.replace("/api/aigw/v1/", "/v1/");
-		const targetUrl = `${aigwUrl}${subPath}${url.search}`;
-		proxyRequest(targetUrl, req, res);
-		return;
+	// Proxy by name: /api/aigw/:name/v1/* → <gateway.url>/v1/* for the named
+	// ENABLED gateway. The browser may not resolve the gateway host directly, so
+	// it routes model discovery / completions through here.
+	const namedProxyMatch = url.pathname.match(/^\/api\/aigw\/([^/]+)\/v1\/(.*)$/);
+	if (namedProxyMatch) {
+		const name = decodeURIComponent(namedProxyMatch[1]);
+		// `/api/aigw/v1/*` (legacy, name-less) is handled below — don't treat the
+		// literal "v1" segment as a gateway name.
+		if (name !== "v1") {
+			const gw = getGatewayByName(preferencesStore, name);
+			if (gw && gw.enabled) {
+				const targetUrl = `${gw.url.replace(/\/+$/, "")}/v1/${namedProxyMatch[2]}${url.search}`;
+				proxyRequest(targetUrl, req, res);
+				return;
+			}
+			// Unknown/disabled gateway — fall through to the 404 handler.
+		}
+	}
+
+	// Legacy proxy: /api/aigw/v1/* → the gateway named `aigw` (or, failing that,
+	// the first enabled gateway) for back-compat with the single-URL client.
+	if (url.pathname.startsWith("/api/aigw/v1/")) {
+		const named = getGatewayByName(preferencesStore, "aigw");
+		const gw = named && named.enabled ? named : getEnabledGateways(preferencesStore)[0];
+		if (gw) {
+			const subPath = url.pathname.replace("/api/aigw/v1/", "/v1/");
+			const targetUrl = `${gw.url.replace(/\/+$/, "")}${subPath}${url.search}`;
+			proxyRequest(targetUrl, req, res);
+			return;
+		}
 	}
 
 	// GET /api/roles/assistant/prompts — must come before :name route
@@ -6149,6 +7015,10 @@ async function handleApiRoute(
 		const goal = getGoalAcrossProjects(goalId);
 		if (!goal) { json({ error: "Goal not found" }, 404); return; }
 		if (goal.archived) { json({ error: "Goal is archived" }, 409); return; }
+		// Pause-cascade: a paused goal must reject gate signals. This is the
+		// most upstream block for both llm-review-* verifier spawns and
+		// command/qa-step kickoffs in the same handler chain.
+		if (goal.paused) { json({ error: `Goal ${goalId} is paused`, code: "GOAL_PAUSED", goalId }, 409); return; }
 		if (!goal.workflow) { json({ error: "Goal has no workflow" }, 400); return; }
 		const gateSignalCtx = projectContextManager.getContextForGoal(goalId);
 		if (!gateSignalCtx) { json({ error: "Goal not found in any project" }, 404); return; }
@@ -6183,6 +7053,23 @@ async function handleApiRoute(
 				json({ error: `Missing required metadata fields: ${required.join(", ")}` }, 400);
 				return;
 			}
+		}
+
+		// Gov-2: an ACCEPTED signal of the `goal-plan` gate on a parent-workflow
+		// goal FREEZES the execution gate's verify[] (sets
+		// execution.metadata.frozen = "true" durably on the goal's workflow
+		// snapshot). Applied here — after dependency/metadata validation has
+		// passed (so a rejected signal never freezes) but before the
+		// cache/dup early-return branches (so the freeze is durable even when
+		// the signal short-circuits to a cached pass). Idempotent: re-signal is
+		// a harmless no-op write. After this, GET /api/goals/:id/plan reports
+		// frozen:true. See src/server/agent/parent-workflow-freeze.ts.
+		const freezeResult = computePlanFreezeUpdate(goal, gateId);
+		if (freezeResult.freeze && freezeResult.workflow) {
+			// Persist via the goal store's `update` (same path applyPlanSteps
+			// uses) — `updateGoal`'s partial type does not expose `workflow`.
+			gateSignalCtx.goalManager.getGoalStore().update(goalId, { workflow: freezeResult.workflow });
+			goal.workflow = freezeResult.workflow;
 		}
 
 		// Get commit SHA
@@ -6662,6 +7549,13 @@ async function handleApiRoute(
 	const teamStartMatch = url.pathname.match(/^\/api\/goals\/([^/]+)\/(?:team|swarm)\/start$/);
 	if (teamStartMatch && req.method === "POST") {
 		const goalId = teamStartMatch[1];
+		// Guard: goal spec must be set before starting the team.
+		const startGoal = getGoalAcrossProjects(goalId);
+		const trimmedSpec = (startGoal?.spec ?? "").trim();
+		if (!trimmedSpec || trimmedSpec.length < 20 || trimmedSpec.toLowerCase() === "placeholder") {
+			json({ error: "Goal spec must be set before starting the team. Update via PUT /api/goals/:id.", code: "SPEC_REQUIRED" }, 400);
+			return;
+		}
 		try {
 			const session = await teamManager.startTeam(goalId);
 			json({ sessionId: session.id, title: session.title }, 201);
@@ -6679,6 +7573,11 @@ async function handleApiRoute(
 		const spawnGoal = getGoalAcrossProjects(goalId);
 		if (spawnGoal?.archived) {
 			json({ error: "Goal is archived" }, 409);
+			return;
+		}
+		// Pause-cascade: refuse to spawn role agents on a paused goal.
+		if (spawnGoal?.paused) {
+			json({ error: `Goal ${goalId} is paused`, code: "GOAL_PAUSED", goalId }, 409);
 			return;
 		}
 		// Guard: reject spawn if goal worktree is not ready
@@ -6700,6 +7599,8 @@ async function handleApiRoute(
 		} catch (err) {
 			if (err instanceof GateDependencyError) {
 				jsonError(409, err);
+			} else if (err instanceof GoalPausedError) {
+				json({ error: err.message, code: err.code, goalId: err.goalId }, 409);
 			} else {
 				jsonError(400, err);
 			}
@@ -6972,6 +7873,12 @@ async function handleApiRoute(
 			json({ error: "No active team for this goal" }, 404);
 			return;
 		}
+		// S1: `teamLeadSessionId` is intentionally exposed here. It is NO LONGER
+		// an authorization credential — orchestration/operator Children authz
+		// binds to the unforgeable per-session `X-Bobbit-Session-Secret` (see
+		// children-mutation-authz.ts + session-secret.ts), so knowing the public
+		// team-lead session id grants nothing without the secret. Consumers rely
+		// on it (the UI, auto-start-team E2E, team-state polling), so we keep it.
 		json(state);
 		return;
 	}
@@ -7050,10 +7957,23 @@ async function handleApiRoute(
 			json({ error: "Missing sessionId or message" }, 400);
 			return;
 		}
-		// Validate target is a team agent
+		// Validate target is a team agent OR a direct-child team-lead
 		const agents = teamManager.listAgents(goalId);
-		if (!agents.find(a => a.sessionId === body.sessionId)) {
-			json({ error: "Session is not a member of this team" }, 403);
+		let allowed = !!agents.find(a => a.sessionId === body.sessionId);
+		if (!allowed) {
+			const targetSession = sessionManager.getSession(body.sessionId);
+			if (targetSession?.role === "team-lead" && targetSession.goalId) {
+				const targetGoal = getGoalAcrossProjects(targetSession.goalId);
+				if (targetGoal?.parentGoalId === goalId) {
+					allowed = true;
+				}
+			}
+		}
+		if (!allowed) {
+			json({
+				error: "Session is not a member of this team and is not a direct-child team-lead",
+				code: "NOT_TEAM_MEMBER_OR_DIRECT_CHILD",
+			}, 403);
 			return;
 		}
 		const session = sessionManager.getSession(body.sessionId);
@@ -7137,6 +8057,26 @@ async function handleApiRoute(
 	const teamCompleteMatch = url.pathname.match(/^\/api\/goals\/([^/]+)\/(?:team|swarm)\/complete$/);
 	if (teamCompleteMatch && req.method === "POST") {
 		const goalId = teamCompleteMatch[1];
+		// Guard: a goal cannot be marked complete while it still has unresolved
+		// live descendant goals. Nested child work must be rolled up (merged +
+		// completed) or archived before the parent completes — otherwise the
+		// parent's branch/PR would land without its children's work. This is
+		// independent of gate-requirement state (the gate checks in
+		// completeTeam() can be absent/skipped/stale, so we enforce here too).
+		// Archived and already-complete descendants don't block.
+		const completeCtx = projectContextManager.getContextForGoal(goalId);
+		const completeAllGoals = completeCtx?.goalStore.getAll() ?? [];
+		const unresolvedChildIds = walkGoalSubtree(goalId, completeAllGoals, { includeRoot: false, includeArchived: false })
+			.filter(g => g.state !== "complete")
+			.map(g => g.id);
+		if (unresolvedChildIds.length > 0) {
+			json({
+				error: `Cannot complete: ${unresolvedChildIds.length} unresolved child goal(s) must be completed or archived first`,
+				code: "UNRESOLVED_CHILDREN",
+				childIds: unresolvedChildIds,
+			}, 409);
+			return;
+		}
 		try {
 			await teamManager.completeTeam(goalId);
 			json({ ok: true });
@@ -7146,16 +8086,60 @@ async function handleApiRoute(
 		return;
 	}
 
-	// POST /api/goals/:id/team/teardown — fully tear down a team (dismiss agents + terminate team lead)
+	// POST /api/goals/:id/team/teardown — fully tear down a team (dismiss agents + terminate team lead).
+	// Cascade required — mirror of `tests/api-team-teardown-cascade.test.ts::teardownRoute`.
 	const teamTeardownMatch = url.pathname.match(/^\/api\/goals\/([^/]+)\/(?:team|swarm)\/teardown$/);
 	if (teamTeardownMatch && req.method === "POST") {
 		const goalId = teamTeardownMatch[1];
-		try {
-			await teamManager.teardownTeam(goalId);
-			json({ ok: true });
-		} catch (err) {
-			jsonError(400, err);
+		const cascadeParam = url.searchParams.get("cascade");
+		if (cascadeParam !== "true" && cascadeParam !== "false") {
+			json({ error: "cascade=true|false query parameter is required", code: "CASCADE_REQUIRED" }, 422);
+			return;
 		}
+		const cascade = cascadeParam === "true";
+		// Validate goal exists before attempting teardown.
+		if (!getGoalAcrossProjects(goalId)) { json({ error: "Goal not found" }, 404); return; }
+		const tdCtx = projectContextManager.getContextForGoal(goalId);
+		const tdAllGoals = tdCtx?.goalStore.getAll() ?? [];
+
+		// cascade=false + live descendant teams → 409 HAS_DESCENDANT_TEAMS.
+		if (!cascade) {
+			const descendants = walkGoalSubtree(goalId, tdAllGoals, { includeRoot: false, includeArchived: false });
+			const descendantsWithTeams = descendants
+				.filter(d => !!teamManager.getTeamState(d.id))
+				.map(d => ({ id: d.id, title: d.title }));
+			if (descendantsWithTeams.length > 0) {
+				json({
+					code: "HAS_DESCENDANT_TEAMS",
+					count: descendantsWithTeams.length,
+					descendants: descendantsWithTeams,
+					message: `Goal has ${descendantsWithTeams.length} descendant team(s) still running. Re-call with ?cascade=true to stop them all.`,
+				}, 409);
+				return;
+			}
+		}
+
+		// Bottom-up: children torn down before parents. Skip archived
+		// nodes. cascade=false collapses to root-only by capping depth at 0.
+		const result = await cascadeGoalSubtree(
+			goalId,
+			tdAllGoals,
+			{ includeRoot: true, includeArchived: false, ...(cascade ? {} : { maxDepth: 0 }) },
+			{
+				order: "bottom-up",
+				apply: async (g) => {
+					if (!teamManager.getTeamState(g.id)) return false;
+					await teamManager.teardownTeam(g.id);
+					return true;
+				},
+			},
+		);
+		const toreDown = result.processed.filter(p => p.result === true).length;
+		json({
+			ok: true,
+			toreDown,
+			errors: result.errors.map(e => ({ goalId: e.goalId, error: e.error.message })),
+		});
 		return;
 	}
 
@@ -7868,6 +8852,17 @@ async function handleApiRoute(
 				json({ ok: false, code: "INVALID_BODY", message: "args must be an object" }, 400);
 				return;
 			}
+			// Auto-inject parentGoalId for team-lead sessions proposing a goal
+			let enrichedArgs = args as Record<string, unknown>;
+			if (proposalType === "goal") {
+				const sess = sessionManager.getSession(sessionId);
+				if (sess?.role === "team-lead" && sess.teamGoalId) {
+					const existingParent = enrichedArgs.parentGoalId;
+					if (!existingParent || (typeof existingParent === "string" && existingParent.trim() === "")) {
+						enrichedArgs = { ...enrichedArgs, parentGoalId: sess.teamGoalId };
+					}
+				}
+			}
 			// Validate workflow + optional steps for goal proposals BEFORE persisting,
 			// so a stale/hallucinated workflow never produces a broken draft. Skipped
 			// when the session has no resolvable project or the project has zero
@@ -7886,7 +8881,7 @@ async function handleApiRoute(
 				if (wfErr) { json(wfErr, 400); return; }
 			}
 			try {
-				const writeRes = await writeProposalFile(proposalStateDir, sessionId, proposalType, args as Record<string, unknown>);
+				const writeRes = await writeProposalFile(proposalStateDir, sessionId, proposalType, enrichedArgs);
 				const parsed = await parseProposalFile(proposalStateDir, sessionId, proposalType);
 				if (!parsed.ok) {
 					json(parsed, 400);
@@ -10917,17 +11912,70 @@ function hasTransitiveDep(workflow: import("./agent/workflow-store.js").Workflow
 	return false;
 }
 
-function readBody(req: http.IncomingMessage): Promise<any> {
+/**
+ * Global cap on accepted request-body size (1 MiB). Legitimate API payloads
+ * (goal specs, inline workflows/roles, plan mutations) are bounded well below
+ * this — the per-endpoint plan/spawn caps in nested-goal-routes.ts are the
+ * fine-grained limits; this is the coarse backstop that prevents a single huge
+ * body from being buffered/parsed at all (Sec-2 defence-in-depth).
+ */
+export const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+
+/**
+ * True when a request's declared Content-Length exceeds `maxBytes`. Pure +
+ * header-only so the request handler can reject oversized bodies with a 413
+ * BEFORE any byte is buffered. Chunked/streamed bodies that omit Content-Length
+ * are bounded by the streaming cap inside `readBody()` instead.
+ */
+export function bodyLimitExceeded(
+	contentLength: string | string[] | undefined,
+	maxBytes: number = MAX_REQUEST_BODY_BYTES,
+): boolean {
+	const raw = Array.isArray(contentLength) ? contentLength[0] : contentLength;
+	if (raw == null) return false;
+	const len = Number(raw);
+	return Number.isFinite(len) && len > maxBytes;
+}
+
+export function readBody(
+	req: http.IncomingMessage,
+	maxBytes: number = MAX_REQUEST_BODY_BYTES,
+): Promise<any> {
 	return new Promise((resolve) => {
 		const chunks: Buffer[] = [];
-		req.on("data", (chunk: Buffer) => chunks.push(chunk));
+		let total = 0;
+		let settled = false;
+		const finish = (value: any): void => {
+			if (settled) return;
+			settled = true;
+			resolve(value);
+		};
+		req.on("data", (chunk: Buffer) => {
+			if (settled) return;
+			total += chunk.length;
+			if (total > maxBytes) {
+				// Oversized body: reject BEFORE Buffer.concat()/JSON.parse() so a
+				// huge payload is never fully materialised in memory. Drop buffered
+				// chunks, tear down the stream, and resolve null — handlers treat a
+				// null body as a malformed request (400); the request-handler's
+				// Content-Length precheck returns a definitive 413 for the common
+				// case where the length is declared up front.
+				chunks.length = 0;
+				try { req.destroy(); } catch { /* best-effort */ }
+				finish(null);
+				return;
+			}
+			chunks.push(chunk);
+		});
 		req.on("end", () => {
 			try {
-				resolve(JSON.parse(Buffer.concat(chunks).toString()));
+				finish(JSON.parse(Buffer.concat(chunks).toString()));
 			} catch {
-				resolve(null);
+				finish(null);
 			}
 		});
+		req.on("error", () => finish(null));
+		req.on("aborted", () => finish(null));
 	});
 }
 
