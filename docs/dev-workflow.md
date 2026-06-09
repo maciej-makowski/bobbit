@@ -341,9 +341,63 @@ This is not a Bobbit bug — it's a git behaviour. There is no per-worktree stas
 
 ---
 
-## Opening PRs on forks
+## Working with forks
 
-When working on a **fork** of the main repository, open pull requests against the **fork's own `master` branch**, not the upstream/original repository's `master`. Bobbit's `origin` remote points at the fork; `upstream` (when present) points at the original repo. Targeting the wrong base sends review traffic and merges to a repository you may not control — always confirm the PR base is `origin/master` (the fork) before creating it.
+This repository is maintained as a **fork**. Two remotes matter:
+
+| Remote | Points at | Role |
+|---|---|---|
+| `origin` (a.k.a. `fork`) | `maciej-makowski/bobbit` | This fork. Day-to-day PRs target its `master`. |
+| `upstream` | `SuuBro/bobbit` | The source project this fork tracks. |
+
+Confirm with `git remote -v` if unsure — targeting the wrong base sends review traffic and merges to a repository you may not control.
+
+### Which base does my PR target?
+
+- **Fork work** (features, fixes, fork-only config) → base **`origin/master`** (the fork). This is the default; always verify the PR base before creating it.
+- **Changes you want in the source project** → base **`upstream/master`** (`SuuBro/bobbit`). See [Contributing fork features upstream](#contributing-fork-features-upstream).
+
+### Syncing changes *from* upstream
+
+New `upstream/master` commits are pulled into the fork through a single review-ready PR titled `[upstream-sync] …` (a scheduled maintenance agent opens these; humans can too):
+
+1. `git fetch upstream && git fetch origin`.
+2. Stop if `git rev-list --count origin/master..upstream/master` is `0` — nothing new.
+3. `git switch -c sync/upstream-<date> origin/master`.
+4. `git merge --no-ff upstream/master`, resolve conflicts so fork-specific behaviour is preserved, validate (`npm run check` + tests), push, open the `[upstream-sync]` PR.
+
+**⚠️ Merge-commit rule — the single most important fork rule.** **Upstream-sync PRs MUST be merged with a real merge commit — never squash, never rebase.**
+
+- Squash/rebase **discards the merge's second parent**, so git loses all record that upstream's commits already live in `master`. After that, `git merge-base master upstream/master` stays pinned at an ancient commit, `origin/master..upstream/master` re-counts every already-merged commit as "ahead", and the next sync re-litigates conflicts that were already resolved.
+- A merge commit keeps `upstream/master` as a true parent, so future syncs surface **only** genuinely-new commits.
+- The repo allows merge commits (`allow_merge_commit = true`) and does not require linear history. Use "Create a merge commit" / `gh pr merge <n> --merge`. If the GitHub UI hides the option right after you change the setting, hard-refresh the PR page — the merge dropdown is cached at load time.
+
+**If a sync PR was squashed by mistake.** You can't rewrite protected `master`, so heal the ancestry *forward*: branch off the current `master`, build a commit that records `upstream/master` as a second parent while keeping `master`'s tree, then merge that PR with a merge commit. The Files-changed diff stays limited to the genuinely-new upstream content. Worked example:
+
+```bash
+git switch -c sync/heal origin/master
+git cherry-pick <new-upstream-commits>          # land any new upstream content cleanly
+TREE=$(git write-tree)
+HEAL=$(git commit-tree "$TREE" -p origin/master -p upstream/master -m "Merge upstream/master (heal ancestry)")
+git reset --hard "$HEAL"                         # branch tip = merge commit, tree = master + new content
+# push, open PR, then: gh pr merge <n> --merge   (NEVER squash)
+```
+
+### Contributing fork features upstream
+
+The sustainable way to get a fork feature into `SuuBro/bobbit`:
+
+1. **Develop upstreamable work on a branch cut from `upstream/master`, not the fork's `master`.** A branch based on upstream produces a PR containing *only* your feature — no fork-specific commits (CI tweaks, `knip.config.ts`, `safe-storage` warn-logging, …) leak in.
+   ```bash
+   git fetch upstream
+   git switch -c feature/<name> upstream/master
+   # build the feature in focused, self-contained commits
+   git push fork feature/<name>
+   gh pr create --repo SuuBro/bobbit --base master --head maciej-makowski:feature/<name>
+   ```
+2. **Land it in both places.** Merge the branch into the fork's `master` (fork PR) and submit it upstream. Once upstream accepts it, the next upstream-sync brings it back as a normal ancestor — no duplication, no conflict.
+3. **Extracting a feature that currently lives only in the fork.** Cherry-pick just that feature's commits onto a fresh `upstream/master`-based branch, dropping fork-only adaptations, and open the upstream PR from there.
+4. **Keep fork divergence minimal.** Every file the fork edits that upstream also maintains becomes a recurring merge conflict. Prefer additive, isolated changes (new files, fork-only config) over editing files upstream actively changes. The smaller and more separable the divergence, the cheaper both syncing-down and contributing-up become.
 
 ---
 

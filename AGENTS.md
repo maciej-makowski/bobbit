@@ -55,7 +55,7 @@ Primary branch is **`master`** (not `main`). Never create a `main` branch.
 
 **Worktrees**: dev server runs from the **primary worktree** on `master`; sessions use separate worktrees under `<project-root>-wt/<branch>/`. Always edit files in your session worktree, never the primary one. For infra files: edit here → commit → push → `cd <primary-worktree> && git pull origin master` (pushing to remote `master` does NOT update the dev server).
 
-**Forks**: open PRs against the fork's `master`, not the upstream repo.
+**Forks**: open PRs against the fork's `master`, not upstream; sync upstream via merge-commit, never squash.
 
 Full worktree story — branch namespaces, `base_ref`, the `git stash` hazard: [docs/dev-workflow.md](docs/dev-workflow.md).
 
