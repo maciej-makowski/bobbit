@@ -27,6 +27,11 @@ const config: KnipConfig = {
     'tests/e2e/e2e-teardown.ts',
     // Standalone tsx harness invoked directly, not from a spec.
     'tests/code-review-e2e.ts',
+    // Extension Host worker bootstrap: ModuleHost spawns it via
+    // `new Worker(new URL('./module-host-bootstrap', import.meta.url))`, a
+    // dynamic load knip can't statically follow. As an entry it also reaches
+    // its only-dynamically-used import, confinement-loader.ts.
+    'src/server/extension-host/module-host-bootstrap.ts',
     // Playwright component-test HTML entrypoints (knip can't see the .html that loads them).
     'tests/fixtures/**/*.ts',
     'tests/ui-fixtures/**/*.ts',
