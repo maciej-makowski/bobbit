@@ -13,113 +13,42 @@
  * - Init sequence (clone, npm ci, build) runs only on first create
  */
 
-import { execFile as execFileCb } from "node:child_process";
 import { performance } from "node:perf_hooks";
-import { promisify } from "node:util";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cpuDiagnosticsEnabled, getCpuDiagnostics } from "./cpu-diagnostics.js";
-import { buildDockerRunArgs } from "./docker-args.js";
+import { buildContainerRunSpec } from "./docker-args.js";
+import { DockerRuntime } from "./container-runtime/docker-runtime.js";
+import { registerContainerRuntime, unregisterContainerRuntime } from "./container-runtime/registry.js";
+import type { ContainerRuntime } from "./container-runtime/types.js";
 import type { PreferencesStore } from "./preferences-store.js";
 import type { ToolManager } from "./tool-manager.js";
 import { stripTokenFromGitUrl, shouldSkipRemotePush, resolveBaseRefWithExec } from "../skills/git.js";
 import type { Component } from "./project-config-store.js";
 import type { SandboxCloneSource } from "./sandbox-clone-source.js";
 
-const execFileAsync = promisify(execFileCb);
-const DOCKER_BIN = "docker";
-
-/** Env config for docker commands — suppresses MSYS path mangling on Windows. */
-const DOCKER_ENV = { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" };
-
-function childErrorCode(err: unknown): string {
-	const code = (err as { code?: unknown } | null)?.code;
-	return typeof code === "string" || typeof code === "number" ? String(code) : "error";
-}
-
-function dockerOperation(args: readonly string[]): string {
-	const cmd = args[0] || "docker";
-	if (cmd !== "exec") return cmd;
-	let i = 1;
-	while (i < args.length) {
-		const arg = args[i];
-		if (arg === "-w" || arg === "-e" || arg === "-u") { i += 2; continue; }
-		if (arg?.startsWith("-")) { i += 1; continue; }
-		break;
-	}
-	const inner = args[i + 1] || "unknown";
-	const innerSub = args[i + 2];
-	if (inner === "git" && innerSub) return `exec git ${innerSub}`;
-	return `exec ${inner}`;
-}
-
-function dockerChildLabel(args: readonly string[]): string {
-	const op = dockerOperation(args);
-	if (op.startsWith("exec git")) return "docker exec git";
-	if (op.startsWith("exec ")) return "docker exec";
-	return `docker ${args[0] || "command"}`;
-}
-
-async function execDocker(args: readonly string[], options?: any): Promise<{ stdout: string; stderr: string }> {
-	if (!cpuDiagnosticsEnabled()) {
-		return await execFileAsync(DOCKER_BIN, args, options) as unknown as { stdout: string; stderr: string };
-	}
-	const start = performance.now();
-	let success = 0;
-	let errorCode = "none";
-	try {
-		const result = await execFileAsync(DOCKER_BIN, args, options) as unknown as { stdout: string; stderr: string };
-		success = 1;
-		return result;
-	} catch (err) {
-		errorCode = childErrorCode(err);
-		throw err;
-	} finally {
-		getCpuDiagnostics().recordChildProcess(dockerChildLabel(args), performance.now() - start, {
-			operation: dockerOperation(args),
-			success,
-			errorCode,
-			timeoutMs: typeof options?.timeout === "number" ? options.timeout : 0,
-		});
-	}
-}
-
-// ── Docker resource limits ─────────────────────────────────────────────────
-
-interface DockerResourceLimits {
-	cpus: number;
-	memBytes: number;
-}
-
-let _cachedDockerLimits: DockerResourceLimits | null | undefined; // undefined = not yet queried
+// ── Container resource limits ───────────────────────────────────────────────
 
 /**
- * Query Docker daemon's available CPU and memory.
- * Cached for the process lifetime (Docker resource limits don't change mid-session).
- * Returns null if `docker info` fails (caller should fall back to host values).
+ * Shared Docker runtime used only by the back-compat `getDockerResourceLimits`
+ * helper below. Per-project sandboxes use their own injected runtime instance.
  */
-export async function getDockerResourceLimits(): Promise<DockerResourceLimits | null> {
-	if (_cachedDockerLimits !== undefined) return _cachedDockerLimits;
+const _sharedDockerRuntime = new DockerRuntime();
 
-	try {
-		const { stdout } = await execDocker(
-			["info", "--format", "{{.NCPU}} {{.MemTotal}}"],
-			{ timeout: 5_000, env: DOCKER_ENV },
-		);
-		const parts = stdout.trim().split(/\s+/);
-		const cpus = parseInt(parts[0], 10);
-		const memBytes = parseInt(parts[1], 10);
-		if (Number.isNaN(cpus) || Number.isNaN(memBytes) || cpus <= 0 || memBytes <= 0) {
-			_cachedDockerLimits = null;
-			return null;
-		}
-		_cachedDockerLimits = { cpus, memBytes };
-		return _cachedDockerLimits;
-	} catch {
-		_cachedDockerLimits = null;
-		return null;
-	}
+/**
+ * Query the (Docker) engine's available CPU and memory. Back-compat wrapper —
+ * the resource-limit logic now lives on the runtime (`getResourceLimits()`).
+ * Cached for the process lifetime. Returns null if the query fails (caller
+ * falls back to host values).
+ */
+export async function getDockerResourceLimits(): Promise<{ cpus: number; memBytes: number } | null> {
+	return _sharedDockerRuntime.getResourceLimits();
+}
+
+/** @internal — exported for testing only. Resets the cached resource limits. */
+export function _resetDockerLimitsCache(): void {
+	_sharedDockerRuntime._resetResourceLimitsCache();
 }
 
 /**
@@ -141,14 +70,16 @@ export function computeResourceLimits(
 	};
 }
 
-/** @internal — exported for testing only. Resets the cached Docker limits. */
-export function _resetDockerLimitsCache(): void {
-	_cachedDockerLimits = undefined;
-}
-
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export interface ProjectSandboxOptions {
+	/**
+	 * Container runtime provider (docker/podman). Resolved once per project from
+	 * `sandbox_runtime` and injected here. Optional for back-compat — defaults to
+	 * a DockerRuntime when omitted (preserves today's behaviour for direct
+	 * constructions, e.g. tests).
+	 */
+	runtime?: ContainerRuntime;
 	projectId: string;
 	projectDir: string;        // host project root
 	repoUrl: string;           // git remote URL to clone inside container (single-repo)
@@ -222,10 +153,14 @@ export class ProjectSandbox {
 	private _recovering = false;
 
 
+	/** Resolved container runtime (docker/podman). Owns all CLI invocation. */
+	private readonly runtime: ContainerRuntime;
+
 	constructor(private options: ProjectSandboxOptions) {
 		if (!options || typeof options !== "object" || typeof options.projectId !== "string" || !options.projectId) {
 			throw new Error("[project-sandbox] ProjectSandbox constructor requires ProjectSandboxOptions with a non-empty projectId");
 		}
+		this.runtime = options.runtime ?? new DockerRuntime();
 	}
 
 	// ── Public API ─────────────────────────────────────────────────────
@@ -246,6 +181,9 @@ export class ProjectSandbox {
 
 		try {
 			await this._initContainer();
+			// Register this container's runtime so server-side git-panel helpers
+			// (which only have a containerId) spawn against the right binary.
+			if (this.containerId) registerContainerRuntime(this.containerId, this.runtime);
 			this._status = "ready";
 			this._readyResolve!();
 		} catch (err: any) {
@@ -281,10 +219,9 @@ export class ProjectSandbox {
 			await this._dockerExec(containerId, ["mkdir", "-p", "/workspace-wt"]);
 		} catch {
 			// Permission denied — create as root and chown to node
-			await execDocker([
-				"exec", "-u", "root", containerId, "sh", "-c",
-				"mkdir -p /workspace-wt && chown node:node /workspace-wt",
-			], { timeout: 10_000, env: DOCKER_ENV });
+			await this.runtime.exec(containerId, [
+				"sh", "-c", "mkdir -p /workspace-wt && chown node:node /workspace-wt",
+			], { user: "root", timeoutMs: 10_000 });
 		}
 
 		// Fetch latest before creating worktree
@@ -391,10 +328,9 @@ export class ProjectSandbox {
 		try {
 			await this._dockerExec(containerId, ["mkdir", "-p", container]);
 		} catch {
-			await execDocker([
-				"exec", "-u", "root", containerId, "sh", "-c",
-				`mkdir -p ${container} && chown node:node ${container}`,
-			], { timeout: 10_000, env: DOCKER_ENV });
+			await this.runtime.exec(containerId, [
+				"sh", "-c", `mkdir -p ${container} && chown node:node ${container}`,
+			], { user: "root", timeoutMs: 10_000 });
 		}
 
 		const configuredBaseRef = this.options.baseRefResolver?.();
@@ -608,10 +544,7 @@ export class ProjectSandbox {
 				const wtList = await this._dockerExec(this.containerId, ["sh", "-c", "ls -d /workspace-wt/session/* 2>/dev/null || echo '(none)'"]);
 				console.log(`[project-sandbox] Pre-shutdown worktrees in ${this.containerId.substring(0, 12)}: ${wtList.trim()}`);
 			} catch { /* best-effort audit */ }
-			await execDocker(["stop", this.containerId], {
-				timeout: 30_000,
-				env: DOCKER_ENV,
-			});
+			await this.runtime.stopContainer(this.containerId, { timeoutMs: 30_000 });
 			console.log(`[project-sandbox] Stopped container ${this.containerId.substring(0, 12)} for project ${this.options.projectId}`);
 		} catch (err: any) {
 			console.warn(`[project-sandbox] Failed to stop container:`, err?.message || err);
@@ -623,18 +556,13 @@ export class ProjectSandbox {
 		this.stopHealthMonitor();
 		const volumeName = this._volumeName();
 		if (this.containerId) {
+			unregisterContainerRuntime(this.containerId);
 			try {
-				await execDocker(["rm", "-f", this.containerId], {
-					timeout: 15_000,
-					env: DOCKER_ENV,
-				});
+				await this.runtime.removeContainer(this.containerId, { force: true, timeoutMs: 15_000 });
 			} catch { /* already gone */ }
 		}
 		try {
-			await execDocker(["volume", "rm", "-f", volumeName], {
-				timeout: 15_000,
-				env: DOCKER_ENV,
-			});
+			await this.runtime.removeVolume(volumeName, { force: true });
 		} catch { /* volume may not exist */ }
 		this.containerId = null;
 		this._status = "starting";
@@ -691,10 +619,7 @@ export class ProjectSandbox {
 			} else {
 				// Stopped — try to start it
 				try {
-					await execDocker(["start", existingId], {
-						timeout: 30_000,
-						env: DOCKER_ENV,
-					});
+					await this.runtime.startContainer(existingId, { timeoutMs: 30_000 });
 					// Validate after start
 					await this._dockerExec(existingId, ["echo", "ok"]);
 					this.containerId = existingId;
@@ -731,13 +656,13 @@ export class ProjectSandbox {
 		}
 
 		// Dynamic resource limits: N-2 cores, M-2GB memory, no PID limit
-		// Query Docker daemon to avoid requesting more resources than the VM has
-		const dockerLimits = await getDockerResourceLimits();
+		// Query the engine to avoid requesting more resources than the VM has
+		const engineLimits = await this.runtime.getResourceLimits();
 		const { cpus: totalCpus, memoryGB: totalMemGB } = computeResourceLimits(
 			os.cpus().length,
 			os.totalmem(),
-			dockerLimits?.cpus,
-			dockerLimits?.memBytes,
+			engineLimits?.cpus,
+			engineLimits?.memBytes,
 		);
 
 		// Collect read-only bind mounts for any `mounted` clone sources (remote-less
@@ -755,7 +680,7 @@ export class ProjectSandbox {
 		addMount(this.options.cloneSource);
 		for (const src of Object.values(this.options.cloneSourceByName ?? {})) addMount(src);
 
-		const dockerArgs = buildDockerRunArgs({
+		const runSpec = buildContainerRunSpec({
 			image,
 			workspaceDir: "", // unused — named volume instead
 			label: projectId,
@@ -774,40 +699,33 @@ export class ProjectSandbox {
 			extraReadonlyMounts: extraReadonlyMounts.length ? extraReadonlyMounts : undefined,
 		});
 
-		// Inject GITHUB_TOKEN for git push/PR inside container
+		// Inject GITHUB_TOKEN for git push/PR inside container (kept out of PID 1
+		// env, exposed only as a `run -e` for the long-lived container).
 		if (githubToken) {
-			const insertIdx = dockerArgs.length - 3; // before image + sleep + infinity
-			dockerArgs.splice(insertIdx, 0, "-e", `GITHUB_TOKEN=${githubToken}`);
+			runSpec.env = { ...runSpec.env, GITHUB_TOKEN: githubToken };
 		}
 
-		const { stdout } = await execDocker(dockerArgs, {
-			timeout: 60_000,
-			env: DOCKER_ENV,
-		});
-
-		const containerId = stdout.trim();
+		const containerId = (await this.runtime.createContainer(runSpec)).trim();
 		if (!containerId) {
-			throw new Error(`[project-sandbox] docker run returned empty container ID for project ${projectId}`);
+			throw new Error(`[project-sandbox] ${this.runtime.bin} run returned empty container ID for project ${projectId}`);
 		}
 
 		this.containerId = containerId;
 
 		// Create /workspace-wt for agent worktrees (needs root since / is root-owned)
 		try {
-			await execDocker([
-				"exec", "-u", "root", containerId, "sh", "-c",
-				"mkdir -p /workspace-wt && chown node:node /workspace-wt",
-			], { timeout: 10_000, env: DOCKER_ENV });
+			await this.runtime.exec(containerId, [
+				"sh", "-c", "mkdir -p /workspace-wt && chown node:node /workspace-wt",
+			], { user: "root", timeoutMs: 10_000 });
 		} catch {
 			// Non-fatal — createWorktree will retry
 		}
 
 		// Defense-in-depth: mask /proc/1/environ
 		try {
-			await execDocker([
-				"exec", "-u", "root", containerId, "sh", "-c",
-				"mount --bind /dev/null /proc/1/environ 2>/dev/null || chmod 0400 /proc/1/environ 2>/dev/null || true",
-			], { timeout: 10_000, env: DOCKER_ENV });
+			await this.runtime.exec(containerId, [
+				"sh", "-c", "mount --bind /dev/null /proc/1/environ 2>/dev/null || chmod 0400 /proc/1/environ 2>/dev/null || true",
+			], { user: "root", timeoutMs: 10_000 });
 		} catch {
 			// Non-fatal — primary defense is not passing sensitive env vars to docker run
 		}
@@ -997,20 +915,7 @@ export class ProjectSandbox {
 	// ── Private: Docker helpers ────────────────────────────────────────
 
 	private async _findContainerByLabel(label: string): Promise<string | null> {
-		try {
-			const { stdout } = await execDocker([
-				"ps", "-a",
-				"--filter", `label=${label}`,
-				"--format", "{{.ID}}",
-			], {
-				timeout: 10_000,
-				env: DOCKER_ENV,
-			});
-			const ids = stdout.trim().split("\n").filter(Boolean);
-			return ids[0] ?? null;
-		} catch {
-			return null;
-		}
+		return this.runtime.findContainerByLabel(label);
 	}
 
 	/**
@@ -1023,40 +928,21 @@ export class ProjectSandbox {
 	 * than nuking a possibly-working container).
 	 */
 	private async _isContainerImageStale(containerId: string, imageTag: string): Promise<boolean> {
-		try {
-			const [containerImg, currentImg] = await Promise.all([
-				execDocker(["inspect", "--format", "{{.Image}}", containerId], { timeout: 5_000, env: DOCKER_ENV }),
-				execDocker(["inspect", "--format", "{{.Id}}", imageTag], { timeout: 5_000, env: DOCKER_ENV }),
-			]);
-			const a = containerImg.stdout.trim();
-			const b = currentImg.stdout.trim();
-			if (!a || !b) return false; // can't determine — don't nuke
-			return a !== b;
-		} catch {
-			return false;
-		}
+		const [a, b] = await Promise.all([
+			this.runtime.getContainerImageId(containerId),
+			this.runtime.getImageId(imageTag),
+		]);
+		if (!a || !b) return false; // can't determine — don't nuke
+		return a !== b;
 	}
 
 	private async _isContainerRunning(containerId: string): Promise<boolean> {
-		try {
-			const { stdout } = await execDocker([
-				"inspect", "--format", "{{.State.Running}}", containerId,
-			], {
-				timeout: 5_000,
-				env: DOCKER_ENV,
-			});
-			return stdout.trim() === "true";
-		} catch {
-			return false;
-		}
+		return this.runtime.isRunning(containerId);
 	}
 
 	private async _removeContainer(containerId: string): Promise<void> {
 		try {
-			await execDocker(["rm", "-f", containerId], {
-				timeout: 15_000,
-				env: DOCKER_ENV,
-			});
+			await this.runtime.removeContainer(containerId, { force: true, timeoutMs: 15_000 });
 		} catch { /* already gone */ }
 	}
 
@@ -1065,21 +951,10 @@ export class ProjectSandbox {
 		args: string[],
 		opts?: { cwd?: string; env?: Record<string, string>; timeout?: number },
 	): Promise<string> {
-		const execArgs = ["exec"];
-		if (opts?.cwd) {
-			execArgs.push("-w", opts.cwd);
-		}
-		if (opts?.env) {
-			for (const [key, value] of Object.entries(opts.env)) {
-				execArgs.push("-e", `${key}=${value}`);
-			}
-		}
-		execArgs.push(containerId, ...args);
-
-		const { stdout } = await execDocker(execArgs, {
-			timeout: opts?.timeout ?? 60_000,
-			env: DOCKER_ENV,
-			maxBuffer: 10 * 1024 * 1024,
+		const { stdout } = await this.runtime.exec(containerId, args, {
+			cwd: opts?.cwd,
+			env: opts?.env,
+			timeoutMs: opts?.timeout ?? 60_000,
 		});
 		return stdout;
 	}
