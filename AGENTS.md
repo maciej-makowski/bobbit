@@ -55,9 +55,9 @@ Primary branch is **`master`** (not `main`). Never create a `main` branch.
 
 **Worktrees**: dev server runs from the **primary worktree** on `master`; sessions use separate worktrees under `<project-root>-wt/<branch>/`. Always edit files in your session worktree, never the primary one. For infra files: edit here → commit → push → `cd <primary-worktree> && git pull origin master` (pushing to remote `master` does NOT update the dev server).
 
-**Forks**: open PRs against the fork's `master`, not the upstream repo.
+**Forks**: open PRs against the fork's `master`, not upstream; sync upstream via merge-commit, never squash.
 
-See [docs/dev-workflow.md](docs/dev-workflow.md) for the full worktree story — branch namespaces, start-point/`base_ref` ([docs/design/base-ref.md](docs/design/base-ref.md)), and the worktree-stash hazard (never `git stash` in a session worktree).
+Full worktree story — branch namespaces, `base_ref`, the `git stash` hazard: [docs/dev-workflow.md](docs/dev-workflow.md).
 
 ## Maintaining this file
 
@@ -69,4 +69,4 @@ AGENTS.md is loaded into **every** agent turn. Keep it small and general.
 
 ## Reference docs
 
-[docs/internals.md](docs/internals.md) · [docs/debugging.md](docs/debugging.md) · [docs/dev-workflow.md](docs/dev-workflow.md) · [docs/testing-strategy.md](docs/testing-strategy.md) · [docs/architecture.md](docs/architecture.md) · [docs/goals-workflows-tasks.md](docs/goals-workflows-tasks.md) · [docs/nested-goals.md](docs/nested-goals.md) · [docs/rest-api.md](docs/rest-api.md) · [docs/preview-architecture.md](docs/preview-architecture.md) · [docs/mcp-meta-tools.md](docs/mcp-meta-tools.md) · [docs/qa-testing.md](docs/qa-testing.md)
+[docs/internals.md](docs/internals.md) · [docs/debugging.md](docs/debugging.md) · [docs/dev-workflow.md](docs/dev-workflow.md) · [docs/testing-strategy.md](docs/testing-strategy.md) · [docs/architecture.md](docs/architecture.md) · [docs/goals-workflows-tasks.md](docs/goals-workflows-tasks.md) · [docs/nested-goals.md](docs/nested-goals.md) · [docs/rest-api.md](docs/rest-api.md) · [docs/preview-architecture.md](docs/preview-architecture.md) · [docs/mcp-meta-tools.md](docs/mcp-meta-tools.md) · [docs/qa-testing.md](docs/qa-testing.md) · [docs/extension-host-authoring.md](docs/extension-host-authoring.md)
