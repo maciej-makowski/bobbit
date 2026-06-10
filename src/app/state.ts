@@ -497,7 +497,7 @@ export const state = {
 	splashProjectPickerOpen: false,
 
 	/** Docker sandbox status (fetched on demand) */
-	sandboxStatus: null as { available: boolean; error?: string; dockerVersion?: string; imageExists?: boolean; configured: boolean; dockerfileExists?: boolean; buildCommand?: string } | null,
+	sandboxStatus: null as { available: boolean; error?: string; runtime?: "docker" | "podman"; dockerVersion?: string; imageExists?: boolean; configured: boolean; dockerfileExists?: boolean; buildCommand?: string } | null,
 
 	/** Per-proposal-tag streaming flag. True between the first message_update
 	 *  delta carrying a propose_<tag> block and the matching block-finish event.
