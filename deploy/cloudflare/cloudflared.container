@@ -6,6 +6,22 @@
 # so Network=host is safe and is required so it can reach Bobbit on the host
 # loopback (http://127.0.0.1:3001). Do NOT use host.containers.internal — that
 # resolves to the host gateway bridge IP, not loopback.
+#
+# We mount cloudflared's DEFAULT dir ~/.cloudflared (where `cloudflared tunnel
+# login` writes cert.pem and `cloudflared tunnel create` writes <UUID>.json) —
+# so there is nothing to copy. Two gotchas make `User=0` necessary:
+#   * The official cloudflare/cloudflared image is built FROM a distroless
+#     `nonroot` base, so the daemon runs as a non-root UID (65532). Under
+#     ROOTLESS Podman that maps to a subuid — NOT your user — so it cannot
+#     traverse ~/.cloudflared (mode 0700) nor read the owner-only cert.pem
+#     (0600) / <UUID>.json (0400).
+#   * `User=0` runs the container as root, which in ROOTLESS Podman maps to
+#     YOUR host uid (the file owner) — so the default 0700/0600/0400 perms are
+#     readable as-is, with no chmod. (Harmless side effect: cloudflared logs a
+#     `ping_group_range` GID warning under User=0 — it just can't ICMP, which
+#     the HTTP/WS tunnel never needs.)
+# `:z` (shared relabel) is used because ~/.cloudflared is shared between this
+# container and the host `cloudflared` CLI.
 [Unit]
 Description=Cloudflare Tunnel (cloudflared) for Bobbit
 Wants=bobbit.service
@@ -14,8 +30,14 @@ After=bobbit.service network-online.target
 [Container]
 Image=docker.io/cloudflare/cloudflared:latest
 Network=host
-# :ro,Z = read-only + private SELinux relabel (host is enforcing).
-Volume=%h/.config/cloudflared:/etc/cloudflared:ro,Z
+# Run as root INSIDE the container; rootless Podman maps that to your host uid
+# (the owner of ~/.cloudflared), so the daemon can read the default-perm creds.
+User=0
+# Mount cloudflared's default dir read-only with a shared SELinux relabel.
+# :ro,z = read-only + shared SELinux relabel (host is enforcing; the dir is
+# shared with the host cloudflared CLI). The host file paths below resolve to
+# the IN-CONTAINER /etc/cloudflared/* paths referenced by config.yml.
+Volume=%h/.cloudflared:/etc/cloudflared:ro,z
 # Image entrypoint is `cloudflared`, so this becomes
 # `cloudflared tunnel --no-autoupdate --config /etc/cloudflared/config.yml run`.
 Exec=tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
