@@ -139,7 +139,7 @@ A squishy pixel-art blob that lives in the UI — animated, expressive, and draw
 | [Marketplace](docs/marketplace.md) | Pack-based install of roles, tools, and skills |
 | [Bobbit Sprites](docs/bobbit-sprites.md) | Pixel-art mascot, animations, and accessories |
 
-**Technical reference:** [REST API](docs/rest-api.md) · [WebSocket Protocol](docs/websocket-protocol.md) · [Security](docs/security.md) · [Networking](docs/networking.md)
+**Technical reference:** [REST API](docs/rest-api.md) · [WebSocket Protocol](docs/websocket-protocol.md) · [Security](docs/security.md) · [Networking](docs/networking.md) · [Cloudflare Tunnel](docs/cloudflare-tunnel.md)
 
 ## Contributing
 

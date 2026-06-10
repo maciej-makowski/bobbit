@@ -2,6 +2,8 @@
 
 By default, Bobbit binds to `localhost` for local-only access (HTTP). Pass `--nord` to bind to the NordLynx interface's IPv4 address with HTTPS, enabling remote access from any device on the NordVPN meshnet.
 
+To expose a single-host instance publicly with Cloudflare Access (Zero Trust) as the sole auth gate while Bobbit stays token-less in localhost mode, see [Cloudflare Tunnel deployment](cloudflare-tunnel.md).
+
 ## Port topology in dev mode
 
 - **Vite** (`:5173`) — User-facing HTTPS, serves UI with HMR, proxies `/api/*` and `/ws/*` to the gateway

@@ -1,0 +1,29 @@
+# Rootless Podman quadlet for the Cloudflare Tunnel daemon (cloudflared).
+# Installed to ~/.config/containers/systemd/cloudflared.container by setup.sh;
+# systemd-generator turns it into cloudflared.service.
+#
+# cloudflared makes only OUTBOUND connections (to the Cloudflare edge on 7844),
+# so Network=host is safe and is required so it can reach Bobbit on the host
+# loopback (http://127.0.0.1:3001). Do NOT use host.containers.internal — that
+# resolves to the host gateway bridge IP, not loopback.
+[Unit]
+Description=Cloudflare Tunnel (cloudflared) for Bobbit
+Wants=bobbit.service
+After=bobbit.service network-online.target
+
+[Container]
+Image=docker.io/cloudflare/cloudflared:latest
+Network=host
+# :ro,Z = read-only + private SELinux relabel (host is enforcing).
+Volume=%h/.config/cloudflared:/etc/cloudflared:ro,Z
+# Image entrypoint is `cloudflared`, so this becomes
+# `cloudflared tunnel --no-autoupdate --config /etc/cloudflared/config.yml run`.
+Exec=tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+AutoUpdate=registry
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
