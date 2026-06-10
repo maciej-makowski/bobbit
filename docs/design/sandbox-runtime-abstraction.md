@@ -212,8 +212,17 @@ DockerRuntime impl, the `sandbox` enable-value comparisons, and the
   validated by `ProjectConfigStore.getSandboxRuntime()` (unknown/empty →
   `"docker"`, never throws).
 - `resolveContainerRuntime(projectConfigStore)` maps the key to an instance.
-- No Settings UI in this cut (config-file only); a later goal can surface a
+- No Settings UI in *this* cut (config-file only); a later goal surfaces a
   provider dropdown with a browser E2E.
+  - **Update (landed):** the dropdown shipped. Project Settings → **Container
+    Sandbox** now exposes a **Container Runtime** select (Docker / Podman)
+    below **Sandbox Mode**, wired to `sandbox_runtime` via the existing
+    `PUT /api/projects/:id/config` flow. It is relevance-gated — always shown
+    but disabled/greyed with an "Applies when Sandbox Mode is enabled" hint
+    when sandboxing is off. The sandbox status display is runtime-aware:
+    `GET /api/sandbox-status` returns a `runtime` field and the UI labels
+    availability and the build-command hint with the selected runtime. See
+    [internals.md → Container runtime abstraction](../internals.md#container-runtime-abstraction).
 
 (Open question: rename `sandbox_runtime` → `sandbox_provider`? `runtime` reads
 well and avoids a migration; leaning keep. See §8.)
