@@ -23,6 +23,7 @@
     "dev:watchdog": "npm run build:server && concurrently -n watchdog,ui -c red,green \"node dist/server/watchdog.js -- --cwd . --no-ui\" \"vite\"",
     "restart-server": "node dist/server/harness-signal.js",
     "start": "node dist/server/cli.js --cwd .",
+    "setup-cloudflare-tunnel": "bash deploy/cloudflare/setup-tunnel.sh",
     "check": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "pretest:unit": "node -e \"require('fs').existsSync('dist/server')||require('child_process').execSync('npm run build:server',{stdio:'inherit'})\"",
     "test:unit": "node scripts/run-unit.mjs",
