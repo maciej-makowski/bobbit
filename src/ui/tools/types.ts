@@ -15,6 +15,14 @@ export interface ToolRenderContext {
 	toolCallInput?: unknown;
 	/** The gateway session ID that issued the tool call. */
 	sessionId?: string;
+	/**
+	 * Server-stamped timestamp (ms epoch) of the assistant message that issued
+	 * this tool call. Used by time-sensitive renderers (e.g. `bash_bg wait`'s
+	 * live elapsed timer) as a reload-stable anchor for when the call started —
+	 * it comes from the persisted transcript, so a refresh reads the same value
+	 * back rather than resetting to "now". Optional.
+	 */
+	toolCallStartTime?: number;
 	/** The current session's goal ID, when bound to a goal. Used by Children
 	 *  tool renderers (e.g. goal_plan_propose's approval flow). */
 	goalId?: string;
@@ -36,6 +44,14 @@ export interface ToolRenderContext {
 	 * it. Optional so existing renderers and test fixtures need no change.
 	 */
 	host?: HostApi;
+	/**
+	 * The tool name whose pack owns this renderer (Slice A — design
+	 * extension-host-phase2.md §2.3). The scoped Phase-2 client capabilities
+	 * (callRoute/store/session) name only this TOOL; the server maps tool → winning
+	 * pack to derive the trusted packId (the client never sends a packId). Built-in
+	 * renderers leave it undefined.
+	 */
+	packTool?: string;
 }
 
 export interface ToolRenderer<TParams = any, TDetails = any> {

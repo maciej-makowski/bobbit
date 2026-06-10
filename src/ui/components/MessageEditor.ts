@@ -10,6 +10,7 @@ import { type Attachment, loadAttachment } from "../utils/attachment-utils.js";
 import { i18n } from "../utils/i18n.js";
 import { getAppStorage } from "../storage/app-storage.js";
 import { gatewayFetch } from "../../app/api.js";
+import { listLauncherEntrypoints, runLauncherEntrypoint } from "../../app/pack-entrypoints.js";
 import "./AttachmentTile.js";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 
@@ -18,17 +19,16 @@ interface SlashSkillInfo {
 	name: string;
 	description: string;
 	argumentHint?: string;
-	source: "project" | "personal" | "legacy" | "built-in";
+	source: "project" | "personal" | "legacy" | "built-in" | "pack";
+	/** Slice C1 — set when this slash entry is a pack `composer-slash` ENTRYPOINT.
+	 *  Selecting it RUNS the launcher (openPanel/navigate) instead of inserting text
+	 *  (the launch is the user gesture — no auto-invoke on mount). */
+	entrypointId?: string;
 }
 
-const BUILT_IN_SLASH_COMMANDS: SlashSkillInfo[] = [
-	{
-		name: "walkthrough-pr",
-		argumentHint: "<GitHub PR URL or #>",
-		description: "Launch a guided PR walkthrough child session.",
-		source: "built-in",
-	},
-];
+// The PR-walkthrough launcher is now provided by the first-party pack's
+// composer-slash entrypoint (not a built-in slash command).
+const BUILT_IN_SLASH_COMMANDS: SlashSkillInfo[] = [];
 
 function mergeBuiltInSlashCommands(skills: SlashSkillInfo[]): SlashSkillInfo[] {
 	const names = new Set(skills.map((skill) => skill.name.toLowerCase()));
@@ -209,11 +209,11 @@ export class MessageEditor extends LitElement {
 			const res = await gatewayFetch(url);
 			if (res.ok) {
 				const data = await res.json();
-				this._slashSkills = mergeBuiltInSlashCommands(data.skills || []);
+				this._slashSkills = this._withPackEntrypoints(mergeBuiltInSlashCommands(data.skills || []));
 			}
 		} catch {
 			// Best effort
-			this._slashSkills = mergeBuiltInSlashCommands([]);
+			this._slashSkills = this._withPackEntrypoints(mergeBuiltInSlashCommands([]));
 		}
 		this._slashSkillsCwd = this.cwd;
 		this._slashSkillsProjectId = this.projectId;
@@ -244,7 +244,36 @@ export class MessageEditor extends LitElement {
 		}
 	}
 
+	/** Slice C1 — append the registered pack `composer-slash` ENTRYPOINTS (from the
+	 *  reconciled client pack-entrypoints registry) to the slash list as synthetic
+	 *  entries. The trigger name is the entrypoint id; selecting one runs the
+	 *  launcher (see `_selectSlashSkill`). Best-effort + synchronous — the registry
+	 *  is already populated by the project reconcile; a load failure is non-fatal. */
+	private _withPackEntrypoints(skills: SlashSkillInfo[]): SlashSkillInfo[] {
+		try {
+			const eps = listLauncherEntrypoints("composer-slash");
+			if (eps.length === 0) return skills;
+			const names = new Set(skills.map((s) => s.name.toLowerCase()));
+			// `name` is the user-facing slash trigger (the pack-local entrypoint id);
+			// `entrypointId` carries the COMPOUND launcher key (packId+entrypointId) so
+			// dispatch addresses the exact launcher even when two packs share an id.
+			const packEntries: SlashSkillInfo[] = eps
+				.filter((e) => !names.has(e.id.toLowerCase()))
+				.map((e) => ({ name: e.id, description: e.label, source: "pack" as const, entrypointId: e.key }));
+			return [...skills, ...packEntries];
+		} catch {
+			return skills;
+		}
+	}
+
 	private _selectSlashSkill(skill: SlashSkillInfo) {
+		// Slice C1 — a pack composer-slash ENTRYPOINT runs its launcher (open panel /
+		// navigate) on selection (the user gesture) instead of inserting text.
+		if (skill.entrypointId) {
+			this._slashMenuOpen = false;
+			try { runLauncherEntrypoint(skill.entrypointId); } catch { /* non-fatal */ }
+			return;
+		}
 		const textarea = this.textareaRef.value;
 		if (!textarea) return;
 		const before = this.value.substring(0, this._slashTokenStart);

@@ -1204,34 +1204,49 @@ const teamLoading = new Set<string>();
 export function renderGateProgressBadge(goalId: string): TemplateResult | string {
 	const gs = state.gateStatusCache.get(goalId);
 	if (!gs) return "";
+	const bypassed = gs.bypassed ?? 0;
+	// A human bypass means ≥1 gate was forced past verification. The numerator
+	// counts bypassed gates as resolved (so a fully-resolved goal reads N/N), the
+	// badge gets a trailing `!`, and every state is tinted red to flag that this
+	// is NOT a clean pass. The wave/blink animations are preserved — only the
+	// colour changes — so a working/verifying team still reads as live.
+	const isBypass = bypassed > 0;
+	const RED = "#dc2626";
+	const suffix = isBypass ? "!" : "";
+
 	const goalAgents = state.gatewaySessions.filter(s => (s.goalId === goalId || s.teamGoalId === goalId) && !isChildSession(s));
 	const hasTeam = goalAgents.some(s => s.role === "team-lead" && s.status !== "terminated");
 	const anyAgentWorking = goalAgents.some(s => s.status === "streaming" || s.status === "busy" || s.isCompacting);
-	const allPassed = gs.passed === gs.total;
-	const color = !hasTeam ? "#6b7280" : allPassed ? "#22c55e" : anyAgentWorking ? "#3b82f6" : "#7a8ea8";
+	const numerator = gs.passed + bypassed;
+	const allPassed = numerator === gs.total;
+	const color = isBypass ? RED : (!hasTeam ? "#6b7280" : allPassed ? "#22c55e" : anyAgentWorking ? "#3b82f6" : "#7a8ea8");
 	const baseStyle = `font-size:0.75em;color:${color};font-weight:600;letter-spacing:-0.02em;white-space:nowrap;`;
+	const resolvedTitle = isBypass
+		? `${numerator} of ${gs.total} gates resolved — ${bypassed} bypassed (NOT a clean pass)`
+		: `${gs.passed} of ${gs.total} gates passed`;
 	if (gs.verifying && gs.verifyingCount > 0) {
-		// Verifying state is always blue — override the base color which may be muted when agents are idle.
+		// Verifying state is blue (red when a bypass is in play) — override the base
+		// colour which may be muted when agents are idle.
 		// Clamp the animated numerator because an already-passed gate can be re-signaled
 		// and running while the stored pass count is still true in server history.
-		const verifyStyle = `font-size:0.75em;color:#3b82f6;font-weight:600;letter-spacing:-0.02em;white-space:nowrap;`;
-		const displayed = Math.min(gs.total, gs.passed + gs.verifyingCount);
-		return html`<span class="shrink-0" style="${verifyStyle}" title="${gs.passed} of ${gs.total} gates passed — verifying ${gs.verifyingCount}"><span style="opacity:0.7">(</span><span class="gate-blink" style="animation: gate-blink 1.2s ease-in-out infinite">${displayed}</span><span style="opacity:0.7">/${gs.total})</span></span>`;
+		const verifyStyle = `font-size:0.75em;color:${isBypass ? RED : "#3b82f6"};font-weight:600;letter-spacing:-0.02em;white-space:nowrap;`;
+		const displayed = Math.min(gs.total, numerator + gs.verifyingCount);
+		const verifyTitle = isBypass
+			? `${numerator} of ${gs.total} gates resolved (${bypassed} bypassed) — verifying ${gs.verifyingCount}`
+			: `${gs.passed} of ${gs.total} gates passed — verifying ${gs.verifyingCount}`;
+		return html`<span class="shrink-0" style="${verifyStyle}" title="${verifyTitle}"><span style="opacity:0.7">(</span><span class="gate-blink" style="animation: gate-blink 1.2s ease-in-out infinite">${displayed}</span><span style="opacity:0.7">/${gs.total})${suffix}</span></span>`;
 	}
-	if (!allPassed && hasTeam) {
-		// Wave animation only when agents are actively working or verifications are running
-		if (anyAgentWorking) {
-			const label = `(${gs.passed}/${gs.total})`;
-			const chars = label.split("");
-			const totalDur = 1.2;
-			const stagger = totalDur / chars.length;
-			return html`<span class="shrink-0 gate-wave" style="${baseStyle}" title="${gs.passed} of ${gs.total} gates passed">${chars.map((ch, i) =>
-				html`<span style="animation-delay:${(i * stagger).toFixed(2)}s">${ch}</span>`
-			)}</span>`;
-		}
-		return html`<span class="shrink-0" style="${baseStyle}" title="${gs.passed} of ${gs.total} gates passed">(${gs.passed}/${gs.total})</span>`;
+	if (!allPassed && hasTeam && anyAgentWorking) {
+		// Wave animation only when agents are actively working.
+		const label = `(${numerator}/${gs.total})${suffix}`;
+		const chars = label.split("");
+		const totalDur = 1.2;
+		const stagger = totalDur / chars.length;
+		return html`<span class="shrink-0 gate-wave" style="${baseStyle}" title="${resolvedTitle}">${chars.map((ch, i) =>
+			html`<span style="animation-delay:${(i * stagger).toFixed(2)}s">${ch}</span>`
+		)}</span>`;
 	}
-	return html`<span class="shrink-0" style="${baseStyle}" title="${gs.passed} of ${gs.total} gates passed">(${gs.passed}/${gs.total})</span>`;
+	return html`<span class="shrink-0" style="${baseStyle}" title="${resolvedTitle}">(${numerator}/${gs.total})${suffix}</span>`;
 }
 
 /**
@@ -1241,10 +1256,14 @@ export function renderGateProgressBadge(goalId: string): TemplateResult | string
  * palette used by `renderGateProgressBadge` — green for passed, red for
  * failed, blue for running, muted-foreground for pending.
  */
-export function renderGateStatusIcon(status: "pending" | "passed" | "failed" | "running"): TemplateResult {
+export function renderGateStatusIcon(status: "pending" | "passed" | "failed" | "running" | "bypassed"): TemplateResult {
 	switch (status) {
 		case "passed":
 			return html`<svg class="shrink-0" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-label="passed"><polyline points="20 6 9 17 4 12"/></svg>`;
+		case "bypassed":
+			// Warning/exclamation triangle in red — a human forced this gate past
+			// verification; it is NOT a clean pass.
+			return html`<svg class="shrink-0" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-label="bypassed"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`;
 		case "failed":
 			return html`<svg class="shrink-0" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#c47070" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-label="failed"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
 		case "running":

@@ -2,7 +2,7 @@
 // URL ROUTING (hash-based: #/ = landing, #/session/{id} = connected, #/goal/{id} = dashboard)
 // ============================================================================
 
-export type RouteView = "landing" | "session" | "goal" | "goal-dashboard" | "roles" | "role-edit" | "tools" | "tool-edit" | "workflows" | "workflow-edit" | "staff" | "staff-edit" | "skills" | "market" | "settings" | "search" | "walkthrough";
+export type RouteView = "landing" | "session" | "goal" | "goal-dashboard" | "roles" | "role-edit" | "tools" | "tool-edit" | "workflows" | "workflow-edit" | "staff" | "staff-edit" | "skills" | "market" | "settings" | "search" | "ext";
 
 export type DashboardTabId = "spec" | "tasks" | "agents" | "commits" | "gates" | "plan" | "children";
 export type SettingsTabId = "shortcuts" | "general" | "project" | "components" | "workflows" | "models" | "palette" | "directories" | "account" | "appearance" | "maintenance";
@@ -18,8 +18,10 @@ export interface AppRoute {
 	settingsScope?: string;
 	settingsTab?: SettingsTabId;
 	searchQuery?: string;
-	walkthroughSessionId?: string;
-	walkthroughTabId?: string;
+	/** Slice C1 — pack deep-link route id parsed from `#/ext/<routeId>` (extension-host-phase2 §7 C1.2a). */
+	extRouteId?: string;
+	/** Slice C1 — query params parsed from `#/ext/<routeId>?<params>` (string-valued, pre-paramKeys filter). */
+	extParams?: Record<string, string>;
 	dashboardTab?: DashboardTabId;
 	focusGateId?: string;
 	focusSignalId?: string;
@@ -30,28 +32,25 @@ const SETTINGS_TABS = new Set<SettingsTabId>(["shortcuts", "general", "project",
 
 export function getRouteFromHash(): AppRoute {
 	const path = window.location.pathname || "";
-	if (path === "/walkthrough" || path.endsWith("/walkthrough")) {
-		const params = new URLSearchParams(window.location.search || "");
-		return {
-			view: "walkthrough",
-			walkthroughSessionId: params.get("session") || undefined,
-			walkthroughTabId: params.get("tab") || undefined,
-		};
-	}
 	const hash = window.location.hash || "";
 	if (hash === "#/search" || hash.startsWith("#/search?")) {
 		const qIdx = hash.indexOf("?");
 		const params = qIdx >= 0 ? new URLSearchParams(hash.slice(qIdx + 1)) : null;
 		return { view: "search", searchQuery: params?.get("q") || undefined };
 	}
-	if (hash === "#/walkthrough" || hash.startsWith("#/walkthrough?")) {
+	// Slice C1 — pack deep-link route `#/ext/<routeId>?<params>` (extension-host-phase2
+	// §7 C1.2a). getRouteFromHash ONLY parses the hash into a structured route; the app's
+	// route handler resolves it through `lookupPackRoute` + `openPackPanel` (no import of
+	// the pack registry here — keeps routing.ts free of a pack-entrypoints dependency).
+	if (hash === "#/ext" || hash.startsWith("#/ext/") || hash.startsWith("#/ext?")) {
 		const qIdx = hash.indexOf("?");
-		const params = qIdx >= 0 ? new URLSearchParams(hash.slice(qIdx + 1)) : null;
-		return {
-			view: "walkthrough",
-			walkthroughSessionId: params?.get("session") || undefined,
-			walkthroughTabId: params?.get("tab") || undefined,
-		};
+		const pathPart = qIdx >= 0 ? hash.slice(0, qIdx) : hash;
+		const routeId = decodeURIComponent(pathPart.replace(/^#\/ext\/?/, ""));
+		const params: Record<string, string> = {};
+		if (qIdx >= 0) {
+			for (const [k, v] of new URLSearchParams(hash.slice(qIdx + 1))) params[k] = v;
+		}
+		return { view: "ext", extRouteId: routeId || undefined, extParams: params };
 	}
 	const sessionMatch = hash.match(/^#\/session\/([a-zA-Z0-9_-]+)$/i);
 	if (sessionMatch) {
@@ -151,6 +150,33 @@ export function setGoalDashboardRoute(
 	}
 }
 
+/**
+ * Slice C1 — serialize a pack deep-link to `#/ext/<routeId>?<encoded params>`
+ * (extension-host-phase2 §7 C1.2). Callers (pack-entrypoints `navigateToTarget`)
+ * pass an ALREADY paramKeys-filtered param map; this helper only encodes —
+ * packs never build the URL themselves. `routeId` and every key/value are
+ * `encodeURIComponent`-escaped. Mirrors `setHashRoute`'s replaceState behaviour.
+ */
+export function setExtRoute(routeId: string, params?: Record<string, unknown>, replace?: boolean): void {
+	const query = new URLSearchParams();
+	if (params) {
+		for (const [k, v] of Object.entries(params)) {
+			if (v === undefined || v === null) continue;
+			query.set(k, String(v));
+		}
+	}
+	const suffix = query.toString();
+	const newHash = `#/ext/${encodeURIComponent(routeId)}${suffix ? `?${suffix}` : ""}`;
+	if (window.location.hash !== newHash) {
+		if (replace) {
+			history.replaceState({}, "", newHash);
+			window.dispatchEvent(new HashChangeEvent("hashchange"));
+		} else {
+			window.location.hash = newHash;
+		}
+	}
+}
+
 export function canonicalizePathSessionRoute(sessionId: string): void {
 	const expectedPath = `/session/${sessionId}`;
 	const expectedHash = `#/session/${sessionId}`;
@@ -187,8 +213,6 @@ export function setHashRoute(view: RouteView, id?: string, replace?: boolean): v
 		newHash = "#/market";
 	} else if (view === "search") {
 		newHash = id ? `#/search?q=${encodeURIComponent(id)}` : "#/search";
-	} else if (view === "walkthrough") {
-		newHash = id ? `#/walkthrough?${id}` : "#/walkthrough";
 	} else if (view === "settings") {
 		if (id) {
 			// Compound id like "system/models" or "<uuid>/project" → emit as-is

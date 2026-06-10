@@ -1390,7 +1390,7 @@ interface GatePipelineNode {
 
 type DashboardSummaryGate = {
 	gateId: string;
-	status: "pending" | "passed" | "failed";
+	status: "pending" | "passed" | "failed" | "bypassed";
 	effectiveStatus?: "pending" | "passed" | "failed" | "running";
 	running?: boolean;
 	signalCount?: number;
@@ -1409,7 +1409,11 @@ function effectiveGateStatus(
 	if (summaryGate?.running) return "running";
 	const hasRunning = gs?.signals?.some(s => s.verification.status === "running");
 	if (hasRunning) return "running";
-	return gs?.status ?? summaryGate?.status ?? "pending";
+	const resolved = gs?.status ?? summaryGate?.status ?? "pending";
+	// A human-bypassed gate counts as resolved for pipeline display (the badge
+	// surfaces the distinct red treatment); the pipeline node vocabulary has no
+	// bypassed state, so map it onto passed here.
+	return resolved === "bypassed" ? "passed" : resolved;
 }
 
 /** Compute dependency depth for each workflow gate via BFS from roots. */
@@ -2015,7 +2019,6 @@ function renderMetaRows(goal: Goal): TemplateResult {
 						.statusFiles=${gs?.status ?? []}
 						.repos=${gs?.repos as any}
 						.loading=${!gs && !!branch}
-						.hideWalkthrough=${true}
 						.prState=${prStatus?.state}
 						.prUrl=${prStatus?.url}
 						.prNumber=${prStatus?.number}

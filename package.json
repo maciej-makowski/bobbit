@@ -14,9 +14,10 @@
     "README.md"
   ],
   "scripts": {
-    "build:server": "tsc -p tsconfig.server.json && shx chmod +x dist/server/cli.js && shx rm -rf dist/server/defaults && node scripts/copy-defaults.mjs",
+    "build:server": "tsc -p tsconfig.server.json && shx chmod +x dist/server/cli.js && shx rm -rf dist/server/defaults && node scripts/copy-defaults.mjs && shx rm -rf dist/server/builtin-packs && node scripts/copy-builtin-packs.mjs",
     "build:ui": "vite build",
-    "build": "npm run build:server && npm run build:ui",
+    "build:packs": "node scripts/build-market-packs.mjs",
+    "build": "npm run build:packs && npm run build:server && npm run build:ui",
     "dev": "concurrently -n gw,ui -c blue,green \"node dist/server/cli.js --cwd . --no-ui\" \"vite\"",
     "dev:harness": "npm run build:server && concurrently -n harness,ui -c yellow,green \"node dist/server/harness.js -- --cwd . --no-ui\" \"vite\"",
     "dev:nord": "npm run build:server && node scripts/dev-nord.mjs",
@@ -76,7 +77,9 @@
     "@types/sortablejs": "^1.15.9",
     "@types/ws": "^8.5.14",
     "c8": "^11.0.0",
-    "concurrently": "^9.2.1",
+    "concurrently": "^10.0.3",
+    "esbuild": "^0.27.7",
+    "highlight.js": "^11.11.1",
     "knip": "^6.1.0",
     "rollup-plugin-visualizer": "^7.0.1",
     "shx": "^0.3.4",
