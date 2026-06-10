@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PI_AI_BEDROCK_HEADERS_PATCH_LABEL } from "./pi-ai-bedrock-headers-patch.js";
 import { DockerRuntime } from "./container-runtime/docker-runtime.js";
-import type { ContainerRuntime } from "./container-runtime/types.js";
+import type { ContainerRuntime, RuntimeId } from "./container-runtime/types.js";
 
 /**
  * Default runtime used when a caller doesn't inject one (preserves today's
@@ -18,6 +18,8 @@ const BEDROCK_UA_PATCH_LABEL = "bobbit.pi-ai-bedrock-ua-patch";
 export interface SandboxStatus {
 	available: boolean;
 	error?: string;
+	/** Identifier of the resolved container runtime ("docker" | "podman"). */
+	runtime?: RuntimeId;
 	dockerVersion?: string;
 	imageExists?: boolean;
 	dockerfileExists?: boolean;
@@ -138,7 +140,7 @@ export async function checkDockerAvailability(
 ): Promise<SandboxStatus> {
 	try {
 		const version = await runtime.getVersion();
-		const status: SandboxStatus = { available: true, dockerVersion: version };
+		const status: SandboxStatus = { available: true, runtime: runtime.id, dockerVersion: version };
 		if (imageName) {
 			if (await runtime.imageExists(imageName)) {
 				status.imageExists = true;
