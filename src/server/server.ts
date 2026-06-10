@@ -40,6 +40,9 @@ import { resolveWorktreeSupport } from "./agent/worktree-support.js";
 import { RoleStore } from "./agent/role-store.js";
 import { RoleManager } from "./agent/role-manager.js";
 import { ToolManager, copyDirRecursive, __resetToolScanCache } from "./agent/tool-manager.js";
+import { ActionDispatcher, ActionError, resolveActionToolManager } from "./extension-host/action-dispatcher.js";
+import { authorizeActionRequest, transcriptHasToolUse, type ActionGuardSession } from "./extension-host/action-guard.js";
+import { createServerHostApi } from "./extension-host/server-host-api.js";
 import { buildGateStatusSummary } from "./gate-status-summary.js";
 import { buildGateVerificationSnapshot, UnknownVerificationStepError } from "./gate-verification-snapshot.js";
 import {
@@ -198,7 +201,24 @@ import { isSandboxAllowed } from "./auth/sandbox-guard.js";
 import * as previewMount from "./preview/mount.js";
 import * as previewArtifacts from "./preview/artifacts.js";
 import { broadcastPreviewChanged, subscribePreviewChanged } from "./preview/events.js";
-import { configureAigw, removeAigw, getAigwUrl, discoverAigwModels, proxyRequest, startupAigwCheck, writeContextWindowOverrides, inferMeta } from "./agent/aigw-manager.js";
+import {
+	discoverAigwModels,
+	discoverGatewayModels,
+	proxyRequest,
+	startupAigwCheck,
+	writeContextWindowOverrides,
+	inferMeta,
+	listGateways,
+	getEnabledGateways,
+	getGatewayByName,
+	saveGateways,
+	migrateGatewayPrefs,
+	syncGatewaysModelsJson,
+	isClaudeId,
+	stripProviderPrefix,
+	type ModelGateway,
+	type AigwModel,
+} from "./agent/aigw-manager.js";
 import { writeOpenAIModelAdditions } from "./agent/openai-model-additions.js";
 import { ReviewAnnotationStore, type ReviewAnnotation } from "./review-annotation-store.js";
 import { getAvailableModels, discoverModelsForConfig, invalidateModelCache } from "./agent/model-registry.js";
@@ -276,6 +296,20 @@ function clampRoleThinking(value: unknown, modelStr: string | undefined): string
 	const modelId = modelStr.slice(slash + 1);
 	const meta = inferMeta(modelId);
 	return clampThinkingLevel(known, { id: modelId, provider, reasoning: meta.reasoning });
+}
+
+/**
+ * Shape a gateway's freshly-discovered models for an API response (the legacy
+ * configure/refresh/status shims + the per-gateway refresh/status endpoints).
+ * Mirrors what the model registry surfaces: an `aigw`-type gateway prefix-strips
+ * Claude ids and tags them `bedrock-converse-stream`; an `openai-compatible`
+ * gateway returns raw ids untouched (never Bedrock-routed, even for `claude-*`).
+ */
+function shapeGatewayModelsForDisplay(gateway: ModelGateway, models: AigwModel[]): AigwModel[] {
+	if (gateway.type !== "aigw") return models;
+	return models.map((m) =>
+		isClaudeId(m.id) ? { ...m, id: stripProviderPrefix(m.id), api: "bedrock-converse-stream" } : m,
+	);
 }
 
 async function deleteRemoteGoalBranches(
@@ -853,6 +887,10 @@ export function createGateway(config: GatewayConfig) {
 	const roleManager = new RoleManager(roleStore);
 	const toolManager = new ToolManager(configDir);
 	toolManager.generateDetailDocs(stateDir);
+	// Extension host (design docs/design/extension-host.md §4b): the action
+	// dispatcher lives for the gateway process lifetime; its module cache is
+	// dropped synchronously by invalidateResolverCaches() on pack mutations.
+	const actionDispatcher = new ActionDispatcher(toolManager);
 	const groupPolicyStore = new ToolGroupPolicyStore(configDir);
 	const sandboxTokenStore = new SandboxTokenStore();
 	const cookieStore = new CookieStore(stateDir);
@@ -1171,7 +1209,7 @@ export function createGateway(config: GatewayConfig) {
 			// Enable via BOBBIT_TIMING_LOG=1 to print "[timing] METHOD path ms" for each API call.
 			const _timingEnabled = process.env.BOBBIT_TIMING_LOG === "1";
 			const _timingStart = _timingEnabled ? performance.now() : 0;
-			await handleApiRoute(url, req, res, sessionManager, config, colorStore, prStatusStore, teamManager, roleManager, toolManager, projectContextManager, bgProcessManager, staffManager, verificationHarness, preferencesStore, projectConfigStore, groupPolicyStore, broadcastToGoal, broadcastToAll, sandboxManager, projectRegistry, configCascade, sandboxScope, sandboxTokenStore, reviewAnnotationStore, broadcastToSession, roleStore, inboxManager, prWalkthroughAgentManager, marketplaceSourceStore, marketplaceInstaller, cookieStore);
+			await handleApiRoute(url, req, res, sessionManager, config, colorStore, prStatusStore, teamManager, roleManager, toolManager, projectContextManager, bgProcessManager, staffManager, verificationHarness, preferencesStore, projectConfigStore, groupPolicyStore, broadcastToGoal, broadcastToAll, sandboxManager, projectRegistry, configCascade, sandboxScope, sandboxTokenStore, reviewAnnotationStore, broadcastToSession, roleStore, inboxManager, prWalkthroughAgentManager, marketplaceSourceStore, marketplaceInstaller, cookieStore, actionDispatcher);
 			if (_timingEnabled) {
 				const dur = performance.now() - _timingStart;
 				if (dur >= 100) console.log(`[timing] ${req.method} ${url.pathname}${url.search} ${dur.toFixed(1)}ms`);
@@ -1600,6 +1638,9 @@ export function createGateway(config: GatewayConfig) {
 			// Check internet and auto-configure AI Gateway if offline
 			// Runs before session restore so models.json is written before
 			// any agent subprocesses start.
+			// Migrate legacy single-URL aigw prefs → modelGateways list first
+			// (idempotent; startupAigwCheck also migrates internally).
+			migrateGatewayPrefs(preferencesStore);
 			await startupAigwCheck(preferencesStore);
 			writeContextWindowOverrides();
 			writeOpenAIModelAdditions();
@@ -2217,10 +2258,12 @@ async function handleApiRoute(
 	marketplaceSourceStore?: MarketplaceSourceStore,
 	marketplaceInstaller?: MarketplaceInstaller,
 	cookieStore?: CookieStore,
+	actionDispatcher?: ActionDispatcher,
 ) {
 	// These are always wired by the sole caller; the optional markers are only to avoid
 	// touching every existing signature site.
 	const serverRoleStore = roleStore!;
+	const dispatcher = actionDispatcher!;
 	/** Serialize a cascade-resolved item with origin/overrides + market-pack tags (design §5.2). */
 	const withOrigin = (r: { item: Record<string, unknown>; origin: unknown; overrides?: unknown; originPackId?: string | null; originPackName?: string | null }): Record<string, unknown> => ({
 		...r.item,
@@ -2236,7 +2279,7 @@ async function handleApiRoute(
 	// marketplace pack-list mutation (design §9.1 / finding #1) so newly
 	// installed/updated/removed market-pack tool roots are re-scanned (Windows
 	// coarse-mtime can otherwise serve a stale scan after a re-copy update).
-	const invalidateResolverCaches = (): void => { invalidateSlashSkillsCache(); __resetToolScanCache(); };
+	const invalidateResolverCaches = (): void => { invalidateSlashSkillsCache(); __resetToolScanCache(); dispatcher.invalidate(); };
 	const json = (data: unknown, status = 200) => {
 		res.writeHead(status, { "Content-Type": "application/json" });
 		res.end(JSON.stringify(data));
@@ -2433,7 +2476,7 @@ async function handleApiRoute(
 			status: "ok",
 			sessions: sessionManager.listSessions().length,
 			localhost: isLocalhost,
-			aigw: !!getAigwUrl(preferencesStore),
+			aigw: getEnabledGateways(preferencesStore).length > 0,
 			setupComplete: isSetupComplete(),
 			orphanedTranscripts: sessionManager.orphanedTranscriptsCount,
 		});
@@ -5159,6 +5202,143 @@ async function handleApiRoute(
 		return null;
 	}
 
+	// GET /api/tools/:tool/renderer — serve a PACK tool's pre-built ESM renderer
+	// module bytes (design docs/design/extension-host.md §4a). Admin-bearer ONLY
+	// (enforced before handleApiRoute): serving the module bytes is a static-asset-
+	// equivalent, NOT a capability invocation, so there is deliberately NO
+	// allowedTools check here (that gate is on the ACTION endpoint below). The
+	// renderer file path is re-validated to stay within the tool's group dir.
+	const rendererMatch = url.pathname.match(/^\/api\/tools\/([^/]+)\/renderer$/);
+	if (rendererMatch && req.method === "GET") {
+		const tool = decodeURIComponent(rendererMatch[1]);
+		// Resolve through the PROJECT-scoped tool manager when a projectId is given
+		// (design §4b — same `?? toolManager` fallback as GET /api/tools): a pack
+		// installed at PROJECT scope, or one that shadows a same-named global tool,
+		// must serve the PROJECT winner — never the split-brain server-level one.
+		const rendererProjectId = url.searchParams.get("projectId") || undefined;
+		const rendererTm = resolveActionToolManager(
+			toolManager,
+			rendererProjectId ? projectContextManager.getOrCreate(rendererProjectId)?.toolManager : undefined,
+		);
+		// Resolve the WINNING tool's on-disk location independent of `provider:`
+		// (design §4b — a pack renderer needs no provider). resolveToolLocation
+		// honors the same pack precedence as every other tool resolution.
+		const loc = rendererTm.resolveToolLocation(tool);
+		if (!loc || loc.rendererKind !== "pack" || !loc.rendererFile || !loc.baseDir) {
+			json({ error: "no pack renderer for this tool" }, 404);
+			return;
+		}
+		const groupAbs = path.join(loc.baseDir, loc.groupDir || "");
+		const fileAbs = path.resolve(groupAbs, loc.rendererFile);
+		// Path-traversal re-validation: fileAbs must stay within the group dir.
+		const rel = path.relative(groupAbs, fileAbs);
+		if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+			json({ error: "invalid renderer path" }, 404);
+			return;
+		}
+		let source: string;
+		try {
+			source = fs.readFileSync(fileAbs, "utf-8");
+		} catch {
+			json({ error: "renderer module not found" }, 404);
+			return;
+		}
+		res.writeHead(200, { "Content-Type": "text/javascript", "Cache-Control": "no-cache" });
+		res.end(source);
+		return;
+	}
+
+	// POST /api/tools/:tool/actions/:action — invoke a pack tool's server action
+	// handler (design §4b / §5). The LLM can curl this directly, so the
+	// allowedTools guard here — NOT the agent layer — is the real gate (§5 i).
+	const actionMatch = url.pathname.match(/^\/api\/tools\/([^/]+)\/actions\/([^/]+)$/);
+	if (actionMatch && req.method === "POST") {
+		const tool = decodeURIComponent(actionMatch[1]);
+		const action = decodeURIComponent(actionMatch[2]);
+		const body = (await readBody(req)) ?? {};
+		const headerSessionId = req.headers["x-bobbit-session-id"] as string | string[] | undefined;
+		// Resolve the tool through the SESSION's project-scoped tool manager (design
+		// §4b): the project is derived from the session, NOT from the client, so a
+		// project-scope pack (or a project pack shadowing a global tool) dispatches
+		// the SAME winner the session's tool resolution sees — no split-brain. The
+		// header session id is the canonical identity (the guard rejects a body/header
+		// mismatch or unknown session); resolving from it before the guard is safe
+		// because an invalid session falls back to the server-level manager and the
+		// guard then rejects the request anyway.
+		const actionHeaderSid = Array.isArray(headerSessionId) ? headerSessionId[0] : headerSessionId;
+		const actionSessionProjectId = actionHeaderSid
+			? (sessionManager.getSession(actionHeaderSid)?.projectId
+				?? sessionManager.getPersistedSession(actionHeaderSid)?.projectId)
+			: undefined;
+		const sessionToolManager = resolveActionToolManager(
+			toolManager,
+			actionSessionProjectId ? projectContextManager.getOrCreate(actionSessionProjectId)?.toolManager : undefined,
+		);
+		const info = sessionToolManager.getToolByName(tool);
+
+		// Resolve a session's allowlist (live preferred, else persisted).
+		const resolveSession = (id: string): ActionGuardSession | undefined => {
+			const live = sessionManager.getSession(id);
+			if (live) return { allowedTools: live.allowedTools };
+			const persisted = sessionManager.getPersistedSession(id);
+			if (persisted) return { allowedTools: persisted.allowedTools };
+			return undefined;
+		};
+		// Verify the toolUseId exists in the HEADER-BOUND session's transcript and
+		// was a call of :tool (anti-replay/forgery; §5 iii / iii-b).
+		const verifyToolUse = async (sid: string, toolUseId: string, t: string): Promise<boolean> => {
+			const ps = sessionManager.getPersistedSession(sid);
+			if (!ps?.agentSessionFile) return false;
+			const fsCtx: SessionFsContext = { sandboxed: ps.sandboxed, projectId: ps.projectId };
+			const content = await sessionFileRead(fsCtx, ps.agentSessionFile, sandboxManager);
+			return transcriptHasToolUse(content, toolUseId, t);
+		};
+
+		const guard = await authorizeActionRequest({
+			tool,
+			action,
+			headerSessionId,
+			bodySessionId: (body as { sessionId?: unknown }).sessionId,
+			toolUseId: (body as { toolUseId?: unknown }).toolUseId,
+			resolveSession,
+			actionNames: info?.actionNames,
+			verifyToolUse,
+		});
+		if (!guard.ok) {
+			json({ error: guard.error }, guard.status);
+			return;
+		}
+		// The tool must actually declare an actions module (checked after authz so
+		// an unauthorized caller never learns whether the tool has actions).
+		if (!info?.hasActions) {
+			json({ error: `tool "${tool}" has no actions` }, 404);
+			return;
+		}
+
+		const toolUseId = (body as { toolUseId: string }).toolUseId;
+		const args = (body as { args?: unknown }).args;
+		// The durable v1 Host API has NO gateway.fetch / raw passthrough: the action
+		// endpoint is same-origin and built here, so there is no caller-supplied URL
+		// or Authorization header to sanitize. `ctx.host` carries only the bound
+		// identity (+ frozen Phase-2 stubs).
+		const host = createServerHostApi({
+			sessionId: guard.sessionId,
+			toolUseId,
+		});
+		const start = Date.now();
+		try {
+			const result = await dispatcher.dispatch(tool, action, { host, sessionId: guard.sessionId, toolUseId, tool }, args, sessionToolManager);
+			console.log(`[ext-action] tool=${tool} action=${action} session=${guard.sessionId} toolUseId=${toolUseId} caller=${guard.sessionId} outcome=ok durationMs=${Date.now() - start}`);
+			json(result ?? null);
+		} catch (err) {
+			const status = err instanceof ActionError ? err.status : 500;
+			const message = err instanceof Error ? err.message : String(err);
+			console.warn(`[ext-action] tool=${tool} action=${action} session=${guard.sessionId} toolUseId=${toolUseId} caller=${guard.sessionId} outcome=error(${status}) durationMs=${Date.now() - start}: ${message}`);
+			json({ error: message }, status);
+		}
+		return;
+	}
+
 	// POST /api/tools/:name/customize — copy tool group to a target scope
 	const toolCustomizeMatch = url.pathname.match(/^\/api\/tools\/([^/]+)\/customize$/);
 	if (toolCustomizeMatch && req.method === "POST") {
@@ -5881,53 +6061,51 @@ async function handleApiRoute(
 		return;
 	}
 
-	// ── AI Gateway ──
+	// ── AI Gateway(s) — multi-gateway provider management ──
+	//
+	// Canonical list-management surface (§6 of docs/design/multi-gateway-providers.md):
+	//   GET  /api/aigw/gateways                 → full list (incl. disabled)
+	//   PUT  /api/aigw/gateways                 → replace whole list (validate + sync)
+	//   POST /api/aigw/test                     → discover a URL without saving
+	//   POST /api/aigw/gateways/:name/refresh   → re-discover one gateway + re-sync
+	//   GET  /api/aigw/gateways/:name/status    → per-gateway status + models
+	// Plus backward-compat shims (single-URL era) so existing clients/tests survive:
+	//   GET /api/aigw/status, POST/DELETE /api/aigw/configure, POST /api/aigw/refresh.
+	// Proxy: /api/aigw/:name/v1/* (named) and legacy /api/aigw/v1/* live further below.
 
-	// GET /api/aigw/status — check if aigw is configured
-	if (url.pathname === "/api/aigw/status" && req.method === "GET") {
-		const aigwUrl = getAigwUrl(preferencesStore);
-		if (!aigwUrl) {
-			json({ configured: false });
-		} else {
-			// Discover fresh models instead of reading from preferences cache
-			try {
-				const models = await discoverAigwModels(aigwUrl);
-				json({ configured: true, url: aigwUrl, models });
-			} catch {
-				json({ configured: true, url: aigwUrl, models: [] });
-			}
-		}
+	// GET /api/aigw/gateways — full gateway list (including disabled rows).
+	if (url.pathname === "/api/aigw/gateways" && req.method === "GET") {
+		json({ gateways: listGateways(preferencesStore) });
 		return;
 	}
 
-	// POST /api/aigw/configure — set aigw URL, discover models, write models.json
-	if (url.pathname === "/api/aigw/configure" && req.method === "POST") {
+	// PUT /api/aigw/gateways — replace the whole gateway list, then re-sync
+	// models.json. saveGateways validates (§1) and throws on any violation → 400.
+	if (url.pathname === "/api/aigw/gateways" && req.method === "PUT") {
 		const body = await readBody(req);
-		if (!body?.url || typeof body.url !== "string") {
-			json({ error: "Missing 'url' field" }, 400);
+		const rows = body?.gateways;
+		if (!Array.isArray(rows)) {
+			json({ error: "Missing 'gateways' array" }, 400);
 			return;
 		}
 		try {
-			const models = await configureAigw(body.url, preferencesStore);
+			saveGateways(preferencesStore, rows as ModelGateway[]);
+		} catch (err: any) {
+			json({ error: err?.message || "Invalid gateways" }, 400);
+			return;
+		}
+		try {
+			const modelsByGateway = await syncGatewaysModelsJson(preferencesStore);
 			invalidateModelCache();
 			broadcastPreferencesChanged();
-			json({ ok: true, models });
+			json({ gateways: listGateways(preferencesStore), modelsByGateway });
 		} catch (err: any) {
-			jsonError(502, err, { error: `Failed to configure AI Gateway: ${err.message}` });
+			jsonError(502, err, { error: `Failed to sync gateways: ${err.message}` });
 		}
 		return;
 	}
 
-	// DELETE /api/aigw/configure — remove aigw config
-	if (url.pathname === "/api/aigw/configure" && req.method === "DELETE") {
-		removeAigw(preferencesStore);
-		invalidateModelCache();
-		broadcastPreferencesChanged();
-		json({ ok: true });
-		return;
-	}
-
-	// POST /api/aigw/test — test connection to a URL without saving
+	// POST /api/aigw/test — discover a URL's models without saving anything.
 	if (url.pathname === "/api/aigw/test" && req.method === "POST") {
 		const body = await readBody(req);
 		if (!body?.url || typeof body.url !== "string") {
@@ -5943,18 +6121,118 @@ async function handleApiRoute(
 		return;
 	}
 
-	// POST /api/aigw/refresh — re-discover models from the configured gateway
+	// POST /api/aigw/gateways/:name/refresh — re-discover ONE gateway + re-sync.
+	const gatewayRefreshMatch = url.pathname.match(/^\/api\/aigw\/gateways\/([^/]+)\/refresh$/);
+	if (gatewayRefreshMatch && req.method === "POST") {
+		const name = decodeURIComponent(gatewayRefreshMatch[1]);
+		const gw = getGatewayByName(preferencesStore, name);
+		if (!gw) {
+			json({ error: `Unknown gateway "${name}"` }, 404);
+			return;
+		}
+		try {
+			const raw = await discoverGatewayModels(gw);
+			await syncGatewaysModelsJson(preferencesStore);
+			invalidateModelCache();
+			broadcastPreferencesChanged();
+			json({ models: shapeGatewayModelsForDisplay(gw, raw) });
+		} catch (err: any) {
+			jsonError(502, err);
+		}
+		return;
+	}
+
+	// GET /api/aigw/gateways/:name/status — per-gateway "view models" affordance.
+	const gatewayStatusMatch = url.pathname.match(/^\/api\/aigw\/gateways\/([^/]+)\/status$/);
+	if (gatewayStatusMatch && req.method === "GET") {
+		const name = decodeURIComponent(gatewayStatusMatch[1]);
+		const gw = getGatewayByName(preferencesStore, name);
+		if (!gw) {
+			json({ configured: false });
+			return;
+		}
+		const meta = { configured: true, name: gw.name, url: gw.url, type: gw.type, enabled: gw.enabled };
+		try {
+			const raw = await discoverGatewayModels(gw);
+			json({ ...meta, models: shapeGatewayModelsForDisplay(gw, raw) });
+		} catch {
+			json({ ...meta, models: [] });
+		}
+		return;
+	}
+
+	// ── Backward-compat shims (single-URL era) ──
+
+	// GET /api/aigw/status — legacy: status of the singleton `aigw` gateway (or
+	// the first aigw-type gateway). { configured:false } when none exists.
+	if (url.pathname === "/api/aigw/status" && req.method === "GET") {
+		const gw = getGatewayByName(preferencesStore, "aigw")
+			?? listGateways(preferencesStore).find((g) => g.type === "aigw");
+		if (!gw) {
+			json({ configured: false });
+			return;
+		}
+		try {
+			const models = await discoverAigwModels(gw.url);
+			json({ configured: true, url: gw.url, models });
+		} catch {
+			json({ configured: true, url: gw.url, models: [] });
+		}
+		return;
+	}
+
+	// POST /api/aigw/configure {url} — legacy: upsert the singleton `aigw` gateway,
+	// discover + sync. Mirrors the old configureAigw return shape (Claude ids
+	// prefix-stripped + api=bedrock-converse-stream).
+	if (url.pathname === "/api/aigw/configure" && req.method === "POST") {
+		const body = await readBody(req);
+		if (!body?.url || typeof body.url !== "string") {
+			json({ error: "Missing 'url' field" }, 400);
+			return;
+		}
+		const normalizedUrl = body.url.replace(/\/+$/, "");
+		try {
+			// Discover first so an unreachable gateway yields a 502 (old behavior).
+			const raw = await discoverAigwModels(normalizedUrl);
+			const next = listGateways(preferencesStore).filter((g) => g.name !== "aigw");
+			next.unshift({ id: randomUUID(), name: "aigw", url: normalizedUrl, type: "aigw", enabled: true });
+			saveGateways(preferencesStore, next);
+			await syncGatewaysModelsJson(preferencesStore);
+			invalidateModelCache();
+			broadcastPreferencesChanged();
+			const gw = getGatewayByName(preferencesStore, "aigw")!;
+			json({ ok: true, models: shapeGatewayModelsForDisplay(gw, raw) });
+		} catch (err: any) {
+			jsonError(502, err, { error: `Failed to configure AI Gateway: ${err.message}` });
+		}
+		return;
+	}
+
+	// DELETE /api/aigw/configure — legacy: remove the `aigw` gateway + re-sync.
+	if (url.pathname === "/api/aigw/configure" && req.method === "DELETE") {
+		const next = listGateways(preferencesStore).filter((g) => g.name !== "aigw");
+		saveGateways(preferencesStore, next);
+		await syncGatewaysModelsJson(preferencesStore);
+		invalidateModelCache();
+		broadcastPreferencesChanged();
+		json({ ok: true });
+		return;
+	}
+
+	// POST /api/aigw/refresh — legacy: re-discover the `aigw` gateway + re-sync.
 	if (url.pathname === "/api/aigw/refresh" && req.method === "POST") {
-		const aigwUrl = getAigwUrl(preferencesStore);
-		if (!aigwUrl) {
+		const gw = getGatewayByName(preferencesStore, "aigw")
+			?? listGateways(preferencesStore).find((g) => g.type === "aigw");
+		if (!gw) {
 			json({ error: "No AI Gateway configured" }, 400);
 			return;
 		}
 		try {
-			const models = await configureAigw(aigwUrl, preferencesStore);
+			const raw = await discoverGatewayModels(gw);
+			await syncGatewaysModelsJson(preferencesStore);
 			invalidateModelCache();
 			broadcastPreferencesChanged();
-			json({ models });
+			json({ models: shapeGatewayModelsForDisplay(gw, raw) });
 		} catch (err: any) {
 			jsonError(502, err);
 		}
@@ -5988,17 +6266,15 @@ async function handleApiRoute(
 				}, 404);
 				return;
 			}
-			if (provider !== "aigw") {
+			// Is this provider one of the configured gateways? If not, fall back to
+			// the standard provider-key / direct test path.
+			const gw = getGatewayByName(preferencesStore, provider);
+			if (!gw) {
 				const result = await testModelPreference(preferencesStore, pref);
 				json(result, result.status || (result.ok ? 200 : 502));
 				return;
 			}
-			const aigwUrl = getAigwUrl(preferencesStore);
-			if (!aigwUrl) {
-				json({ ok: false, error: "No AI Gateway configured." });
-				return;
-			}
-			const baseUrl = aigwUrl.replace(/\/+$/, "");
+			const baseUrl = gw.url.replace(/\/+$/, "");
 			const chatUrl = baseUrl.endsWith("/v1") ? `${baseUrl}/chat/completions` : `${baseUrl}/v1/chat/completions`;
 
 			// The aigw registry strips the provider prefix (e.g. "aws/") from Claude
@@ -6057,13 +6333,36 @@ async function handleApiRoute(
 		return;
 	}
 
-	// Proxy: /api/aigw/v1/* → forward to configured aigw URL
-	if (url.pathname.startsWith("/api/aigw/v1/") && getAigwUrl(preferencesStore)) {
-		const aigwUrl = getAigwUrl(preferencesStore)!;
-		const subPath = url.pathname.replace("/api/aigw/v1/", "/v1/");
-		const targetUrl = `${aigwUrl}${subPath}${url.search}`;
-		proxyRequest(targetUrl, req, res);
-		return;
+	// Proxy by name: /api/aigw/:name/v1/* → <gateway.url>/v1/* for the named
+	// ENABLED gateway. The browser may not resolve the gateway host directly, so
+	// it routes model discovery / completions through here.
+	const namedProxyMatch = url.pathname.match(/^\/api\/aigw\/([^/]+)\/v1\/(.*)$/);
+	if (namedProxyMatch) {
+		const name = decodeURIComponent(namedProxyMatch[1]);
+		// `/api/aigw/v1/*` (legacy, name-less) is handled below — don't treat the
+		// literal "v1" segment as a gateway name.
+		if (name !== "v1") {
+			const gw = getGatewayByName(preferencesStore, name);
+			if (gw && gw.enabled) {
+				const targetUrl = `${gw.url.replace(/\/+$/, "")}/v1/${namedProxyMatch[2]}${url.search}`;
+				proxyRequest(targetUrl, req, res);
+				return;
+			}
+			// Unknown/disabled gateway — fall through to the 404 handler.
+		}
+	}
+
+	// Legacy proxy: /api/aigw/v1/* → the gateway named `aigw` (or, failing that,
+	// the first enabled gateway) for back-compat with the single-URL client.
+	if (url.pathname.startsWith("/api/aigw/v1/")) {
+		const named = getGatewayByName(preferencesStore, "aigw");
+		const gw = named && named.enabled ? named : getEnabledGateways(preferencesStore)[0];
+		if (gw) {
+			const subPath = url.pathname.replace("/api/aigw/v1/", "/v1/");
+			const targetUrl = `${gw.url.replace(/\/+$/, "")}${subPath}${url.search}`;
+			proxyRequest(targetUrl, req, res);
+			return;
+		}
 	}
 
 	// GET /api/roles/assistant/prompts — must come before :name route
