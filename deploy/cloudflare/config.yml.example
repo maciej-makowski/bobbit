@@ -1,14 +1,15 @@
 # Cloudflare Tunnel — locally-managed config template for Bobbit.
 #
-# Copy this file to ~/.config/cloudflared/config.yml on the HOST and replace
-# <TUNNEL_ID> with the UUID printed by `cloudflared tunnel create bobbit-z13`.
+# Copy this file to ~/.cloudflared/config.yml on the HOST (cloudflared's default
+# config path, also read by the host `cloudflared` CLI) and replace <TUNNEL_ID>
+# with the UUID printed by `cloudflared tunnel create bobbit-z13`.
 # (setup-tunnel.sh scaffolds this for you with your chosen hostname + port.)
-# Drop the matching credentials JSON next to it as
-# ~/.config/cloudflared/<TUNNEL_ID>.json. Neither the real config.yml nor the
-# credentials JSON is committed (see repo .gitignore); only this *.example is.
+# The matching credentials JSON is ALREADY written next to it by
+# `cloudflared tunnel create` as ~/.cloudflared/<TUNNEL_ID>.json — nothing to
+# copy. Neither the real config.yml nor the credentials JSON is in the repo.
 #
-# The cloudflared quadlet mounts ~/.config/cloudflared at /etc/cloudflared
-# (read-only), so paths below are the IN-CONTAINER paths.
+# The cloudflared quadlet mounts ~/.cloudflared at /etc/cloudflared
+# (read-only), so the paths below are the IN-CONTAINER paths.
 
 tunnel: <TUNNEL_ID>
 credentials-file: /etc/cloudflared/<TUNNEL_ID>.json
