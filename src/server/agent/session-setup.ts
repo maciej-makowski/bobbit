@@ -348,13 +348,12 @@ function _resolveBridgeOptions(plan: SessionSetupPlan, ctx: PipelineContext): vo
 		plan.bridgeOptions.cliPath = ctx.agentCliPath;
 	}
 
-	// Delegate-specific env
-	if (plan.delegateOf) {
-		plan.bridgeOptions.env = {
-			...plan.bridgeOptions.env,
-			BOBBIT_DELEGATE_OF: plan.delegateOf,
-		};
-	}
+	// NOTE: the legacy `BOBBIT_DELEGATE_OF` env var (the old delegate-recursion
+	// early-return guard in the agent extension) is intentionally NOT set here
+	// anymore. Recursion is now blocked by OrchestrationCore.assertCanSpawn +
+	// allowedTools subtraction (every spawn verb stripped from the child) — see
+	// docs/design/orchestration-core.md §7. The persisted `delegateOf` link
+	// (plan.delegateOf) is unchanged; only the env-var guard is removed.
 
 	// Wire tool manager for extension path resolution in RpcBridge
 	if (ctx.toolManager) {
@@ -672,6 +671,10 @@ export function persistOnce(session: SessionInfo, plan: SessionSetupPlan, store:
 		nonInteractive: plan.nonInteractive,
 		sandboxed: plan.sandboxed,
 		delegateOf: plan.delegateOf,
+		// Durable delegate task — restored into the system prompt on reboot so the
+		// delegate comes back live with its task intact (mirrors a worker's goal spec).
+		instructions: plan.instructions,
+		context: plan.context,
 		parentSessionId: plan.parentSessionId,
 		childKind: plan.childKind,
 		readOnly: plan.readOnly,
