@@ -1961,8 +1961,7 @@ Bobbit server                           /workspace        (repo clone, native Li
 All settings in `project.yaml` (Settings → Project → Docker Sandbox):
 
 ```yaml
-sandbox: "docker"                      # enable flag: "none" (default) or "docker"
-sandbox_runtime: "docker"              # provider: "docker" (default) or "podman" — see Container runtime abstraction
+sandbox: "docker"                      # "none" (default) or "docker"
 sandbox_image: "bobbit-agent"          # must be pre-built
 sandbox_tokens:
   - key: GITHUB_TOKEN
@@ -1973,43 +1972,6 @@ sandbox_mounts: '["/data/shared:/data:ro"]'  # bind mounts
 ```
 
 `sandbox_credentials`, `sandbox_github_token`, and `sandbox_host_token_overrides` are legacy fallbacks. New configuration should use structured `sandbox_tokens`, whose secret `value` fields are stored in `SecretsStore` rather than persisted inline in `project.yaml`.
-
-### Container runtime abstraction
-
-Sandboxing is gated by the `sandbox` **enable flag** (`"none" | "docker"`); *which* container CLI actually runs the containers is a **separate** choice, the `sandbox_runtime` **provider selector** (`"docker" | "podman"`). The two strings look alike but mean different things — `sandbox: "docker"` is the on/off switch, `sandbox_runtime` names the provider binary. Keeping them independent lets a project run the identical sandbox flows on Podman, with no `docker` binary on the host. (The rest of this page still says "Docker" for the common case; everything applies to whichever runtime is selected.)
-
-**Why a provider interface, not a binary-name string.** The first attempt simply threaded a `"docker" | "podman"` string to every call site and reused Docker's argument arrays verbatim, assuming the two CLIs are argument-for-argument identical. They are not, and the gaps leaked everywhere — most visibly, `docker info --format '{{.ServerVersion}}'` *throws* against Podman, whose `info` schema is nested. Threading a string meant every new difference became another `if (bin === "podman")` scattered across the codebase: it doesn't scale and is hard to test. The fix is a provider interface — one place per runtime that owns its own arg/template/quirk differences — so call sites stay runtime-agnostic. Full rationale and migration plan: [design/sandbox-runtime-abstraction.md](design/sandbox-runtime-abstraction.md).
-
-**The `ContainerRuntime` interface** (`src/server/agent/container-runtime/types.ts`) abstracts every container interaction the sandbox performs, grouped by capability:
-
-- **Diagnostics** — `getVersion()` (also the availability probe; throws an error naming the binary when the runtime is missing) and `getResourceLimits()` (daemon-reported CPU/mem, or `null` so the caller falls back to host sizing).
-- **Images** — `buildImage()`, `imageExists()`, `getImageLabel()`, `getImageId()`.
-- **Lifecycle** — `createContainer(spec)`, `findContainerByLabel()`, `isRunning()`, `getContainerImageId()`, `startContainer()`, `stopContainer()`, `removeContainer()`.
-- **Exec (two modes)** — `exec()` runs a one-shot command and captures output (the bulk of operations). `buildExecCommand()` is a *pure argv builder* that returns `{ file, args, env }` **without spawning**, for the streaming callers that need a live `ChildProcess`: the rpc-bridge agent process, bg-process-manager, and verification-harness (via `spawnTracked`). The runtime owns the binary plus `exec`-flag construction (`-i`/`-w`/`-u`/`-e`, MSYS shim); the caller keeps ownership of spawning, stdio piping, and the kill-tree. The split is deliberate — an `async` method cannot hand back a `ChildProcess`, and centralising the spawn would force `spawnTracked` (and its "never `spawn({ timeout })`" rule) inside the runtime.
-- **Files** — `copyToContainer()`.
-- **Volumes & networks** — `removeVolume()`, `createNetwork()`, `removeNetwork()`.
-
-**Implementations** live in `src/server/agent/container-runtime/`:
-
-- `BaseCliRuntime` holds everything identical across docker-style CLIs: the `execFile` wrapper with cpu-diagnostics instrumentation, the `MSYS_NO_PATHCONV`/`MSYS2_ARG_CONV_EXCL` shim (suppresses Git-Bash path mangling on Windows), and every argument array that does not vary — `exec`, `cp`, `build`, `start`/`stop`/`rm`, `volume rm`, `network create`/`rm`, `ps --filter`, and the container/image `inspect` templates. Those `inspect` templates (`.State.Running`, `.Image`, `.Id`, `Config.Labels`) are **Docker-API-compatible in Podman**, so they are shared rather than overridden.
-- `DockerRuntime` and `PodmanRuntime` each `extend BaseCliRuntime` and override only what genuinely differs. The deltas are confined to two areas:
-  - **`info --format` schema.** Docker flattens fields (`{{.ServerVersion}}`, `{{.NCPU}}`, `{{.MemTotal}}`); Podman nests them (`{{.Version.Version}}`, `{{.Host.CPUs}}`, `{{.Host.MemTotal}}`). Running Docker's template against Podman throws — exactly the "podman not available" failure the binary-swap approach shipped, and the classic Podman gotcha to remember when diagnosing availability errors.
-  - **`run` args.** *Host-gateway:* Docker emits `--add-host=host.docker.internal:host-gateway`; Podman provides `host.containers.internal` natively and *also* maps the Docker name, so agent tooling that hardcodes `host.docker.internal` keeps working. *SELinux:* Podman appends `:Z` (private relabel) to relabel-eligible bind mounts so a rootless/SELinux host can write into them; Docker ignores relabel flags entirely. *Network:* Docker disables inter-container comms with `--opt com.docker.network.bridge.enable_icc=false`, an opt Podman rejects, so it is omitted. A shared serializer (`serializeContainerRunSpec`) fixes the run-arg skeleton order and delegates only these differences to per-runtime `RunArgHooks`; `buildDockerRunArgs` (in `docker-args.ts`) is the Docker serialization of the same spec and its byte-for-byte output is pinned by a test so Docker behaviour never drifts.
-
-`PodmanRuntime` is validated against rootless podman 5.8.2.
-
-**Factory and wiring.** `createContainerRuntime(id)` maps a `RuntimeId` to an instance; `resolveContainerRuntime(store)` reads `ProjectConfigStore.getSandboxRuntime()` and **never throws** — an unknown, empty, or missing value resolves to Docker, preserving today's behaviour. `SessionManager` resolves the runtime once per project and threads the *instance* (not a binary string) into `ProjectSandbox`, the rpc-bridge options, and bg-process wiring. Server-side git-panel helpers (commit/push/status/diff) only have a `containerId` in scope, not the project's runtime, so `ProjectSandbox` registers a `containerId → runtime` mapping in a small registry that `runtimeForContainerId()` / `runtimeForContainerIdOrDocker()` look up (Docker fallback for unregistered ids). End state: no `=== "podman"` branch exists anywhere outside the implementation files — `rg '"docker"' src/server` shows only the `DockerRuntime` impl, the `sandbox` enable-flag comparisons, and the `docker/Dockerfile` build-context path.
-
-**Configuration recap.** Set both keys in `project.yaml`:
-
-```yaml
-sandbox: "docker"            # enable flag: "none" (default) | "docker"
-sandbox_runtime: "podman"    # provider:    "docker" (default) | "podman"
-```
-
-`getSandboxRuntime()` is the only reader (lower-cases and trims the value, falling back to `docker`). There is no Settings UI for `sandbox_runtime` yet — it is config-file only; a later goal can surface a provider dropdown with a browser E2E.
-
-**Out of scope (first cut):** rootless-Podman edge cases beyond the `:Z` relabel and host-gateway mapping above, remote daemon/socket transports, nerdctl, and podman-machine provisioning. These land as fast-follows if real-Podman use surfaces them — the point of the interface is that each one is a change confined to `PodmanRuntime`, not a new conditional sprinkled across the codebase.
 
 ### Docker image
 
