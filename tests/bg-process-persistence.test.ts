@@ -84,6 +84,15 @@ function makeHarness(opts?: { env?: Partial<BgEnv>; stateDir?: string }): Harnes
 		tailerFactory,
 		env,
 	);
+	// restoreOne()'s bounded pidfile-retry sleeps on an UNREF'd real timer (deliberate
+	// prod hygiene: a pending restore must never keep the gateway alive). Under the
+	// unit runner's `--test-force-exit`, real wall-time on that await both drains the
+	// loop mid-await (node:test then cancels the suite: "Promise resolution is still
+	// pending but the event loop has already resolved") and slows the file enough to
+	// race the force-exit, truncating later suites. The retry semantics need no real
+	// time in tests — the pidfile/liveness state is set up synchronously — so make the
+	// sleep instant. (Production source stays byte-identical to upstream.)
+	(mgr as unknown as { sleep: (ms: number) => Promise<void> }).sleep = () => Promise.resolve();
 
 	const h: Harness = {
 		stateDir,
