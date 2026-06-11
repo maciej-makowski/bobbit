@@ -36,6 +36,8 @@
 // the resource/crash isolation.
 
 import { Worker } from "node:worker_threads";
+import { createRequire } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { ActionError, type ActionHandlerCtx } from "./action-dispatcher.js";
 
 export interface ModuleHostOptions {
@@ -106,6 +108,35 @@ function workerSafeExecArgv(argv: readonly string[]): string[] {
 	return out;
 }
 
+/** Locate tsx's programmatic `register()` API (`tsx/esm/api`) by ANCHORING on the
+ *  tsx loader path tsx injected into `process.execArgv`. Anchoring there — rather
+ *  than a bare `import "tsx/esm/api"` — is what makes it resolvable when tsx lives
+ *  ONLY in the npx cache (the unit-CI case: `npx tsx`, with tsx absent from the
+ *  project `node_modules`). Returns a `file:` URL to import inside the worker eval
+ *  shim, or `undefined` when no tsx loader flag is present (not running under tsx —
+ *  the packaged `.js` worker path is used instead). */
+function resolveTsxApiUrl(): string | undefined {
+	const argv = process.execArgv;
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i];
+		const val = a.startsWith("--import=")
+			? a.slice("--import=".length)
+			: a.startsWith("--require=")
+				? a.slice("--require=".length)
+				: a === "--import" || a === "--require" || a === "-r"
+					? argv[i + 1]
+					: undefined;
+		if (!val || !/[\\/]tsx[\\/]/.test(val)) continue;
+		try {
+			const anchor = val.startsWith("file:") ? fileURLToPath(val) : val;
+			return pathToFileURL(createRequire(anchor).resolve("tsx/esm/api")).href;
+		} catch {
+			/* not resolvable from this flag — try the next loader flag */
+		}
+	}
+	return undefined;
+}
+
 /** Methods the worker is permitted to proxy back to the parent host. A worker can
  *  ONLY drive these exact `host.<ns>.<method>` calls — never arbitrary property
  *  access on the live host object (no `constructor`, no prototype walk). */
@@ -160,11 +191,35 @@ export class ModuleHost {
 		this.stackSizeMb = opts.stackSizeMb ?? 4;
 	}
 
-	/** Resolve the worker bootstrap sibling with the SAME extension as THIS module
-	 *  (`.js` compiled in dist; `.ts` under the tsx unit runner). */
-	private bootstrapUrl(): URL {
-		const ext = import.meta.url.endsWith(".ts") ? ".ts" : ".js";
-		return new URL(`./module-host-bootstrap${ext}`, import.meta.url);
+	/** Build the `new Worker` entry + option overrides for the bootstrap.
+	 *
+	 *  Packaged build (THIS module is `.js`): load the sibling compiled
+	 *  `module-host-bootstrap.js` directly; `execArgv` is empty (plain node, no
+	 *  loaders) so the worker runs the real compiled `.js` module graph.
+	 *
+	 *  tsx dev/test runtime (THIS module is `.ts`): Node's `Worker` inherits tsx's
+	 *  transpile (LOAD) hook — enough to RUN the `.ts` bootstrap entry — but NOT
+	 *  tsx's `.js`→`.ts` RESOLVE hook, so the bootstrap's nested imports
+	 *  (`./confinement-loader.js`, `./path-guard.js`, and the pack module) fail with
+	 *  ERR_MODULE_NOT_FOUND. So we boot via a tiny `eval` shim that explicitly
+	 *  installs tsx's FULL hooks in the worker (`tsx/esm/api` `register()`) BEFORE it
+	 *  dynamic-imports the `.ts` bootstrap. tsx is resolved from the loader path tsx
+	 *  injected into `process.execArgv` (see `resolveTsxApiUrl`), so it works whether
+	 *  tsx lives in the project `node_modules` or only the npx cache (CI). If tsx
+	 *  cannot be located (it always can under the tsx runtime), fall back to loading
+	 *  the `.ts` directly with the inherited loader flags. This branch is DEAD in any
+	 *  packaged/CI runtime build (plain node runs the `.js` path above). */
+	private bootstrapWorkerArgs(): { entry: string | URL; execArgv: string[]; eval: boolean } {
+		if (!import.meta.url.endsWith(".ts")) {
+			return { entry: new URL("./module-host-bootstrap.js", import.meta.url), execArgv: workerSafeExecArgv(process.execArgv), eval: false };
+		}
+		const apiUrl = resolveTsxApiUrl();
+		if (!apiUrl) {
+			return { entry: new URL("./module-host-bootstrap.ts", import.meta.url), execArgv: workerSafeExecArgv(process.execArgv), eval: false };
+		}
+		const bootUrl = new URL("./module-host-bootstrap.ts", import.meta.url).href;
+		const shim = `import { register } from ${JSON.stringify(apiUrl)};\nregister();\nawait import(${JSON.stringify(bootUrl)});\n`;
+		return { entry: shim, execArgv: [], eval: true };
 	}
 
 	/**
@@ -195,7 +250,8 @@ export class ModuleHost {
 			},
 		};
 
-		const worker = new Worker(this.bootstrapUrl(), {
+		const boot = this.bootstrapWorkerArgs();
+		const worker = new Worker(boot.entry, {
 			// No `env` option: the worker inherits a full copy of the gateway env
 			// (full-env parity — trusted pack code is the tool/MCP tier).
 			//
@@ -211,10 +267,11 @@ export class ModuleHost {
 				maxOldGenerationSizeMb: this.maxOldGenerationSizeMb,
 				stackSizeMb: this.stackSizeMb,
 			},
-			// Forward ONLY the Worker-safe loader flags (drops node:test / process-level
-			// flags that `new Worker` rejects) so the worker transpiles TS under the tsx
-			// unit runner; empty in production (no loaders).
-			execArgv: workerSafeExecArgv(process.execArgv),
+			// Production (.js): forward ONLY the Worker-safe loader flags (empty in a
+			// packaged build). tsx dev/test (.ts): an `eval` shim that register()s tsx in
+			// the worker (execArgv empty) — see bootstrapWorkerArgs.
+			eval: boot.eval,
+			execArgv: boot.execArgv,
 		});
 		const children = new Set<number>();
 		this.live.set(worker, children);
