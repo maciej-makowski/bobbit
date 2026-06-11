@@ -1960,7 +1960,7 @@ Bobbit server                           /workspace        (repo clone, native Li
 
 ### Configuration
 
-All settings in `project.yaml` (Settings → Project → Docker Sandbox):
+All settings live in `project.yaml`; the common ones are also editable from the **Container Sandbox** section of Project Settings (including the **Container Runtime** dropdown described below):
 
 ```yaml
 sandbox: "docker"                      # enable flag: "none" (default) or "docker"
@@ -2009,7 +2009,11 @@ sandbox: "docker"            # enable flag: "none" (default) | "docker"
 sandbox_runtime: "podman"    # provider:    "docker" (default) | "podman"
 ```
 
-`getSandboxRuntime()` is the only reader (lower-cases and trims the value, falling back to `docker`). There is no Settings UI for `sandbox_runtime` yet — it is config-file only; a later goal can surface a provider dropdown with a browser E2E.
+`getSandboxRuntime()` is the only reader (lower-cases and trims the value, falling back to `docker`).
+
+**Selecting the runtime in the UI.** Project Settings → **Container Sandbox** surfaces a **Container Runtime** dropdown (Docker / Podman) directly below the **Sandbox Mode** selector, wired to `sandbox_runtime` through the generic `PUT /api/projects/:id/config` save flow — no hand-editing of `project.yaml` required (`renderSandboxSection` in `src/app/settings-page.ts`). Default/absent renders **Docker** selected. The dropdown is *relevance-gated*: it is always visible but disabled and greyed (with an "Applies when Sandbox Mode is enabled" hint) unless Sandbox Mode is `docker`, since the runtime choice is moot when sandboxing is off. The UI only reads/writes the `sandbox_runtime` string and lists the two options — there is no `=== "podman"` behaviour in the UI; all runtime behaviour stays behind `ContainerRuntime`.
+
+**Runtime-aware status display.** `GET /api/sandbox-status` resolves the project's runtime via `resolveContainerRuntime(projectConfigStore)` and includes a `runtime` field (`runtime.id`, `"docker" | "podman"`). The Settings status row reflects the *selected* runtime rather than a hardcoded "Docker": the availability probe (`checkDockerAvailability`) runs `getVersion()` against the chosen binary, the UI labels the line with the runtime's display name (e.g. "Podman available (v5.8.2)"), and the build-command hint shown when the image is missing uses the selected binary (`<runtime> build -t <image> docker/`). The section header and status row were generalized for this ("Docker Sandbox" → "Container Sandbox", "Docker Status" → "Runtime Status") so they read correctly under either runtime.
 
 **Out of scope (first cut):** rootless-Podman edge cases beyond the `:Z` relabel and host-gateway mapping above, remote daemon/socket transports, nerdctl, and podman-machine provisioning. These land as fast-follows if real-Podman use surfaces them — the point of the interface is that each one is a change confined to `PodmanRuntime`, not a new conditional sprinkled across the codebase.
 
