@@ -6,7 +6,7 @@ All deployment artifacts referenced here live in [`deploy/cloudflare/`](../deplo
 
 > **Follow the sections in order.** Section 2 (edge TLS) and Section 3 (host Node) are the two most likely failure points and must be settled **before** you touch any of the plumbing.
 
-> **Prefer a guided install?** `npm run setup-cloudflare-tunnel` (Section 5) walks you through the host-side setup interactively — dependency checks, hostname/runtime/port prompts, scaffolding `~/.config/cloudflared/config.yml`, and installing the units — then prints the manual Cloudflare-panel steps. It surfaces the two key decisions below (edge TLS in Section 2, host Node in Section 3) as prompts/warnings rather than deciding for you, so read those sections first.
+> **Prefer a guided install?** `npm run setup-cloudflare-tunnel` (Section 5) walks you through the host-side setup interactively — dependency checks, hostname/runtime/port prompts, scaffolding `~/.cloudflared/config.yml`, and installing the units — then prints the manual Cloudflare-panel steps. It surfaces the two key decisions below (edge TLS in Section 2, host Node in Section 3) as prompts/warnings rather than deciding for you, so read those sections first.
 
 ---
 
@@ -39,7 +39,7 @@ When `isLocalhostMode` is true the auth check is skipped; Bobbit just mints a co
 |---|---|---|
 | Bobbit gateway | host loopback `127.0.0.1:3001` | systemd `--user` unit ([`bobbit.service`](../deploy/cloudflare/bobbit.service)) |
 | `cloudflared` | rootless Podman, `Network=host` | quadlet ([`cloudflared.container`](../deploy/cloudflare/cloudflared.container)) → generated `cloudflared.service` |
-| Tunnel ingress | `~/.config/cloudflared/config.yml` (uncommitted) | from [`config.yml.example`](../deploy/cloudflare/config.yml.example) |
+| Tunnel ingress | `~/.cloudflared/config.yml` (uncommitted) | from [`config.yml.example`](../deploy/cloudflare/config.yml.example) |
 
 Both services start at boot and survive logout because `setup.sh` enables **linger** (`loginctl enable-linger`).
 
@@ -145,13 +145,12 @@ These six steps touch live Cloudflare state and/or place secrets, so they are pe
    cloudflared tunnel route dns bobbit-z13 <HOSTNAME>
    ```
 4. **Create the Access application** (this is the authentication layer): Zero Trust dashboard → **Access → Applications** → **Add an application** → **Self-hosted**, with the application domain set to `<HOSTNAME>`. Add an **allow policy** scoped to your identity (e.g. an *Emails* rule listing the owner email). Without this policy, anyone who can reach the hostname would reach Bobbit, which has no auth of its own.
-5. **Drop the real config + credentials into `~/.config/cloudflared/`** (these are **uncommitted** — the repo `.gitignore` keeps `config.yml`/`*.json` out of git):
+5. **Put the config in `~/.cloudflared/`** (cloudflared's default dir — the credentials JSON `tunnel create` wrote in step 2 is **already there**, so there is nothing to copy or re-perm):
    ```bash
-   cp deploy/cloudflare/config.yml.example ~/.config/cloudflared/config.yml
+   cp deploy/cloudflare/config.yml.example ~/.cloudflared/config.yml
    # Edit config.yml: set tunnel + credentials-file <TUNNEL_ID>, and hostname = <HOSTNAME>.
-   cp ~/.cloudflared/<TUNNEL_ID>.json ~/.config/cloudflared/<TUNNEL_ID>.json
    ```
-   The `credentials-file` path inside `config.yml` is the **in-container** path (`/etc/cloudflared/<TUNNEL_ID>.json`), because the quadlet mounts `~/.config/cloudflared` at `/etc/cloudflared` read-only. Keep `service: http://127.0.0.1:3001` pinned to `127.0.0.1` (not `localhost`/`::1`) to avoid flaky IPv6 resolution between `cloudflared` and Bobbit.
+   The `credentials-file` path inside `config.yml` is the **in-container** path (`/etc/cloudflared/<TUNNEL_ID>.json`), because the quadlet mounts `~/.cloudflared` at `/etc/cloudflared` read-only. Keep `service: http://127.0.0.1:3001` pinned to `127.0.0.1` (not `localhost`/`::1`) to avoid flaky IPv6 resolution between `cloudflared` and Bobbit.
 6. **Run the non-interactive installer** (Section 5), which places the units and starts both services.
 
 ---
@@ -160,7 +159,7 @@ These six steps touch live Cloudflare state and/or place secrets, so they are pe
 
 There are two entry points, both **host-only** (they refuse to run inside a toolbox):
 
-- **`npm run setup-cloudflare-tunnel`** — the **recommended** interactive installer ([`setup-tunnel.sh`](../deploy/cloudflare/setup-tunnel.sh)). It guides you through the host-side setup, scaffolds `~/.config/cloudflared/config.yml`, installs the units (by delegating to `setup.sh`), and prints the remaining manual Cloudflare-panel steps.
+- **`npm run setup-cloudflare-tunnel`** — the **recommended** interactive installer ([`setup-tunnel.sh`](../deploy/cloudflare/setup-tunnel.sh)). It guides you through the host-side setup, scaffolds `~/.cloudflared/config.yml`, installs the units (by delegating to `setup.sh`), and prints the remaining manual Cloudflare-panel steps.
 - **`setup.sh`** — the lower-level, non-interactive engine ([`setup.sh`](../deploy/cloudflare/setup.sh)) that actually renders and installs the units. The interactive command calls it under the hood; you can also run it directly if you would rather hand-manage `config.yml`.
 
 Both are **idempotent** — safe to re-run at any time.
@@ -195,9 +194,9 @@ What it does, in order:
 
    Any prompt whose env var is already set is **skipped** (the value is echoed as "from env"). Pass **`--yes`** / **`-y`** (or `ASSUME_DEFAULTS=1`) to accept every default without prompting, and **`--help`** / **`-h`** to print usage and exit with no side effects.
 3. **Warns on a 2nd-level subdomain.** If the hostname looks like a 2nd-level (or deeper) name — the free Universal SSL caveat from Section 2 — it prints the warning and asks you to confirm before continuing (declining aborts). Non-interactively the warning is advisory only.
-4. **Scaffolds `~/.config/cloudflared/config.yml`** from [`config.yml.example`](../deploy/cloudflare/config.yml.example) with your chosen hostname and port substituted, leaving `<TUNNEL_ID>` as a placeholder (the tunnel does not exist yet). If a `config.yml` already exists it prompts before overwriting.
+4. **Scaffolds `~/.cloudflared/config.yml`** from [`config.yml.example`](../deploy/cloudflare/config.yml.example) with your chosen hostname and port substituted, leaving `<TUNNEL_ID>` as a placeholder (the tunnel does not exist yet). If a `config.yml` already exists it prompts before overwriting.
 5. **Installs the units by delegating to `setup.sh`**, passing your answers through as `CHECKOUT_DIR`, `BOBBIT_CWD`, `NODE_BIN_DIR`, `RUNTIME`, `TOOLBOX_CONTAINER`, and `PORT`. `setup.sh` performs the authoritative Node ≥ 20 probe (host or toolbox — see Section 3), renders the units, reloads systemd, enables linger, and starts both services.
-6. **Prints the remaining manual Cloudflare-panel steps** (Section 4) — `tunnel login`, `create`, `route dns`, the **Access application** (panel-only), and wiring the credentials JSON + `<TUNNEL_ID>` into `config.yml`.
+6. **Prints the remaining manual Cloudflare-panel steps** (Section 4) — `tunnel login`, `create`, `route dns`, the **Access application** (panel-only), and setting `<TUNNEL_ID>` in `config.yml` (the credentials JSON is already in `~/.cloudflared` from `tunnel create`).
 7. **Optional, strictly opt-in:** if the `cloudflared` CLI is installed, it offers (default **No**) to run `cloudflared tunnel login` / `create` / `route dns` for you right then. It **never** runs the Access-application step — that is dashboard-only and cannot be scripted.
 
 ### `setup.sh` — the non-interactive engine
@@ -297,11 +296,14 @@ journalctl --user -u bobbit.service | grep -i 'listening\|host'
 ```
 Fix the unit, `systemctl --user daemon-reload`, `systemctl --user restart bobbit.service`.
 
+**cloudflared exits with `open /etc/cloudflared/config.yml: permission denied`, or `No file cert.pem` / "client didn't specify origincert path".**
+Both mean the daemon can't read the mounted `~/.cloudflared`. The official `cloudflare/cloudflared` image is built from a distroless **nonroot** base (uid 65532); under rootless Podman that maps to a subuid — not your user — so it cannot traverse `~/.cloudflared` (mode `0700`) or read the owner-only `cert.pem` (`0600`) / `<UUID>.json` (`0400`). The quadlet sets **`User=0`** to fix this: container-root maps to your host uid (the file owner), so the default perms work with **no chmod**. If you hit these errors, confirm the quadlet has `User=0` and `Volume=%h/.cloudflared:/etc/cloudflared:ro,z`, then `systemctl --user daemon-reload && systemctl --user restart cloudflared.service`. (A benign `ping_group_range` GID warning under `User=0` is expected — the tunnel doesn't use ICMP.)
+
 **SELinux denials on the mounted config (cloudflared can't read `config.yml`).**
-The host is enforcing; the mount must be relabeled. The quadlet uses `Volume=%h/.config/cloudflared:/etc/cloudflared:ro,Z` (`Z` = private relabel). If you changed it or copied files in after the relabel, look for AVC denials and re-check:
+The host is enforcing; the mount must be relabeled. The quadlet uses `Volume=%h/.cloudflared:/etc/cloudflared:ro,z` (`z` = **shared** relabel, since the host `cloudflared` CLI uses that dir too). Look for AVC denials and re-check:
 ```bash
-sudo ausearch -m AVC -ts recent     # look for denials referencing .config/cloudflared
-ls -lZ ~/.config/cloudflared/        # files should carry a container_file_t-style label after :Z mount
+sudo ausearch -m AVC -ts recent     # look for denials referencing .cloudflared
+ls -lZ ~/.cloudflared/               # files should carry a container_file_t-style label after the :z mount
 ```
 Restart the service to re-apply the relabel: `systemctl --user restart cloudflared.service`.
 
@@ -313,7 +315,7 @@ journalctl --user -u cloudflared.service -e
 podman logs systemd-cloudflared      # the quadlet-managed container
 ```
 
-**Re-running the installer.** `setup.sh` and `npm run setup-cloudflare-tunnel` are both idempotent. If a unit drifted or you changed a value (hostname, port, runtime, checkout dir), re-run the installer to re-render and reinstall the units — e.g. `flatpak-spawn --host npm run setup-cloudflare-tunnel` (it will not overwrite an existing `~/.config/cloudflared/config.yml` without asking). Then `systemctl --user daemon-reload` and restart the affected service.
+**Re-running the installer.** `setup.sh` and `npm run setup-cloudflare-tunnel` are both idempotent. If a unit drifted or you changed a value (hostname, port, runtime, checkout dir), re-run the installer to re-render and reinstall the units — e.g. `flatpak-spawn --host npm run setup-cloudflare-tunnel` (it will not overwrite an existing `~/.cloudflared/config.yml` without asking). Then `systemctl --user daemon-reload` and restart the affected service.
 
 ---
 
@@ -337,7 +339,7 @@ cloudflared tunnel delete bobbit-z13
 loginctl disable-linger "$USER"
 ```
 
-You may also delete the Access application from the Zero Trust dashboard and remove `~/.config/cloudflared/` (config + credentials). The repo artifacts under `deploy/cloudflare/` are templates only and can stay.
+You may also delete the Access application from the Zero Trust dashboard and remove `~/.cloudflared/` (config + credentials — cloudflared's default dir; only remove it if you are done with cloudflared on this host). The repo artifacts under `deploy/cloudflare/` are templates only and can stay.
 
 ---
 

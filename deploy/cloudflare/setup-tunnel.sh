@@ -3,7 +3,7 @@
 # setup-tunnel.sh — INTERACTIVE, HOST-ONLY entry point for the Bobbit
 # Cloudflare Tunnel deployment. This is what `npm run setup-cloudflare-tunnel`
 # invokes. It gathers your answers, scaffolds the LOCAL machine config
-# (~/.config/cloudflared/config.yml + the systemd/quadlet units, via setup.sh),
+# (~/.cloudflared/config.yml + the systemd/quadlet units, via setup.sh),
 # and prints the remaining manual Cloudflare-panel steps. It does NOT create
 # any live Cloudflare resources unless you explicitly opt in at the end.
 #
@@ -25,7 +25,7 @@ print_help() {
 Usage: setup-tunnel.sh [--yes|-y] [--help|-h]
 
 Interactive, host-only installer for the Bobbit Cloudflare Tunnel deployment.
-Scaffolds ~/.config/cloudflared/config.yml and installs the systemd --user +
+Scaffolds ~/.cloudflared/config.yml and installs the systemd --user +
 Podman quadlet units (delegating to setup.sh), then prints the remaining
 manual Cloudflare-panel steps. Never creates live Cloudflare resources unless
 you explicitly opt in at the end.
@@ -57,7 +57,10 @@ for arg in "$@"; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLOUDFLARED_DIR="$HOME/.config/cloudflared"
+# cloudflared's DEFAULT dir: `tunnel login` writes cert.pem here and
+# `tunnel create` writes <UUID>.json here, and the quadlet mounts it — so the
+# credentials are already in the mounted dir with nothing to copy.
+CLOUDFLARED_DIR="$HOME/.cloudflared"
 
 # --- Helpers ---------------------------------------------------------------
 # ask VARNAME "Prompt text" "default" — leaves VARNAME alone if pre-seeded via
@@ -226,7 +229,7 @@ echo "  bobbit cwd      = $BOBBIT_CWD"
 echo "  runtime         = $RUNTIME${TOOLBOX_CONTAINER:+ (container: $TOOLBOX_CONTAINER)}"
 echo "  node bin dir    = $NODE_BIN_DIR"
 
-# --- 4. Scaffold ~/.config/cloudflared/config.yml --------------------------
+# --- 4. Scaffold ~/.cloudflared/config.yml ---------------------------------
 mkdir -p "$CLOUDFLARED_DIR"
 CFG="$CLOUDFLARED_DIR/config.yml"
 write_cfg=1
@@ -271,10 +274,9 @@ cat <<EOF
  4. Zero Trust dashboard -> Access -> Applications: add a self-hosted app for
     $CF_HOSTNAME with an allow policy (e.g. your owner email).
     This is the ONLY authentication layer (panel-only; cannot be scripted here).
- 5. Wire up the credentials (UNCOMMITTED):
-        # copy the credentials JSON cloudflared wrote (usually ~/.cloudflared/)
-        cp ~/.cloudflared/<TUNNEL_ID>.json $CLOUDFLARED_DIR/<TUNNEL_ID>.json
-        # then set the matching <TUNNEL_ID> in $CFG
+ 5. Set the tunnel ID in the config (the credentials JSON is already in
+    $CLOUDFLARED_DIR from step 2 — nothing to copy):
+        # set the <TUNNEL_ID> printed by step 2 in:
         \$EDITOR $CFG
  6. (Re)start the tunnel and check status:
         systemctl --user start cloudflared.service
@@ -296,8 +298,8 @@ if [ "$HAVE_CLOUDFLARED" = "1" ]; then
     cloudflared tunnel route dns "$TUNNEL_NAME" "$CF_HOSTNAME" || true
     echo
     echo "==> Done. Still TODO manually: the Access application (step 4),"
-    echo "    copying the credentials JSON + setting <TUNNEL_ID> in $CFG (step 5),"
-    echo "    then: systemctl --user start cloudflared.service"
+    echo "    setting <TUNNEL_ID> in $CFG (step 5; creds already in"
+    echo "    $CLOUDFLARED_DIR), then: systemctl --user start cloudflared.service"
   else
     echo "==> skipped automated cloudflared steps (complete steps 1-6 manually)."
   fi
