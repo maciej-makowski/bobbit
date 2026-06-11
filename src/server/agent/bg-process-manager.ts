@@ -8,43 +8,37 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { WebSocket } from "ws";
 import type { ServerMessage } from "../ws/protocol.js";
 import { getShellConfig } from "./shell-util.js";
-import { DockerRuntime } from "./container-runtime/docker-runtime.js";
-import type { ContainerRuntime } from "./container-runtime/types.js";
 
 /**
  * Function used to spawn the underlying child process. Injected via the
  * constructor so unit tests can supply a fake EventEmitter-backed child
  * without touching the OS. Production wiring uses {@link defaultSpawn}.
- *
- * `runtime` (when `containerId` is set) selects the container CLI; defaults to
- * Docker when omitted.
  */
-export type SpawnFn = (command: string, cwd: string, containerId: string | undefined, runtime?: ContainerRuntime) => ChildProcess;
+export type SpawnFn = (command: string, cwd: string, containerId: string | undefined) => ChildProcess;
 
-function defaultSpawn(command: string, cwd: string, containerId: string | undefined, runtime?: ContainerRuntime): ChildProcess {
+function defaultSpawn(command: string, cwd: string, containerId: string | undefined): ChildProcess {
 	const { shell: hostShell, args: hostArgs } = getShellConfig();
 	// Inside the container: always /bin/sh, use the caller's cwd
 	// (which is the container-internal worktree path for sandboxed sessions)
 	const shell = containerId ? "/bin/sh" : hostShell;
 	const args = containerId ? ["-c"] : hostArgs;
+	const containerCwd = cwd;
 
 	if (containerId) {
-		const rt = runtime ?? new DockerRuntime();
-		console.log(`[bg-process] ${rt.bin} exec in container ${containerId.substring(0, 12)}, cwd=${cwd}`);
-		// The runtime owns `-w`/env-shim construction; we own spawn + stdio.
-		const { file, args: execArgs, env } = rt.buildExecCommand(containerId, [shell, ...args, command], { cwd });
-		return spawn(file, execArgs, {
-			stdio: ["ignore", "pipe", "pipe"],
-			detached: false, // exec manages the process
-			env,
-		});
+		console.log(`[bg-process] Docker exec in container ${containerId.substring(0, 12)}, cwd=${containerCwd}`);
 	}
-	return spawn(shell, [...args, command], {
-		cwd,
-		stdio: ["ignore", "pipe", "pipe"],
-		detached: true,
-		env: process.env,
-	});
+	return containerId
+		? spawn("docker", ["exec", "-w", containerCwd, containerId, shell, ...args, command], {
+			stdio: ["ignore", "pipe", "pipe"],
+			detached: false, // docker exec manages the process
+			env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" },
+		})
+		: spawn(shell, [...args, command], {
+			cwd,
+			stdio: ["ignore", "pipe", "pipe"],
+			detached: true,
+			env: process.env,
+		});
 }
 
 export interface LogEntry {
@@ -127,12 +121,12 @@ export class BgProcessManager {
 		}
 	}
 
-	create(sessionId: string, command: string, cwd: string, containerId?: string, sandboxed?: boolean, name?: string, runtime?: ContainerRuntime): BgProcessInfo {
+	create(sessionId: string, command: string, cwd: string, containerId?: string, sandboxed?: boolean, name?: string): BgProcessInfo {
 		if (sandboxed && !containerId) {
 			throw new Error("Sandboxed session without containerId — refusing host-side execution");
 		}
 		const id = `bg-${this.nextId++}`;
-		const child = this.spawnFn(command, cwd, containerId, runtime);
+		const child = this.spawnFn(command, cwd, containerId);
 
 		// Unref so bg process doesn't prevent gateway from exiting (host spawns only)
 		if (!containerId && typeof child.unref === "function") child.unref();

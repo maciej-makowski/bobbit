@@ -20,8 +20,6 @@ import { execFile as execFileCb } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 import { cpuDiagnosticsEnabled, getCpuDiagnostics } from "../agent/cpu-diagnostics.js";
-import { DockerRuntime } from "../agent/container-runtime/docker-runtime.js";
-import type { ContainerRuntime } from "../agent/container-runtime/types.js";
 import type { GitStatusResult } from "../server.js";
 import { parseBaseRef } from "./git.js";
 
@@ -45,10 +43,8 @@ function statusGitOperation(args: readonly string[]): string {
 export interface BatchGitStatusOpts {
 	/** When true, runs porcelain with -uall (untracked included). Default false → -uno. */
 	untracked?: boolean;
-	/** When set, all git invocations route through `<runtime> exec -w cwd <cid> git ...`. */
+	/** When set, all git invocations route through `docker exec -w cwd <cid> git ...`. */
 	containerId?: string;
-	/** Container runtime (docker/podman) for the container path. Defaults to docker. */
-	runtime?: ContainerRuntime;
 	/**
 	 * Project-level `base_ref` configuration. When non-empty, drives the
 	 * `primaryBranch` used for `aheadOfPrimary`/`behindPrimary` counters,
@@ -77,7 +73,6 @@ async function runGit(
 	containerId?: string,
 	timeoutMs = PER_CALL_TIMEOUT_MS,
 	trim = true,
-	runtime?: ContainerRuntime,
 ): Promise<{ stdout: string; ok: boolean }> {
 	const diagEnabled = cpuDiagnosticsEnabled();
 	const diagStart = diagEnabled ? performance.now() : 0;
@@ -86,13 +81,10 @@ async function runGit(
 	try {
 		let stdout: string;
 		if (containerId) {
-			// Source the exec argv (binary + `-w cwd` flags) from the runtime; keep
-			// git-status's own execFile + cpu-diagnostics instrumentation.
-			const ec = (runtime ?? new DockerRuntime()).buildExecCommand(containerId, ["git", ...args], { cwd });
 			const r = await execFileAsync(
-				ec.file,
-				ec.args,
-				{ encoding: "utf-8", timeout: timeoutMs, windowsHide: true, env: ec.env },
+				"docker",
+				["exec", "-w", cwd, containerId, "git", ...args],
+				{ encoding: "utf-8", timeout: timeoutMs, windowsHide: true },
 			);
 			stdout = r.stdout;
 		} else {
@@ -278,7 +270,7 @@ async function runHost(cwd: string, untracked: boolean, configuredBaseRef?: stri
 /** Container path: preserve the legacy single-spawn batched script. The
  * Windows tax is host-side only; inside Linux containers `git` is fast and
  * one `docker exec sh -c` round-trip beats 11 parallel `docker exec` calls. */
-async function runContainer(cwd: string, containerId: string, untracked: boolean, configuredBaseRef?: string, runtime?: ContainerRuntime): Promise<GitStatusResult | null> {
+async function runContainer(cwd: string, containerId: string, untracked: boolean, configuredBaseRef?: string): Promise<GitStatusResult | null> {
 	const porcelainLine = untracked
 		? "git -c core.filemode=false status --porcelain=v1 -uall 2>/dev/null"
 		: "git -c core.filemode=false status --porcelain=v1 -uno 2>/dev/null";
@@ -334,16 +326,13 @@ async function runContainer(cwd: string, containerId: string, untracked: boolean
 	let errorCode = "none";
 	let stdout: string;
 	try {
-		// Source the exec argv (binary + `-w cwd` + env shim) from the runtime;
-		// keep git-status's own execFile + cpu-diagnostics instrumentation.
-		const ec = (runtime ?? new DockerRuntime()).buildExecCommand(containerId, ["/bin/sh", "-c", batchScript], { cwd });
 		const result = await execFileAsync(
-			ec.file,
-			ec.args,
+			"docker",
+			["exec", "-w", cwd, containerId, "/bin/sh", "-c", batchScript],
 			{
 				encoding: "utf-8",
 				timeout: CONTAINER_BATCH_TIMEOUT_MS,
-				env: ec.env,
+				env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" },
 				windowsHide: true,
 			},
 		);
@@ -445,7 +434,7 @@ export async function runBatchGitStatusNative(
 ): Promise<GitStatusResult | null> {
 	const untracked = opts?.untracked === true;
 	if (opts?.containerId) {
-		return runContainer(cwd, opts.containerId, untracked, opts?.configuredBaseRef, opts?.runtime);
+		return runContainer(cwd, opts.containerId, untracked, opts?.configuredBaseRef);
 	}
 	return runHost(cwd, untracked, opts?.configuredBaseRef);
 }

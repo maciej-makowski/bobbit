@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "yaml";
-import type { RuntimeId } from "./container-runtime/types.js";
 
 // ── Component yaml normalization ────────────────────────────
 // SECURITY: `component.repo` and `component.relativePath` are joined onto
@@ -267,8 +266,7 @@ const DEFAULTS: Record<string, string> = {
 	test_e2e_command: "npm run test:e2e",
 	worktree_setup_command: "",  // Empty = no setup runs on new worktrees
 	base_ref: "",                      // Empty = today's behaviour (resolveRemotePrimary, typically origin/master). Else a branch ref — local ("master") or remote ("origin/develop"). See docs/design/base-ref.md.
-	sandbox: "none",                    // "none" | "docker" — sandbox enable flag (on/off)
-	sandbox_runtime: "docker",          // "docker" | "podman" — container provider when sandbox enabled (unknown → docker)
+	sandbox: "none",                    // "none" | "docker"
 	sandbox_image: "bobbit-agent",      // Docker image name
 	sandbox_credentials: "",            // DEPRECATED — use sandbox_tokens. JSON object: '{"GITHUB_TOKEN":"ghp_xxx"}'
 	sandbox_github_token: "true",       // DEPRECATED — use sandbox_tokens. "true" | "false"
@@ -670,17 +668,6 @@ export class ProjectConfigStore {
 	}
 
 	// ── Native-YAML typed accessors (preferred over flat get/set) ────
-
-	/**
-	 * Resolve the container provider for sandboxing. Reads `sandbox_runtime`
-	 * ("docker" | "podman"); any unknown/empty value falls back to "docker".
-	 * This is the config accessor `resolveContainerRuntime` consumes — note it
-	 * is independent of the `sandbox` enable flag ("none" | "docker").
-	 */
-	getSandboxRuntime(): RuntimeId {
-		const raw = (this.get("sandbox_runtime") ?? "").trim().toLowerCase();
-		return raw === "podman" ? "podman" : "docker";
-	}
 
 	getConfigDirectories(): ConfigDirectoryEntry[] {
 		return this.configDirectories.map(e => ({ path: e.path, types: [...e.types] }));
