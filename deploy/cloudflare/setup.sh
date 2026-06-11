@@ -36,7 +36,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 QUADLET_DIR="$HOME/.config/containers/systemd"
-CLOUDFLARED_DIR="$HOME/.config/cloudflared"
+# cloudflared's DEFAULT dir (where `tunnel login`/`create` write cert.pem +
+# <UUID>.json). The quadlet mounts this dir, so no credential copying needed.
+CLOUDFLARED_DIR="$HOME/.cloudflared"
 
 echo "==> RUNTIME      = $RUNTIME"
 echo "==> CHECKOUT_DIR = $CHECKOUT_DIR"
@@ -146,8 +148,8 @@ systemctl --user enable --now bobbit.service
 # quadlet's WantedBy=default.target once daemon-reload regenerates it.
 systemctl --user start cloudflared.service || {
   echo "WARN: cloudflared.service did not start — most likely because" >&2
-  echo "      ~/.config/cloudflared/config.yml + credentials JSON are not in" >&2
-  echo "      place yet. Complete the manual Cloudflare steps below, then:" >&2
+  echo "      ~/.cloudflared/config.yml + credentials JSON are not in place" >&2
+  echo "      yet. Complete the manual Cloudflare steps below, then:" >&2
   echo "        systemctl --user start cloudflared.service" >&2
 }
 
@@ -166,10 +168,10 @@ cat <<EOF
  4. Zero Trust dashboard -> Access -> Applications: add a self-hosted app for
     bobbit-z13.maciej.dev with an allow policy (e.g. your owner email).
     This is the ONLY authentication layer.
- 5. Drop the real config + credentials into $CLOUDFLARED_DIR (UNCOMMITTED):
+ 5. Put the config in $CLOUDFLARED_DIR (the credentials JSON is already there
+    from step 2 — nothing to copy):
         cp deploy/cloudflare/config.yml.example $CLOUDFLARED_DIR/config.yml
-        # edit it: set <TUNNEL_ID>; copy <TUNNEL_ID>.json from
-        # ~/.cloudflared/ into $CLOUDFLARED_DIR/
+        # edit it: set <TUNNEL_ID> to the UUID from step 2.
  6. (Re)start the tunnel and check status:
         systemctl --user start cloudflared.service
         systemctl --user status bobbit.service cloudflared.service

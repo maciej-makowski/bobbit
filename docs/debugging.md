@@ -548,7 +548,10 @@ The bug is a stale-state race between three fields on `GitStatusWidget` (`src/ui
 
 ## Sandbox sessions
 
-- `GET /api/sandbox-status` for Docker availability
+- `GET /api/sandbox-status` for runtime availability
+- **Runtime selection**: the spawned container binary is `sandbox_runtime` (`docker`|`podman`), resolved to a `ContainerRuntime` via `resolveContainerRuntime` (unknown/empty → docker, never throws). `sandbox: "docker"` is only the on/off enable flag — it does NOT select the binary. See [internals.md — Container runtime abstraction](internals.md#container-runtime-abstraction).
+- **Availability error names the runtime** (`<bin> is not available: …`) — if it says `podman is not available`, the chosen binary is missing or its `info` probe failed.
+- **Podman `info --format` schema gotcha**: Docker is flat (`.ServerVersion`/`.NCPU`/`.MemTotal`), Podman is nested (`.Version.Version`/`.Host.CPUs`/`.Host.MemTotal`). A Docker template run against Podman throws → spurious "not available". Each impl owns its own templates (`DockerRuntime`/`PodmanRuntime`); never branch on the runtime at a call site.
 - Worktree sessions now correctly call `applySandboxWiring()` via the pipeline (previously `_setupWorktreeAndLaunchAgent()` skipped sandbox wiring)
 - `sessions.json` has `sandboxed: boolean`
 - Container can't reach internet? Check: (1) `docker network inspect bobbit-sandbox-net` shows the network exists, (2) container is attached to it (`docker inspect <container>` → Networks), (3) host firewall isn't blocking Docker bridge traffic
