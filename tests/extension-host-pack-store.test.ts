@@ -29,11 +29,25 @@ after(() => {
 
 describe("withStoreTimeout — bound a stuck store backend (design §3 B1.2)", () => {
 	it("rejects a HUNG store op with PackStoreTimeoutError after the wall-time", async () => {
-		const hung = new Promise<never>(() => { /* never settles */ });
-		await assert.rejects(
-			() => withStoreTimeout(hung, 25, "store get"),
-			(e) => e instanceof PackStoreTimeoutError && /store get timed out after 25ms/.test((e as Error).message),
-		);
+		// `withStoreTimeout`'s timer is intentionally `.unref()`'d (production hygiene:
+		// a pending store timeout must never keep the gateway process alive). In the
+		// gateway the HTTP server always holds the event loop, so the timer fires
+		// normally. In THIS isolated unit, though, the never-settling op + the unref'd
+		// timer would be the ONLY pending work, so `node --test` declares the loop idle
+		// and aborts the test with "Promise resolution is still pending but the event
+		// loop has already resolved" BEFORE the 25ms timer can fire (and poisons the
+		// rest of the file). Hold the loop open for the assertion — exactly as the
+		// server does in production — so the unref'd timer fires and the bound is proven.
+		const keepLoopAlive = setInterval(() => {}, 1_000);
+		try {
+			const hung = new Promise<never>(() => { /* never settles */ });
+			await assert.rejects(
+				() => withStoreTimeout(hung, 25, "store get"),
+				(e) => e instanceof PackStoreTimeoutError && /store get timed out after 25ms/.test((e as Error).message),
+			);
+		} finally {
+			clearInterval(keepLoopAlive);
+		}
 	});
 
 	it("resolves a fast op normally (no spurious timeout) and propagates rejections verbatim", async () => {
