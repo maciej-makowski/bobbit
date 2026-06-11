@@ -23,7 +23,7 @@ Where things live. Use this to orient, then `rg` for the symbol.
 - **Agent runtime**: `src/server/agent/` — sessions, manager, status, steer, respawn, store, project context.
 - **MCP / tools**: `src/server/mcp/`, `defaults/tools/<group>/` (project overrides under `.bobbit/config/tools/<group>/`). Tool descriptions are budget-pinned by `tests/tool-description-budget.test.ts`.
 - **Skills**: `.claude/skills/<name>/SKILL.md`.
-- **Roles/tools/skills resolution**: unified `PackResolver` over one ordered pack list in `src/server/agent/pack-*.ts`; `config-cascade.ts` + `slash-skills.ts` are adapters. See [docs/marketplace.md](docs/marketplace.md).
+- **Roles/tools/skills resolution**: `PackResolver` over one pack list (`src/server/agent/pack-*.ts`); `config-cascade.ts`/`slash-skills.ts` adapt it; built-in packs in `market-packs/` (`builtin-packs.ts`). See [docs/marketplace.md](docs/marketplace.md).
 - **UI shell**: `src/app/` — state, render, message-reducer, dialogs, follow-tail.
 - **UI components**: `src/ui/` — components, `tools/renderers/`, `lazy/`.
 - **Tests**: `tests/` (unit), `tests/e2e/` (API), `tests/e2e/ui/` (browser), `tests/manual-integration/` (real agents + Docker).
@@ -55,7 +55,7 @@ Primary branch is **`master`** (not `main`). Never create a `main` branch.
 
 **Worktrees**: dev server runs from the **primary worktree** on `master`; sessions use separate worktrees under `<project-root>-wt/<branch>/`. Always edit files in your session worktree, never the primary one. For infra files: edit here → commit → push → `cd <primary-worktree> && git pull origin master` (pushing to remote `master` does NOT update the dev server).
 
-**Forks**: open PRs against the fork's `master`, not upstream; sync upstream via merge-commit, never squash.
+**Forks**: PRs target the fork's `master`; sync upstream via merge-commit, never squash.
 
 Full worktree story — branch namespaces, `base_ref`, the `git stash` hazard: [docs/dev-workflow.md](docs/dev-workflow.md).
 

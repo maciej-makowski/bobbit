@@ -33,7 +33,7 @@ import { getRouteFromHash, setHashRoute } from "./routing.js";
 import { authenticateGateway, connectToSession, createAndConnectSession, terminateSession, applyProjectPalette, flushAndTeardownDraft, flushPendingDraft } from "./session-manager.js";
 import { migrateLegacyVisitedMap } from "./render-helpers.js";
 import { installPwaLifecycleRecovery, markAppBooted } from "./pwa-lifecycle.js";
-import { doRenderApp, showHeaderToast, workspaceSessionId } from "./render.js";
+import { doRenderApp, showHeaderToast, workspaceSessionId, dismissExtRouteUnavailable } from "./render.js";
 import { renderTool } from "../ui/tools/index.js";
 import { navigateSidebar, expandActiveSidebarItem, installKeyboardNavOverrideClearListener } from "./sidebar-nav.js";
 import { toggleRolePicker } from "./sidebar.js";
@@ -53,7 +53,7 @@ function clearDashboardState(): void {
 	if (_goalDashboardModule) _goalDashboardModule.clearDashboardState();
 }
 import { registerShortcut, startListening, loadSavedBindings } from "./shortcut-registry.js";
-import { activeSidePanelTabIdForSession, loadPersistedPanelWorkspace } from "./panel-workspace.js";
+import { loadPersistedPanelWorkspace } from "./panel-workspace.js";
 import { bootMark } from "./boot-timing.js";
 
 // Boot-timing: this fires only after the entire eager module graph has been
@@ -94,23 +94,26 @@ import("lit").then(m => { (window as any).__bobbitLitRender = m.render; }).catch
 // E2E can assert the running UI reconciles (stale pack renderer removed, built-in
 // restored) WITHOUT a page reload. Used by tests/e2e/ui/extension-host.spec.ts.
 (window as any).__bobbitReconcilePackRenderers = async () => {
-	const [{ fetchTools }, { registerPackRenderers }] = await Promise.all([
-		import("./api.js"),
-		import("./pack-renderers.js"),
-	]);
-	const pid = state.activeProjectId ?? undefined;
-	registerPackRenderers(await fetchTools(pid), pid);
+	// Delegate to the REAL marketplace-mutation reconcile (renderers + panels +
+	// entrypoints), which FORCE re-registers from freshly fetched metadata —
+	// bypassing the per-registry dedupe guard so an install/uninstall tears down
+	// removed renderers/panels/entrypoints+routes WITHOUT a reload.
+	const { reconcileRenderersForActiveSession } = await import("./marketplace-page.js");
+	await reconcileRenderersForActiveSession();
+};
+
+// E2E test hook: run a pack composer-slash/git-widget/command-palette launcher
+// entrypoint by id — the SAME `runLauncherEntrypoint` the MessageEditor slash menu
+// calls on a user click (Slice C1). Lets the pr-walkthrough-pack browser E2E
+// trigger "entrypoint launches the panel" deterministically. Faithful: it
+// exercises the real launcher→navigate→openPanel chain.
+(window as any).__bobbitRunPackLauncher = async (id: string): Promise<void> => {
+	const { runLauncherEntrypoint } = await import("./pack-entrypoints.js");
+	runLauncherEntrypoint(id);
 };
 
 function hasActiveProposalPanel(): boolean {
 	return PROPOSAL_TYPES.some((type) => state.activeProposals[type] != null);
-}
-
-function hasActiveWalkthroughPanel(): boolean {
-	// Used by the in-app resize keyboard shortcuts to recognise the unified panel
-	// as a fullscreen-able walkthrough. The standalone `/walkthrough` route has no
-	// panel-level resize chrome, so it intentionally has no special-case here.
-	return activeSidePanelTabIdForSession(state, workspaceSessionId()).startsWith("walkthrough:");
 }
 
 // ============================================================================
@@ -147,6 +150,88 @@ async function waitForGateway(url: string, token: string): Promise<void> {
 // HASH CHANGE HANDLER (browser back/forward)
 // ============================================================================
 
+/**
+ * Slice C1 — restore a `#/ext/<routeId>?<params>` pack deep-link (extension-host-
+ * phase2 §7 C1.2a): ensure pack entrypoints are reconciled for the active project
+ * (so a cold-load deep-link resolves even if the boot reconcile is still in flight),
+ * look the routeId up in the client pack-route registry, and open the target panel
+ * with the parsed params (the panel rehydrates its content from host.store). A
+ * routeId with no registered owner (e.g. the pack was disabled/uninstalled) shows
+ * the "feature unavailable" empty state (§7.3).
+ *
+ * RACE-FREE: the empty-state-vs-panel decision is NOT a one-shot. The "feature
+ * unavailable" empty state is now RENDER-DERIVED (render.ts::extRouteUnavailable
+ * reads the current `#/ext/<routeId>` hash + the live pack-route registry on every
+ * render), so this function only has to (a) open the target panel when the route
+ * resolves and (b) drive a re-render when the registry changes. We record the
+ * deep-link in {@link activeExtRoute} and re-evaluate it through
+ * {@link evaluateActiveExtRoute} BOTH now AND on every later entrypoint-registry
+ * change (via {@link setRoutesChangedListener}). So a disable/enable reconcile that
+ * lands AFTER this hashchange (the test's `__bobbitReconcilePackRenderers`, or a
+ * Market activation toggle's own reconcile) flips the open deep-link between its
+ * panel and the render-derived empty state.
+ */
+let activeExtRoute: { routeId: string; params?: Record<string, string> } | null = null;
+let extRouteListenerInstalled = false;
+
+/** Re-evaluate the active `#/ext/<routeId>` deep-link against the CURRENT route
+ *  registry and re-render: an owner → open (or re-focus, idempotently) its panel.
+ *  The empty-state overlay itself is render-derived (render.ts) so this just needs
+ *  to drive a renderApp + open the panel when resolvable. Safe to call repeatedly
+ *  (openPackPanel focuses an existing tab). */
+async function evaluateActiveExtRoute(): Promise<void> {
+	try {
+		// The render-derived overlay re-evaluates the hash + registry on every render,
+		// so a registry change must trigger a render (disable → overlay appears;
+		// enable → overlay clears once the route resolves + the panel opens below).
+		renderApp();
+		const cur = activeExtRoute;
+		if (!cur) return;
+		const { lookupPackRoute } = await import("./pack-entrypoints.js");
+		const { openPackPanel } = await import("./pack-panels.js");
+		const entry = lookupPackRoute(cur.routeId);
+		if (!entry) return; // no owner → render-derived empty state already shows
+		const openParams: Record<string, unknown> = {};
+		if (cur.params) for (const key of entry.paramKeys) if (key in cur.params) openParams[key] = cur.params[key];
+		// The target panel is resolved within the SAME pack — thread the route's
+		// owning packId so the {packId, panelId} lookup is exact (pack schema V1 §8.1).
+		openPackPanel({ panelId: entry.targetPanelId, params: openParams }, entry.packId);
+	} catch { /* non-fatal — a bad deep-link must never break the app */ }
+}
+
+/** Clear the tracked deep-link + any empty state when navigating AWAY from an ext
+ *  view, so a later unrelated reconcile never re-surfaces the overlay. */
+function clearActiveExtRoute(): void {
+	activeExtRoute = null;
+	dismissExtRouteUnavailable();
+}
+
+async function restoreExtRoute(routeId: string | undefined, params: Record<string, string> | undefined): Promise<void> {
+	if (!routeId) { clearActiveExtRoute(); return; }
+	try {
+		const ep = await import("./pack-entrypoints.js");
+		const { reconcilePackPanelsForProject } = await import("./pack-panels.js");
+		// Install the registry-change listener ONCE so every subsequent
+		// registerPackEntrypoints rebuild (reconcile / activation toggle / uninstall)
+		// re-derives the open deep-link's resolution.
+		if (!extRouteListenerInstalled) {
+			ep.setRoutesChangedListener(() => { void evaluateActiveExtRoute(); });
+			extRouteListenerInstalled = true;
+		}
+		// Record the deep-link BEFORE reconciling so a route-map rebuild fired during
+		// the reconcile already sees it and re-derives.
+		activeExtRoute = { routeId, params };
+		// Reconcile BOTH registries before resolving: a cold-load `#/ext/<routeId>`
+		// must find its owning route (entrypoints) AND its target panel must be
+		// registered (panels) or openPackPanel no-ops against an unregistered panel.
+		await Promise.all([
+			ep.reconcilePackEntrypointsForProject(state.activeProjectId ?? undefined),
+			reconcilePackPanelsForProject(state.activeProjectId ?? undefined),
+		]);
+		await evaluateActiveExtRoute();
+	} catch { /* non-fatal — a bad deep-link must never break boot */ }
+}
+
 let handlingHashChange = false;
 let pendingHashChange = false;
 
@@ -180,7 +265,21 @@ async function handleHashChange(): Promise<void> {
 			flushAndTeardownDraft();
 		}
 
-		if (route.view === "goal" && route.goalId) {
+		// Leaving an `#/ext/<routeId>` deep-link: drop the tracked route + any empty
+		// state so a later unrelated entrypoint reconcile never re-surfaces the
+		// overlay on top of a different view.
+		if (route.view !== "ext") {
+			clearActiveExtRoute();
+		}
+
+		if (route.view === "ext") {
+			// Slice C1 — pack deep-link. Open the target panel as an overlay on the
+			// CURRENT view (do NOT tear down the session/goal context); the panel mounts
+			// into the side-panel workspace of the active session.
+			if (state.appView !== "authenticated") state.appView = "authenticated";
+			await restoreExtRoute(route.extRouteId, route.extParams);
+			renderApp();
+		} else if (route.view === "goal" && route.goalId) {
 			if (state.remoteAgent) {
 				state.remoteAgent.disconnect();
 				state.remoteAgent = null;
@@ -278,18 +377,6 @@ async function handleHashChange(): Promise<void> {
 			applyProjectPalette(gdGoal.projectId);
 			state.appView = "authenticated";
 			loadDashboardData(route.goalId);
-			renderApp();
-			await refreshSessions();
-		} else if (route.view === "walkthrough") {
-			clearDashboardState();
-			if (state.remoteAgent) {
-				state.remoteAgent.disconnect();
-				state.remoteAgent = null;
-				state.connectionStatus = "disconnected";
-			}
-			state.selectedSessionId = null;
-			state.goalDashboardId = null;
-			state.appView = "authenticated";
 			renderApp();
 			await refreshSessions();
 		} else if (route.view === "roles") {
@@ -546,7 +633,13 @@ async function initApp() {
 					// project (session-manager) so a reload / deep-link into a session
 					// whose project differs from the active/default resolves correctly.
 					await reconcilePackRenderersForProject(state.activeProjectId ?? undefined);
-				} catch { /* non-fatal — built-in renderers are unaffected */ }
+					// Slice B4 — same lifecycle for pack-contributed side panels.
+					const { reconcilePackPanelsForProject } = await import("./pack-panels.js");
+					await reconcilePackPanelsForProject(state.activeProjectId ?? undefined);
+					// Slice C1 — same lifecycle for pack-contributed entrypoints + deep-link routes.
+					const { reconcilePackEntrypointsForProject } = await import("./pack-entrypoints.js");
+					await reconcilePackEntrypointsForProject(state.activeProjectId ?? undefined);
+				} catch { /* non-fatal — built-in renderers/panels are unaffected */ }
 			})();
 
 			// Load saved preferences (palette, timestamps, AI gateway)
@@ -595,10 +688,12 @@ async function initApp() {
 				loadDashboardData(route.goalId);
 				renderApp();
 				await refreshSessions();
-			} else if (route.view === "walkthrough") {
+			} else if (route.view === "ext") {
+				// Slice C1 — cold-load pack deep-link restoration.
 				state.appView = "authenticated";
 				renderApp();
 				await refreshSessions();
+				await restoreExtRoute(route.extRouteId, route.extParams);
 			} else if (route.view === "roles") {
 				const { loadRolePageData } = await import("./role-manager-page.js");
 				loadRolePageData();
@@ -710,7 +805,7 @@ async function initApp() {
 		defaultBindings: [{ key: "[", ctrlOrMeta: true, shift: false, alt: false }],
 		allowInInput: true,
 		handler: () => {
-			const canFullscreen = !state.assistantType && (state.isPreviewSession || state.reviewPanelOpen || state.inboxPanelOpen || hasActiveWalkthroughPanel());
+			const canFullscreen = !state.assistantType && (state.isPreviewSession || state.reviewPanelOpen || state.inboxPanelOpen);
 			const hasPanel = canFullscreen || (!state.assistantType && hasActiveProposalPanel());
 			if (hasPanel) {
 				const key = `bobbit-preview-collapsed-${workspaceSessionId()}`;
@@ -770,7 +865,7 @@ async function initApp() {
 		defaultBindings: [{ key: "]", ctrlOrMeta: true, shift: false, alt: false }],
 		allowInInput: true,
 		handler: () => {
-			const hasPanel = !state.assistantType && (state.isPreviewSession || state.reviewPanelOpen || state.inboxPanelOpen || hasActiveWalkthroughPanel() || hasActiveProposalPanel());
+			const hasPanel = !state.assistantType && (state.isPreviewSession || state.reviewPanelOpen || state.inboxPanelOpen || hasActiveProposalPanel());
 			if (!hasPanel) return;
 			const key = `bobbit-preview-collapsed-${workspaceSessionId()}`;
 			if (state.previewPanelFullscreen) {
@@ -794,8 +889,7 @@ async function initApp() {
 		defaultBindings: [{ key: "#", ctrlOrMeta: true, shift: false, alt: false }],
 		allowInInput: true,
 		handler: () => {
-			const hasWalkthroughPanel = hasActiveWalkthroughPanel();
-			const hasPanel = !state.assistantType && (state.isPreviewSession || state.reviewPanelOpen || state.inboxPanelOpen || hasWalkthroughPanel || hasActiveProposalPanel());
+			const hasPanel = !state.assistantType && (state.isPreviewSession || state.reviewPanelOpen || state.inboxPanelOpen || hasActiveProposalPanel());
 			if (hasPanel) {
 				const key = `bobbit-preview-collapsed-${workspaceSessionId()}`;
 				if (state.previewPanelFullscreen) {
@@ -803,7 +897,7 @@ async function initApp() {
 					state.previewPanelFullscreen = false;
 					localStorage.setItem(key, "true");
 					sessionStorage.removeItem("bobbit-pre-fullscreen-collapsed");
-				} else if (state.isPreviewSession || hasWalkthroughPanel) {
+				} else if (state.isPreviewSession) {
 					// any non-fullscreen level → 2: jump to fullscreen
 					localStorage.setItem(key, "false");
 					state.previewPanelFullscreen = true;

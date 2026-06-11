@@ -82,7 +82,8 @@ import { PrStatusStore } from "./pr-status-store.js";
 import { TaskStore } from "./task-store.js";
 import type { GateStore } from "./gate-store.js";
 import { bobbitStateDir, bobbitConfigDir, globalAgentDir, globalAuthPath } from "../bobbit-dir.js";
-import { rotateSubmissionProofForRestoredJob } from "../pr-walkthrough/walkthrough-agent-store.js";
+import { rotateSubmissionProofForRestoredJob, WalkthroughAgentStore } from "../pr-walkthrough/walkthrough-agent-store.js";
+import { shouldReapWalkthroughChildOnBoot } from "../pr-walkthrough/walkthrough-reap.js";
 
 import type { SandboxManager } from "./sandbox-manager.js";
 import { WorktreePool } from "./worktree-pool.js";
@@ -159,12 +160,12 @@ export function isUserVisibleActivity(event: any): boolean {
 /**
  * Build a user-visible system-prefix explaining that the previous turn
  * errored. Injected in front of the user's new text when SessionManager
- * implicitly unsticks a wedged session — orients the model to ignore the
- * incomplete last turn.
+ * implicitly unsticks a wedged session — orients the model to recover and
+ * continue without redoing completed work.
  */
 function buildErrorRecoveryPrefix(errMsg: string, userText: string): string {
 	const snippet = (errMsg || "unknown error").slice(0, 200);
-	return `[SYSTEM: previous turn failed with: ${snippet}. Ignore the incomplete last turn and handle the following.]\n\n${userText}`;
+	return `[SYSTEM: previous turn failed with: ${snippet}. Your previous turn was interrupted. Pick up where you left off — re-check state first and avoid redoing completed work.]\n\n${userText}`;
 }
 
 /**
@@ -190,7 +191,10 @@ export type PromptSource =
 	| "task-notification"
 	| "verification"
 	| "system"
-	| "agent";
+	| "agent"
+	// Extension Host C2: a pack's `host.session.postMessage` drove this prompt
+	// (gesture-gated, allowedTools-scoped, audited — see session-write.ts).
+	| "extension";
 
 export interface SessionInfo {
 	id: string;
@@ -1641,7 +1645,8 @@ export class SessionManager {
 		// Skipped when the session lacks `activate_skill` (catalog is useless without
 		// the activator) or when explicitly already populated.
 		if (!parts.skillsCatalog) {
-			parts.skillsCatalog = this.computeSkillsCatalog(parts.allowedTools, parts.projectRoot || parts.cwd, parts.projectConfigStore);
+			const catalogProjectId = this.sessions.get(sessionId)?.projectId;
+			parts.skillsCatalog = this.computeSkillsCatalog(parts.allowedTools, parts.projectRoot || parts.cwd, parts.projectConfigStore, catalogProjectId);
 		}
 		// Stamp the user-configured skills-catalog byte budget onto the parts so it flows
 		// into both the assembled prompt and the persisted prompt-sections snapshot.
@@ -1668,6 +1673,7 @@ export class SessionManager {
 		allowedTools: string[] | undefined,
 		discoveryRoot: string,
 		projectConfigStore?: { get(key: string): string | undefined },
+		projectId?: string,
 	): import("../skills/slash-skills.js").SlashSkill[] | undefined {
 		// allowedTools=undefined or empty => no restrictions; include catalog.
 		// allowedTools restricted => require activate_skill in the list.
@@ -1685,6 +1691,17 @@ export class SessionManager {
 				projectBase: discoveryRoot,
 				serverConfigStore: this.projectConfigStore,
 				projectConfigStore: projectConfigStore as SkillMarketContext["projectConfigStore"],
+				// pack-schema-v1 §7: filter disabled market-pack skills out of the runtime
+				// activation catalog too, using the SAME pack_activation store (server/
+				// global-user → server config store; project → the project's config store).
+				packActivation: (scope, packName) => {
+					const store = scope === "project"
+						? (projectId && this.projectContextManager
+							? this.projectContextManager.getOrCreate(projectId)?.projectConfigStore
+							: undefined)
+						: this.projectConfigStore;
+					return store?.getPackActivation(scope, packName) ?? {};
+				},
 			};
 			const all = discoverSlashSkills(discoveryRoot, projectConfigStore, marketContext);
 			// Filter: omit disable-model-invocation and skills with empty descriptions.
@@ -3289,6 +3306,30 @@ export class SessionManager {
 		} catch {
 			console.warn(`[session-manager] Skipping session ${ps.id} — project "${ps.projectId}" no longer registered`);
 			return;
+		}
+		// Reap finished/orphaned PR-walkthrough children instead of respawning them.
+		// They are persisted sessions linked by parentSessionId/childKind (not
+		// delegateOf), so without this they would be resurrected as live node
+		// processes on every restart (the session-leak bug).
+		if (ps.childKind === "pr-walkthrough") {
+			let jobStatus: string | undefined;
+			if (ps.walkthroughJobId) {
+				try { jobStatus = new WalkthroughAgentStore(bobbitStateDir()).get(ps.walkthroughJobId)?.status; }
+				catch (err) { console.warn(`[session-manager] Failed to read walkthrough job for ${ps.id}:`, err); }
+			}
+			const parent = ps.parentSessionId ? this.getPersistedSession(ps.parentSessionId) : undefined;
+			const decision = shouldReapWalkthroughChildOnBoot({
+				walkthroughJobId: ps.walkthroughJobId,
+				parentSessionId: ps.parentSessionId,
+				jobStatus,
+				parentExists: !!parent,
+				parentArchived: parent?.archived === true,
+			});
+			if (decision.reap) {
+				console.log(`[session-manager] Reaping PR-walkthrough child ${ps.id} on boot — ${decision.reason}`);
+				sessionStore.archive(ps.id);
+				return;
+			}
 		}
 		if (!ps.agentSessionFile) {
 			// No session file path — persistSessionMetadata never completed.
@@ -5305,18 +5346,22 @@ export class SessionManager {
 		const session = this.sessions.get(id);
 		if (!session) return false;
 
-		// Cascade: terminate all delegate (child) sessions first
-		const children = [...this.sessions.values()].filter(s => s.delegateOf === id);
+		// Cascade: terminate all delegate (child) sessions first. PR-walkthrough
+		// children are linked via parentSessionId/childKind (not delegateOf), so they
+		// must be cascaded too — otherwise the read-only child process leaks when its
+		// parent is terminated or archived (archival flows through terminateSession).
+		const children = [...this.sessions.values()].filter(s => s.delegateOf === id || (s.childKind === "pr-walkthrough" && s.parentSessionId === id));
 		for (const child of children) {
-			console.log(`[session ${id}] Cascading terminate to delegate ${child.id}`);
+			console.log(`[session ${id}] Cascading terminate to child ${child.id}`);
 			await this.terminateSession(child.id);
 		}
-		// Also archive persisted-but-not-in-memory delegate sessions
+		// Also archive persisted-but-not-in-memory delegate / pr-walkthrough children
 		const allLiveForTerminate = this.projectContextManager
 			? [...this.projectContextManager.getAllLiveSessions()]
 			: (this._testStore?.getLive() ?? []);
 		for (const ps of allLiveForTerminate) {
-			if (ps.delegateOf === id && !this.sessions.has(ps.id)) {
+			const isChild = ps.delegateOf === id || (ps.childKind === "pr-walkthrough" && ps.parentSessionId === id);
+			if (isChild && !this.sessions.has(ps.id)) {
 				try { this.getSessionStore(ps.projectId).archive(ps.id); } catch { /* project gone */ }
 			}
 		}
@@ -5370,9 +5415,11 @@ export class SessionManager {
 		this.sessionSecretStore.remove(id);
 
 		// Clean up sandbox worktree inside the container.
-		// Skip for delegate sessions — they share the parent's worktree and must
-		// never remove it.  Only the owning (non-delegate) session should clean up.
-		if (session.sandboxed && !session.delegateOf && session.cwd?.startsWith("/workspace-wt/") && this.sandboxManager && session.projectId) {
+		// Skip for delegate sessions AND pr-walkthrough children — both share the
+		// parent's worktree and must never remove it. Only the owning session should
+		// clean up (cascade-terminating a prw child must not delete the launching
+		// session's still-active /workspace-wt/<name>).
+		if (session.sandboxed && !session.delegateOf && session.childKind !== "pr-walkthrough" && session.cwd?.startsWith("/workspace-wt/") && this.sandboxManager && session.projectId) {
 			try {
 				const sandbox = this.sandboxManager.get(session.projectId);
 				if (sandbox) {

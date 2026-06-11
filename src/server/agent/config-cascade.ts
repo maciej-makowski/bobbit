@@ -17,6 +17,7 @@ import type { ProjectContextManager } from "./project-context-manager.js";
 import type { LoadedEntity, PackEntry, PackScope, ResolvedEntity } from "./pack-types.js";
 import { scopePaths } from "./pack-types.js";
 import { PackResolver, RoleLoader, ToolLoader } from "./pack-resolver.js";
+import { builtinFirstPartyPackEntries, resolveBuiltinPacksDir } from "./builtin-packs.js";
 
 /**
  * `user` corresponds to the global-user scope. It is additive: global-user is
@@ -57,6 +58,20 @@ export interface MarketPackProvider {
 	marketEntries(scope: "server" | "global-user" | "project", projectId?: string): PackEntry[];
 }
 
+/**
+ * Supplies the per-scope pack-activation disabled-entity refs so the cascade can
+ * drop disabled roles/tools BEFORE precedence merge (pack-schema-v1 §7). Injected
+ * (server.ts wires it to the pack_activation store) so {@link ConfigCascade} stays
+ * decoupled from store wiring. Omitted ⇒ no activation filtering.
+ */
+export interface PackActivationProvider {
+	disabled(
+		scope: "server" | "global-user" | "project",
+		projectId: string | undefined,
+		packName: string,
+	): { roles?: string[]; tools?: string[]; skills?: string[]; entrypoints?: string[] };
+}
+
 export interface ResolvedPolicy {
 	policy: GrantPolicy;
 	origin: ConfigOrigin;
@@ -94,6 +109,15 @@ export class ConfigCascade {
 	 */
 	private globalUserBase: string;
 
+	/**
+	 * The first-party pack band root (`resolveBuiltinPacksDir()`). Shipped
+	 * first-party packs resolve in place as a band ABOVE the builtin defaults
+	 * and BELOW every user scope band (design §5.3). Injectable so unit tests can
+	 * point it at a fixture dir; defaults to the shipped dist tree (which is
+	 * absent under source/test runs ⇒ no band ⇒ byte-identical legacy merge).
+	 */
+	private builtinPacksDir: string;
+
 	constructor(
 		private builtins: BuiltinConfigProvider,
 		private serverStores: ServerStores,
@@ -101,13 +125,22 @@ export class ConfigCascade {
 		private projectRegistry?: ProjectAncestorRegistry,
 		private marketPackProvider?: MarketPackProvider,
 		globalUserBase?: string,
+		builtinPacksDir?: string,
 	) {
 		this.globalUserBase = globalUserBase ?? os.homedir();
+		this.builtinPacksDir = builtinPacksDir ?? resolveBuiltinPacksDir();
 	}
 
 	/** Late-bind the market-pack provider (server.ts wires it after fs/store setup). */
 	setMarketPackProvider(provider: MarketPackProvider): void {
 		this.marketPackProvider = provider;
+	}
+
+	private packActivationProvider?: PackActivationProvider;
+
+	/** Late-bind the pack-activation provider (server.ts wires it after store setup). */
+	setPackActivationProvider(provider: PackActivationProvider): void {
+		this.packActivationProvider = provider;
 	}
 
 	/** Override the global-user scope base (tests; defaults to `os.homedir()`). */
@@ -336,6 +369,16 @@ export class ConfigCascade {
 		};
 
 		const entries: PackEntry[] = [layer("builtin", "builtin", builtinItems)];
+		// Built-in first-party packs (resolve-in-place band, design §5.3): above
+		// the monolithic builtin defaults, below every user scope band. Deduped by
+		// path like market entries. Activation filtering (below) treats them as
+		// normal server-scope market packs.
+		for (const e of builtinFirstPartyPackEntries(this.builtinPacksDir)) {
+			const key = path.resolve(e.path);
+			if (seenMarketPaths.has(key)) continue;
+			seenMarketPaths.add(key);
+			entries.push(e);
+		}
 		// Server segment: market packs below the server user pack.
 		pushMarket("server");
 		entries.push(layer("user:server", "server", serverItems));
@@ -362,7 +405,21 @@ export class ConfigCascade {
 			}
 		}
 
-		return new PackResolver(entries, loaders).resolve<T>(type);
+		// Activation filtering (§7): drop disabled market-pack entities BEFORE merge
+		// so a lower-priority shadow can win. Non-market entries are never filtered.
+		const provider = this.packActivationProvider;
+		const filter = provider
+			? (entry: PackEntry, t: import("./pack-types.js").EntityType, name: string): boolean => {
+				if (entry.kind !== "market" || !entry.manifest) return true;
+				if (t !== "roles" && t !== "tools" && t !== "skills") return true;
+				const scope = entry.scope;
+				if (scope !== "server" && scope !== "global-user" && scope !== "project") return true;
+				const disabled = provider.disabled(scope, projectId, entry.manifest.name);
+				const list = disabled[t];
+				return !list || !list.includes(name);
+			}
+			: undefined;
+		return new PackResolver(entries, loaders, filter).resolve<T>(type);
 	}
 }
 

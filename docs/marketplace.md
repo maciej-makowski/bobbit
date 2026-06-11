@@ -27,7 +27,16 @@ A **pack is just a directory** laid out like Bobbit's shipped `defaults/` tree:
   roles/<name>.yaml
   tools/<group>/{*.yaml, extension.ts, _shared/...}
   skills/<name>/SKILL.md
+  panels/<panel>.yaml             # Extension-Host pack-scoped panels (auto-discovered)
+  entrypoints/<ep>.yaml           # Extension-Host pack-scoped launchers/deep-links
+  lib/                            # shared pack implementation modules (renderers, panels, routes)
 ```
+
+The `panels/`, `entrypoints/`, and `lib/` directories belong to the [Extension
+Host](#extension-contributions-tool-renderers--server-actions). A pack may ship any subset —
+including **no `tools/` at all** (a UI-only pack). See the
+[Extension Host authoring guide](extension-host-authoring.md) and the
+[V1 schema design](design/pack-schema-v1-rationalisation.md).
 
 A single `PackResolver` walks **one ordered list of packs**, low→high priority, and produces resolved entities — each tagged with the pack it came from. **Precedence is position in the list**: a name defined by a higher-priority pack shadows the same name in a lower one. That shadow is exactly what the marketplace flags as a conflict.
 
@@ -60,6 +69,16 @@ Private repos rely on your ambient git credentials (credential helper / SSH agen
 
 Select a source to list its packs. Each pack shows its name, version, description, and declared entities (the `contents` from `pack.yaml`, rendered as chips). A directory in the source is only treated as a pack if it contains a valid `pack.yaml`; anything else (a `README.md`, a `docs/` folder) is ignored.
 
+**Per-entity descriptions.** Below the entity chips, a collapsed **"Show details"** disclosure (a `<details>` element) reveals a one-line description for each declared role, tool, skill, and entry point. Descriptions are read straight from the pack dir on the source — role frontmatter, a representative tool-group YAML, skill `SKILL.md` frontmatter, and entry-point YAML respectively. The disclosure is collapsed by default so the at-a-glance chips stay the default and the descriptions are progressive disclosure — a pack with many entities never produces a wall of text. Entities without a description are simply omitted, and the disclosure disappears entirely when nothing would render.
+
+**Install state is reflected up front.** Rather than always offering an Install button, the browse card cross-references the installed list for the **currently-selected install scope** (project identity included, so it never matches a different project):
+
+- Not installed → an **Install** button (`market-install-pack`).
+- Installed but behind the source's latest version (same version comparison as [Updating and uninstalling](#updating-and-uninstalling)) → an **Update** button (`market-browse-update-pack`).
+- Installed and current → an **"Installed"** indicator (`market-browse-installed`).
+
+Why surface this on Browse? Without it, Browse always said "Install" even for packs already present, so users hit confusing `409 already installed` errors; showing the real state guides them to the correct action.
+
 ### Installing to a scope
 
 Each pack has an **Install** button with a scope picker. Installing copies the pack's directory verbatim into the chosen scope's `market-packs/<pack-name>/` and writes a generated `.pack-meta.yaml` recording provenance. Every contained role/tool/skill then resolves through the single resolver, tagged with that pack as its `origin`.
@@ -68,23 +87,38 @@ Each pack has an **Install** button with a scope picker. Installing copies the p
 
 Why a blanket warning rather than a tool-pack-only one? The old model implied a false binary — tool packs dangerous, role/skill packs safe. In reality every pack is risky once installed, because roles and skills become instructions to an LLM that has shell access. The Add-source panel includes an expandable **"Why?"** disclosure (collapsed by default) explaining the risk spectrum across the three entity types, highest to lowest:
 
-- **Tools** — ship code that runs **directly in the Bobbit server process on the host**, deterministically, with no LLM and no sandbox in the loop. This is the highest, most immediate risk. Three distinct code surfaces ship in a tool pack:
+- **Tools** — ship code that runs **on the host**, deterministically, with no LLM in the loop and only worker-level resource/crash isolation (not a security sandbox against the pack's own code). This is the highest, most immediate risk. Three distinct code surfaces ship in a tool pack:
   - **`extension.ts` / `_shared/`** — the tool implementation, run in the gateway process.
-  - **Server action handlers** (`actions:` contribution, [Extension Host](#extension-contributions-tool-renderers--server-actions)) — `actions.mjs` modules the gateway dynamically imports and runs **in the long-lived gateway process** when a renderer invokes an action via the sole pack→server path, `host.invokeAction`. The action endpoint (`POST /api/tools/:tool/actions/:action`) is same-origin and **authorized like a tool call** — it requires `:tool` to be in the calling session's `allowedTools` and verifies the supplied `toolUseId` actually exists in that session and was a call of `:tool` (because the LLM can `curl` it directly, this guard, not the agent layer, is the real gate). Unlike subprocess-isolated tool extensions, a crashing or hung handler runs in-process; Bobbit caps blast radius (a per-call timeout spanning **both** module load+eval *and* handler execution, a global concurrency cap, a per-session rate limit, try/catch isolation, and audit logging) but the handler code is still trusted host code. Handler inputs (`args`, `sessionId`, `toolUseId`) are **LLM-influenced and forgeable** — handlers must validate/whitelist them and never `eval`/`exec` them.
-  - **UI-thread renderers** (`renderer:` contribution) — pre-built ESM modules the browser lazily imports and runs **on the main UI thread**, over LLM-influenced tool data. They render tool blocks and can call server actions. Renderers must not auto-invoke actions on render (action calls require a user gesture), must preserve iframe `sandbox` attributes, and use theme tokens only.
+  - **Server action handlers** (tool-YAML `actions:` contribution, [Extension Host](#extension-contributions-tool-renderers--server-actions)) — `actions.mjs` modules invoked when a renderer calls an action via the sole pack→server path, `host.invokeAction`. The action endpoint (`POST /api/tools/:tool/actions/:action`) is same-origin and **authorized like a tool call** — it requires `:tool` to be in the calling session's `allowedTools` and verifies the supplied `toolUseId` actually exists in that session and was a call of `:tool` (because the LLM can `curl` it directly, this guard, not the agent layer, is the real gate). The handler does **not** run in the gateway process: like a pack's route and store handlers, it executes in a confined `worker_threads` worker — the parent process only resolves + validates the module path and never imports pack code. The worker gives **resource + crash isolation** (terminate-on-timeout, which is also the CPU control; memory/stack caps; spawned-child kill; module-import containment to the **pack root**) on top of the dispatcher's blast-radius controls (per-call timeout spanning module load+eval *and* execution, global concurrency cap, per-session rate limit, audit logging). This is a **stability** boundary, **not** a security sandbox against the pack's own code — the handler is still trusted host code, run from a source you chose to trust. Handler inputs (`args`, `sessionId`, `toolUseId`) are **LLM-influenced and forgeable** — handlers must validate/whitelist them and never `eval`/`exec` them.
+  - **UI-thread renderers** (tool-YAML `renderer:` contribution) **and panels** (`panels/<panel>.yaml`, auto-discovered) — pre-built ESM modules the browser lazily imports and runs **on the main UI thread**, over LLM-influenced tool data. They render tool blocks / side panels and reach the server only through the mediated Host API (`host.invokeAction` / `host.callRoute` / `host.store.*` / `host.session.*`). Renderers/panels must not auto-invoke actions or navigate on mount (writes require a genuine user gesture), must preserve iframe `sandbox` attributes for any embedded content, and use theme tokens only. A pack may **vendor npm dependencies** by bundling them into its served module ahead of time (esbuild, `npm run build:packs`; see the [authoring guide](extension-host-authoring.md#bundling-npm-dependencies-into-a-pack-vendoring)) — e.g. the artifacts pack inlines `highlight.js`/`pdfjs-dist`/`docx-preview` to reach built-in parity. This does NOT widen the trust model: bundled code is **the same trusted UI-thread code** as the rest of the renderer (source-level trust decision), and untrusted model-derived content (HTML artifacts) still renders inside a `sandbox`ed iframe — the trust boundary is content-origin, not which library drew the pixels.
+  - **Pack IDENTITY on the scoped capabilities is a SERVER-MINTED surface binding token, never a caller-supplied id.** The scoped Host-API calls (`host.store.*`, `host.session.*`, `host.callRoute`, and the WS session-write mint/post) all act AS a specific pack — store keys are namespaced by `packId`, `callRoute` is confined to the calling pack's own namespace, session reads are own-session. Identity must therefore not be forgeable. When the trusted app first constructs a surface's Host API it asks the server to mint a token (`POST /api/ext/surface-token`) for either a **tool-bound** surface (renderer/action, ref `{ tool }`) or a **pack-bound** surface (panel/entrypoint/route, ref `{ contributionKind, contributionId, packId }`). The server resolves the winning contribution and mints an opaque, HMAC-signed token bound to `{sessionId, packId, contributionId, tool?}`. The token is captured in the Host API **closure** (pack module code never sees or sets it) and echoed on every scoped call; the server **derives `{packId, tool?}` from the validated token and ignores any caller-supplied id**, re-resolving the pack identity on each call (so a token gone stale after an uninstall, or a session mismatch, is rejected). **Trust boundary differs by surface kind.** A tool-bound token still layers `:tool ∈ allowedTools`. A **pack-bound** token has no carrier tool, so its gate is **pack installed + active in the session's scope + caller's own session** — `allowedTools` no longer narrows which pack a session may reach. This is the deliberate authorization change that lets **orphan / UI-only packs** (no `tools/`) use the scoped surfaces; it grants no capability a tool-bound surface did not already have, because it stays bounded by the pack-scoped guarantees (store is `packId`-namespaced, `callRoute` reaches only the pack's own routes, session reads are own-session, session writes keep the user-gesture + one-time permit gate). This closes the **accidental + non-pack-reachable** identity-confusion path. **Residual:** in the shared main UI realm (Model A) a deliberately MALICIOUS pack can still mint its own token for a contribution it knows, or read another surface's token out of a shared closure / monkey-patch `fetch` — TRUE cross-pack isolation needs **per-pack realm isolation**, which Model A de-scopes for UI. The token makes the Host API the only *sanctioned* identity path and is **not** claimed as a defense against a same-realm adversary; full UI-thread realm isolation is the documented future hardening.
+  - **Session write (`host.session.postMessage`) drives the agent, so it is the highest-risk Host-API surface.** Because pack UI runs in the main realm and *can* monkey-patch globals like `window.fetch` **and `WebSocket.prototype.send`**, the surface is defended in depth: (1) the SEND does **not** ride a `fetch` — it goes over the app's already-authenticated **session WebSocket**, which pack code has no handle to, so there is no capturable session secret on any request; (2) every post must carry a **server-minted, one-time, content-bound write permit** — the client mints a nonce over the trusted WS (bound to `{session, packId, tool, sha256(role+text)}`, short TTL) and the server **single-use consumes** it on the post, so a **captured/replayed** `ext_session_post` frame (permit already consumed), a **forged** frame (no valid nonce), or a **tampered** role/text (hash mismatch) are all rejected with no post; (3) the server authorizes it (the pack's tool ∈ the session's `allowedTools`, server-derived packId), targets only the WS connection's own session (cross-session posting is structurally impossible), enforces role-aware delivery (a `"system"` message is framed as an explicit system directive, never silently delivered as user text), and **audits every post**; (4) the client adds a `navigator.userActivation` "no post on mount" check before minting. **Residual:** a pack forging the permit MINT *during a genuine user gesture* is inherent to the same-realm model — **FULL realm isolation of pack UI logic (a separate iframe/worker realm) is out of scope** for now and is what would close it; the source-level trust decision plus the server-side authorization/permit/audit are the durable boundary, and UI-thread realm isolation is the documented future hardening.
 - **Skills** — free-form instructions an agent tends to follow literally. An agent with shell access can be directed to do damage.
 - **Roles** — persona/behavior steering; influential but more diffuse. Still drives an LLM with tool access.
 
-There is no signing or sandboxing yet, so the source-level trust decision is the only safeguard. The full extension-host threat model — the allowlist-bypass fix, input validation, `toolUseId` ownership verification, and the blast-radius controls — is in [docs/design/extension-host.md §5](design/extension-host.md).
+There is no signing, and the worker isolation around pack server modules is **stability-only** (resource + crash isolation — terminate-on-timeout, memory/CPU caps, child kill, import-containment), not a security sandbox against trusted pack code. So the source-level trust decision remains the primary safeguard. The full extension-host threat model — the allowlist-bypass fix, input validation, `toolUseId` ownership verification, the worker isolation, and the blast-radius controls — is in [docs/design/extension-host.md §5](design/extension-host.md).
 
 ### Viewing provenance
 
 The **Installed** panel lists installed packs grouped by scope, each with the provenance from its `.pack-meta.yaml`: origin source URL, version, commit short SHA, and install/updated dates. A partially-copied or corrupt install (missing/invalid `.pack-meta.yaml`) is surfaced with a `corrupt` status so you can re-install or clean it up; corrupt packs are ignored by the resolver.
 
+Each installed pack also carries two install-state signals on its wire row (`InstalledPackWire`): `updateAvailable` (boolean) and `sourceStatus` (`"ok" | "unknown"`). These drive the action column honestly:
+
+- **Up to date** (`updateAvailable: false`, `sourceStatus: "ok"`) → no Update button. There is nothing to do, so nothing is shown.
+- **Update available** (`updateAvailable: true`) → an **Update** button (`market-update-pack`).
+- **Source can't be checked** (`sourceStatus: "unknown"` — the originating source was removed, never synced, or carries no version data) → a muted/warning **"Source not found"** lozenge (`market-source-unknown`) in place of the Update button.
+- **Uninstall is always available**, regardless of source state — you must always be able to remove an installed pack even if its source is gone.
+
+Why two fields instead of one boolean? A single "update available" flag can't distinguish *confirmed up to date* from *couldn't check*. Showing nothing in the unknown case would falsely imply the pack is current, and showing a stale Update button would mislead. The `updateAvailable` + `sourceStatus` split lets the UI render the honest third state — the "Source not found" lozenge.
+
 ### Updating and uninstalling
 
 - **Update** re-syncs the originating source, re-resolves the commit, and atomically replaces the installed directory (preserving the original `installedAt`, bumping `updatedAt`). Re-syncing a source then updating reflects upstream changes.
 - **Uninstall** deletes the pack directory and removes it from the scope's `pack_order`. Because the directory is the unit of truth, uninstall removes exactly what install added — no orphans.
+
+**When the Update button appears (change detection).** The Update button is shown only when the source's latest **manifest version** differs from the installed `.pack-meta.yaml` version — a plain version-string comparison, not a commit-SHA or file diff. This is cheap, deterministic, and matches the semver the publisher advertises.
+
+Crucially, this comparison is computed **server-side without a network sync**: it reads only the *existing* local source cache (a git source's already-cloned cache dir, or a local-dir source read in place). Why sync-free? The installed list (`GET /api/marketplace/installed`) is fetched on every Market-page open, and doing a per-pack `git fetch` there would be slow and would fail outright when offline. The cheap local-cache read is good enough to flag a likely update; the explicit **"Re-sync"** action (and the Update action itself) still refresh the source live, so a deliberate check is always one click away.
 
 ### Resolving same-name conflicts
 
@@ -93,6 +127,54 @@ When two packs define the same entity name, the higher-priority one wins and the
 > A plain builtin→user customize/override is **not** flagged — that's the normal override flow. Only conflicts involving a market pack raise the warning, to avoid noise on every customized role.
 
 The MVP ships exactly one configured resolution mechanism: **`pack_order`**, the per-scope ordering of market packs. Drag-reorder market packs within a scope (mirroring the existing project drag-reorder UI); the last entry has highest priority within that scope's market band. Reordering calls `PUT /api/marketplace/pack-order` and re-resolves synchronously, so the winner flips immediately and persists across reload. Alternatively, **customizing** the entity writes into the scope's user pack, which sits above all market packs in that scope and so always wins locally.
+
+### Activation controls
+
+Each installed pack exposes per-entity **activation toggles** on the Market installed-pack
+surface, so you can disable individual entities without uninstalling the pack. **Only
+user-facing entities are toggleable:** roles, tools, skills, and entrypoints. Support surfaces
+— panels, routes, stores, renderers, actions, `lib/` — are **not** independently toggleable
+(panels may be shown read-only as "support surfaces").
+
+What disabling does:
+
+- **Disable a tool / role / skill** — it is dropped from its resolved list (in the cascade
+  resolver, *before* precedence merge), so a lower-priority shadowed entity of the same name
+  may reappear.
+- **Disable an entrypoint** — its launcher + deep-link registration is omitted from
+  `/api/ext/contributions`, so the launcher/deep-link disappears. **A panel the entrypoint
+  targets stays available** to any enabled tool/entrypoint that opens it — disabling an
+  entrypoint never disables a panel.
+
+**Why a catalogue/runtime split.** Toggles persist in `pack_activation` (per scope/project,
+keyed by pack name + entity kind + name; entrypoints keyed by their `contents.entrypoints`
+basename, so one toggle covers both the launcher id and the deep-link `routeId` from that
+file). The toggle UI must render from the **unfiltered catalogue** — read straight from the
+installed pack's `pack.yaml` manifest via `GET /api/marketplace/pack-activation` — *not* from
+the runtime-filtered `/api/tools` / `/api/ext/contributions`. If the UI read the filtered
+runtime endpoints, a disabled entity would vanish from the list and become impossible to
+re-enable. So the catalogue stays complete (every toggle visible, `checked = name ∉
+disabled[kind]`) while the runtime registries stay filtered (a disabled entity does not
+register/resolve). The `PUT` returns the refreshed catalogue alongside the normalized
+`disabled`, then invalidates resolver caches so the effect is live without a reload. Scope
+split mirrors `pack_order`: project activation lives in the project config, server +
+global-user in the server config.
+
+**No standalone help paragraph.** An earlier version rendered an explanatory paragraph below
+the toggles; it has been removed. Once each entity carries its own one-line description (below),
+the toggles are self-explanatory and the paragraph was just noise competing with the pack
+provenance and action buttons for vertical space.
+
+**Per-entity descriptions (collapsed by default).** As on the Browse card, each installed pack
+exposes a collapsed **"Show details"** disclosure listing a one-line description per declared
+role / tool / skill / entry point. The descriptions are read straight from the **installed pack's
+manifest/dir** — the same authoritative source the activation catalogue reads from, **never**
+from `/api/tools` or `/api/ext/contributions`. This preserves the unfiltered-catalogue invariant:
+if the descriptions came from the runtime-filtered endpoints, a disabled entity would vanish and
+become impossible to re-enable. Manifest-declared entity names are **path-validated** (safe
+basename + a realpath-aware pack-root containment check) before any file is read, because the
+manifest's `contents` names are publisher-authored and this helper also runs on Browse, before
+any install. A rejected name simply yields no description row.
 
 ### Config-page integration
 
@@ -134,6 +216,42 @@ Both install and resolution derive these paths from one helper (`scopePaths()` i
 
 The source registry persists separately to `<server-cwd>/.bobbit/config/marketplace-sources.yaml`, and git clones are cached under `<server-cwd>/.bobbit/state/marketplace-cache/<source-id>/`.
 
+## Built-in (first-party) packs
+
+Bobbit ships some of its own features **as packs** rather than as bespoke built-in code. This **dogfoods the pack API**: a real shipped feature is delivered through the same `PackResolver` + Host API + activation system as any third-party pack, so the extension surface is exercised by production code and not just by tests. It also lets users **disable shipped features they don't want** from the Market UI, using the same per-entity activation toggles as installed packs. The first feature migrated this way is **`pr-walkthrough`** — see [docs/design/built-in-first-party-packs.md](design/built-in-first-party-packs.md) for the full design and rationale, and [the Extension Host authoring guide](extension-host-authoring.md#first-party-packs-dogfood-the-host-api) for how the pack re-expresses it.
+
+The shipped packs live in the repo at `market-packs/<name>/`, are built by `npm run build:packs`, and are copied into `dist/server/builtin-packs/market-packs/<name>/` by `scripts/copy-builtin-packs.mjs` (an explicit allowlist — *not* every dir under `market-packs/`). At runtime they are located relative to the server module dir (`resolveBuiltinPacksDir()` in `src/server/agent/builtin-packs.ts`, overridable via `BOBBIT_BUILTIN_PACKS_DIR` for tests).
+
+### Resolve-in-place, not copy-install
+
+Built-in packs are **resolved in place**, never copied into a scope's `market-packs/`. `buildPackList()` adds a dedicated **built-in first-party band** (`builtinFirstPartyPackEntries()`) that resolves each shipped pack directly from the dist tree. The band sits **above the monolithic builtin defaults and below every user scope band**:
+
+```
+builtin-defaults  <  built-in-first-party  <  server-installed  <  global-user  <  project
+```
+
+This was chosen over a copy-install model (auto-copy each pack into a scope on startup) because copy-install fights the user: re-installing a pack the user removed would need a persisted "opted-out" ledger, plus bespoke update-on-upgrade logic to refresh stale copies. With resolve-in-place, **"installed" just means present + active by default**, the only opt-out is *disable* (below), updates ride the app upgrade for free, and the user's `market-packs/` dirs stay purely user-owned. See [the design doc §2](design/built-in-first-party-packs.md) for the rejected alternative in full.
+
+Because the shipped dir contains a literal `market-packs` path segment, the security-critical pack-identity derivation (`derivePackId` / `packIdFromRoot` / `isMarketPackBaseDir`) yields a stable, correct `packId` with **zero changes to the identity code** — a built-in pack's identity is its dir name exactly like any market pack.
+
+### The synthetic "builtin" source
+
+The Market **Sources** tab shows a distinct, labelled **Built-in** section. It is backed by a *synthetic* source (`id: "builtin"`, `url: "builtin:"`) that is **never persisted** to `marketplace-sources.yaml` — `GET /api/marketplace/sources` composes it into the response at read time, so it is automatically idempotent across restarts and can never be duplicated or shadowed by a disk-authored row (`MarketplaceSourceStore` strips/rejects any `builtin` field or reserved id/url). Consequences:
+
+- **The built-in source cannot be removed.** `DELETE /api/marketplace/sources/builtin` → **403**; the UI omits the Remove control. Re-sync is a no-op (the dir ships with the app).
+- **Its packs cannot be copy-installed or updated.** `POST /api/marketplace/install` with `sourceId: "builtin"` → **403**, and `POST /api/marketplace/update` for a built-in pack name with no real user install → **403** ("built-in packs update with the app; nothing to update"). Browse rows render as *Provided (built-in)*, never with an Install button.
+
+### Disabling a shipped feature
+
+Built-in packs appear in the **Installed** tab in their own *Built-in (shipped)* group, flagged `builtin: true`, with **enable/disable toggles only — no Uninstall and no Update**. Disabling reuses the [#734 activation-override system](#activation-controls) verbatim: it writes `pack_activation` under the **`server` scope** (a shipped feature is a server-wide admin decision, so disabling applies across projects) and removes exactly the toggled user-facing entries (roles/tools/skills/entrypoints) from resolution. Panels and routes stay as support surfaces for whatever remains enabled. Because the migrated feature's old built-in code is **deleted** (the pack is the sole provider), disabling its pack makes the feature genuinely unavailable — the deep-link degrades to an empty "feature unavailable" state, never a crash. Toggling invalidates resolver caches synchronously, so the change takes effect with no restart/reload, and the disabled state **persists across reload and restart** (it lives in server config).
+
+### Same-name user override (shadowing)
+
+If a user installs a pack with the **same name** as a built-in one, both render as **two distinct Market rows** (built-in rows are keyed `builtin:<name>`, installed rows `<scope>:<name>`). The user install wins resolution (it sits higher in the list), so:
+
+- The installed row is uninstallable and **owns the live activation toggle**; uninstalling it simply re-exposes the built-in pack as the winner again.
+- The built-in row is non-uninstallable and its toggle is **disabled and marked *shadowed*** ("Shadowed by an installed pack — manage activation on the installed copy"), so exactly one row ever owns a live toggle.
+
 ## Authoring a pack
 
 ### Source-repo layout
@@ -165,14 +283,18 @@ description: >                   # REQUIRED. One-paragraph summary shown in the 
 version: 1.2.0                   # REQUIRED. Semver-ish string; shown in provenance.
 author: jane@example.com         # OPTIONAL.
 homepage: https://...            # OPTIONAL.
-contents:                        # REQUIRED. All three keys required; each MAY be empty.
-  roles:  [researcher]           #   Drives the browse-UI declared-entity chips.
-  tools:  [research]             #   tools[] are tool GROUP dir names under tools/.
-  skills: [lit-review]           #   (No per-pack gate keys off tools[]; trust is
-                                 #    decided once when adding a source.)
+contents:                        # REQUIRED. roles/tools/skills required; each MAY be empty.
+  roles:       [researcher]      #   Drives the browse-UI declared-entity chips.
+  tools:       [research]        #   tools[] are tool GROUP dir names under tools/.
+  skills:      [lit-review]      #   (No per-pack gate keys off tools[]; trust is
+  entrypoints: [open-review]      #    decided once when adding a source.)
+                                 #   OPTIONAL — entrypoints/<name>.yaml basenames (toggleable).
+routes:                          # OPTIONAL top-level block — Extension-Host pack routes.
+  module: lib/routes.mjs         #   relative to pack.yaml, contained in the pack root.
+  names:  [bundle, publish]       #   exported route-name allowlist.
 ```
 
-Validation rules: `name`, `description`, `version` must be non-empty; `name` must match the pattern (rejects path separators, `..`, leading dots); `contents` is required with all three array keys present (each may be empty). A `contents.mcp` key is **rejected** — MCP installs are out of scope in the MVP. Unknown top-level keys are ignored (forward-compat). A pack whose `pack.yaml` is missing or invalid is skipped with a warning, never fatal.
+Validation rules: `name`, `description`, `version` must be non-empty; `name` must match the pattern (rejects path separators, `..`, leading dots); `contents` is required with the `roles`/`tools`/`skills` array keys present (each may be empty). `contents.entrypoints` is optional and lists the basenames of `entrypoints/<name>.yaml` files (the Extension-Host activation catalogue — see [authoring guide](extension-host-authoring.md#entrypoints--non-chat-launchers--deep-link-routes-hostuinavigate)). The optional top-level `routes:` block declares pack-level Extension-Host routes. Panels are **auto-discovered** from `panels/*.yaml` and are not listed here. A `contents.mcp` key is **rejected** — MCP installs are out of scope in the MVP. There is **no `stores` key** (Extension-Host stores are implicit, namespaced by the server-derived `packId`) and **no `permissions` key** (trusted pack code has ambient OS access — there is no permission system). Unknown top-level keys are ignored (forward-compat). A pack whose `pack.yaml` is missing or invalid is skipped with a warning, never fatal.
 
 ### Generated `.pack-meta.yaml`
 
@@ -193,15 +315,17 @@ The canonical installed identity is `pack.yaml`'s `name` (not the source subdir 
 
 ## Extension contributions: tool renderers & server actions
 
-A tool pack can ship more than a tool implementation — it can contribute **how its tool blocks look in the chat** (a renderer) and **interactive server-side behavior** (action handlers). This is the **Extension Host**: the same VS Code-shaped contribution model that will eventually let packs ship side panels, routes, and persistent stores. **Phase 1** (shipped) covers the inner slice — tool renderers and server actions — and freezes the rest of the shape as reserved manifest keys + typed interfaces. See [docs/design/extension-host.md](design/extension-host.md) for the full design and the artifacts / PR-walkthrough migration sketch, and the [Extension Host authoring guide](extension-host-authoring.md) for a step-by-step walkthrough.
+A pack can ship more than a tool implementation — it can contribute **how tool blocks look in the chat** (a renderer), **interactive server-side behavior** (action handlers), persistent **side panels**, the pack's own **server routes**, non-chat **entrypoints**, implicit pack-scoped **stores**, and **session** access. This is the **Extension Host**: a contribution model where every capability flows through one mediated Host API. Everything is shipped — `HOST_API_VERSION` is `1` and `host.capabilities` reports all flags `true`. The two built-ins re-expressed as packs are the acceptance litmus: `market-packs/artifacts/` (a tool + panel + deep-link pack) and `market-packs/pr-walkthrough/` (a **no-tools / UI-only** pack).
+
+**Where each contribution lives (V1 schema).** Contributions are declared where their runtime scope already is: tool-scoped `renderer`/`actions` on the tool YAML; pack-scoped panels in `panels/<panel>.yaml` (auto-discovered), entrypoints in `entrypoints/<ep>.yaml` (listed in `contents.entrypoints`), and routes in the top-level `routes:` block of `pack.yaml`; shared modules in `lib/`. Stores are implicit. The authoritative schema + addressing contract is [docs/design/pack-schema-v1-rationalisation.md](design/pack-schema-v1-rationalisation.md). See also [docs/design/extension-host.md](design/extension-host.md) for the design (contract adapter, isolation model), [extension-host-phase2.md](design/extension-host-phase2.md) for the build history, and the [Extension Host authoring guide](extension-host-authoring.md) for the step-by-step walkthrough.
 
 **Why this lives in packs.** Before the extension host, tool renderers were hardcoded into the UI bundle and there was no way for a tool to run interactive server logic on a button click. Making both packable means a pack can re-express any built-in interactive tool (the litmus test: a pack tool with a **Retry** button wired to a handler) with no privileged escape hatch — every capability flows through one mediated Host API, which is also the single security choke point.
 
-**The durability invariant: no raw escape hatch.** A renderer reaches the server through exactly one Phase-1 path — `host.invokeAction(tool, action, args)`, authorized like a tool call. There is **no `host.gateway.fetch`** and no other raw transport. This is deliberate: Bobbit *serves* a typed, versioned contract rather than handing extensions a window into internals, so the abstraction stays durable (one un-typed passthrough would make it a fiction) and Phase-2 capabilities can be added purely additively. Removing the raw-fetch capability also eliminates the trusted-base-URL / `Host:`-header token-leak surface a raw fetch would have required — the action endpoint is same-origin and the client builds the request itself, so there is no caller-supplied URL or `Authorization` header to misdirect. The durable Phase-2 replacement for reaching the server is the typed, pack-scoped `host.callRoute(name, init)` (frozen, not implemented), which reaches only the calling pack's OWN `/api/ext/<thisPack>/*` routes. See the [Extension Host authoring guide](extension-host-authoring.md) and [design doc](design/extension-host.md) for the full Host API.
+**The durability invariant: no raw escape hatch.** A pack reaches the server only through typed, named, authorized Host-API methods — `host.invokeAction` (actions), `host.callRoute` (the pack's OWN routes), `host.store.*`, `host.session.*`. There is **no `host.gateway.fetch`** and no other raw transport. This is deliberate: Bobbit *serves* a typed, versioned contract rather than handing extensions a window into internals, so the abstraction stays durable (one un-typed passthrough would make it a fiction) and Phase-2 capabilities landed purely additively (no v1 signature changed, `HOST_API_VERSION` still `1`). Removing the raw-fetch capability also eliminates the trusted-base-URL / `Host:`-header token-leak surface a raw fetch would have required — endpoints are same-origin and the client builds the request itself, so there is no caller-supplied URL or `Authorization` header to misdirect. `host.callRoute(name, init)` is the typed, pack-scoped way to reach dynamic server data: it reaches only the calling pack's OWN routes (the server derives `<pack>` from the proven `tool` — no forgeable URL segment). See the [Extension Host authoring guide](extension-host-authoring.md) and [design doc](design/extension-host.md) for the full Host API.
 
-### The two load-bearing tool-YAML keys
+### The two tool-scoped keys (renderer + actions)
 
-Contributions are declared **per tool**, in the tool's YAML (`tools/<group>/<tool>.yaml`) — the same files `ToolManager` already scans. Two keys are load-bearing in Phase 1:
+The tool YAML (`tools/<group>/<tool>.yaml`) carries **only** the tool-scoped contributions — `renderer` and `actions`, the two that depend on a tool call / `toolUseId`. Pack-scoped contributions (panels, entrypoints, routes) live in their own files (see [below](#the-pack-scoped-contributions-panels-entrypoints-routes)). The two tool-scoped keys:
 
 ```yaml
 # market-packs/<pack>/tools/<group>/<tool>.yaml
@@ -214,12 +338,20 @@ actions:
   names: [retry]                    # optional action-name allowlist (defense in depth)
 ```
 
-- **`renderer:`** — path (relative to the tool's group dir) to a **pre-built ESM** renderer module. For built-in tools this field is display-only metadata; for **pack** tools it becomes load-bearing — the gateway serves the module and the browser lazily imports it.
+- **`renderer:`** — path (relative to the tool YAML's dir, contained in the pack root) to a **pre-built ESM** renderer module. For built-in tools this field is display-only metadata; for **pack** tools it becomes load-bearing — the gateway serves the module and the browser lazily imports it. May point at a shared module (`../../lib/SharedRenderer.js`).
 - **`actions:`** — the server actions module plus an optional explicit allowlist of action names. `actions.module` defaults to `actions.js`; `actions.names`, when present, is enforced by the endpoint *before* the module loads.
 
-A pack tool needs **no `provider:`** — the renderer endpoint and the action dispatcher resolve the tool's on-disk location via `ToolManager.resolveToolLocation()`, which is provider-independent.
+A pack tool needs **no `provider:`** — the renderer endpoint and the action dispatcher resolve the tool's on-disk location via `ToolManager.resolveToolLocation()`, which is provider-independent. A tool YAML carries no other contribution keys; the tool-scoped `/api/tools` payload exposes only `rendererKind`/`hasActions`/`actionNames` (plus origin metadata).
 
-The Phase-2 keys `panels:`, `entrypoints:`, `routes:`, and `stores:` are **parsed-and-reserved**: validated for shape, retained verbatim, and never rejected — so a pack authored against the full future shape installs and resolves cleanly on a Phase-1 server. Path-bearing values (`renderer`, `actions.module`) are rejected at parse time if they contain `..` segments or are absolute (traversal guard); a malformed contributions block degrades gracefully (the tool still loads, with a `console.warn`) and is never fatal.
+### The pack-scoped contributions (panels, entrypoints, routes)
+
+Panels, entrypoints, and routes are **pack-scoped** — they are not anchored to a carrier tool, which is what lets a pack ship them with no `tools/` dir at all:
+
+- **Panels** — one `panels/<panel>.yaml` per panel (`{ id, title?, entry }`), **auto-discovered** (not listed in `contents`). Panel ids are pack-local; the client keys its registry by `{packId, panelId}` and serves bytes from the pack-addressed `GET /api/ext/packs/:packId/panels/:panelId`.
+- **Entrypoints** — one `entrypoints/<ep>.yaml` per entrypoint, with the basename listed in `contents.entrypoints`. Launchers (composer-slash / git-widget-button / command-palette) and `kind:"route"` deep-links. Entrypoint `id` is pack-local; a `kind:"route"` `routeId` is **host-global**.
+- **Routes** — the top-level `routes: { module, names }` block on `pack.yaml`. The `RouteRegistry` builds from these pack-level refs (keyed by `packId`), so `host.callRoute` is opener-independent within a pack.
+
+Path-bearing values (`renderer`, `actions.module`, panel `entry`, `routes.module`) resolve **relative to their declaring file** and must stay inside the **pack root** — a `..` that escapes the pack root is rejected (realpath aware) at serve/import time; absolute paths are rejected at parse time. A malformed contribution file degrades gracefully (warned + dropped) and is never fatal. The hard-conflict rejections happen at pack-level registry build: a duplicate route name within a pack, a duplicate `routeId` across packs, a duplicate panel id within a pack, or a duplicate entrypoint id within a pack. **Stores are implicit** — created on first `host.store.put`, namespaced by the server-derived `packId`; there is no `stores` declaration.
 
 ### `.mjs` vs `.js` — ESM-loadability of the actions module
 
@@ -238,18 +370,32 @@ The renderer module, served to the browser and imported as ESM regardless of ext
 
 ```
 <scope>/.bobbit/config/market-packs/<pack>/
-  pack.yaml
+  pack.yaml                     # contents (incl. entrypoints[]) + optional routes:
   tools/<group>/
-    <tool>.yaml                 # renderer: + actions: contributions
+    <tool>.yaml                 # renderer: + actions: (tool-scoped only)
     SampleActionRenderer.js     # pre-built ESM renderer (browser-imported)
     actions.mjs                 # server action handlers (gateway-imported)
+  panels/<panel>.yaml           # auto-discovered pack panels
+  entrypoints/<ep>.yaml         # launchers + deep-link routes (listed in contents.entrypoints)
+  lib/                          # shared modules (panels, routes.mjs, helpers)
 ```
+
+A **no-tools pack** (e.g. `market-packs/pr-walkthrough/`) omits `tools/` entirely and ships only `pack.yaml` + `panels/` + `entrypoints/` + `lib/` — its surfaces obtain a pack-scoped Host API through pack-bound surface tokens, with no tool in `allowedTools`.
 
 ### Precedence, project scoping, and cache invalidation
 
 - **Pack precedence / shadowing** — renderers and actions resolve through the **same precedence** as every other tool (`buildPackList` / `PackResolver` / `ToolManager`: builtin < market packs in `pack_order` < user pack, per scope). A pack that shadows a same-named built-in interactive tool wins the **renderer too** (the UI registers it with `{ override: true }`), so it gets behavioral parity — pack actions *and* pack renderer, never a split-brain mix.
 - **Project scoping** — both the renderer endpoint and the action endpoint resolve through the **session's project-scoped** tool manager (falling back to the server-level one when there is no project), so a project-scope pack — or a project pack shadowing a global tool — serves and dispatches its own winner. The client threads the active `projectId` into the renderer fetch so the browser loads the same winner the `/api/tools` metadata reported.
-- **Cache invalidation (synchronous)** — install, update, uninstall, and pack-order changes all call `invalidateResolverCaches()`, which drops the loaded-actions-module cache and the tool-scan cache synchronously. The next action call picks up (or 404s) the freshly installed/updated/removed handler with **no server restart and no client reload** — the UI re-fetches `/api/tools` and reconciles its renderer registry (re-registering pack renderers, restoring displaced built-ins on uninstall) live.
+- **Cache invalidation (synchronous)** — install, update, uninstall, pack-order changes, and activation-toggle PUTs all call `invalidateResolverCaches()`, which drops the loaded-actions/routes-module caches, the route registry, the **pack-contribution registry**, and the tool-scan cache synchronously. The next action/route call picks up (or 404s) the freshly installed/updated/removed/toggled handler with **no server restart and no client reload** — the UI re-fetches `/api/tools` (renderers) and `/api/ext/contributions` (panels + entrypoints) and reconciles its registries (re-registering pack contributions, restoring displaced built-ins on uninstall) live.
+
+### What is (and isn't) pack-expressible in v1
+
+The Host API is deliberately the *only* surface a pack uses, so what a pack can express is exactly the set of typed, scoped capabilities the contract exposes. Two boundaries are worth stating explicitly, because they shape what re-expressing a built-in as a pack can and cannot cover:
+
+- **Privilege-minting operations are NOT pack-expressible — on purpose.** A pack cannot drive `team_spawn` (or any operation that mints a *new* privilege principal — a fresh agent/session with its own `allowedTools` and credentials). Every Host-API capability acts within the calling session's already-granted authority (own-session reads, allowedTools-gated writes, pack-namespaced stores); spawning a new principal would let a pack escalate beyond the session it was invoked in, which the boundary explicitly forbids. Such operations stay agent-tool-side, where the agent's own authority gates them.
+- **Typed `host.model.*` inference is the most impactful missing capability.** There is no Host-API method for a pack's server code to run LLM inference. This is not a credential boundary — a trusted pack could do its own inference exactly as a tool can (it has full ambient env + network) — but a *typed* `host.model.*` is simply out of scope for the durable v1 contract. This is *why* PR-walkthrough's LLM card synthesis stays in the `submit_pr_walkthrough_yaml` **agent tool** (which already has the agent's credentials and loop) and is read back from the pack store, rather than re-deriving inference in the pack's `bundle` route. A future parent-side `host.model.*` capability — running inference in the gateway process behind the same authorized proxy as `store`/`session` — is the highest-value additive extension; it would let packs synthesize live without an agent-tool round-trip, with provider/credential selection mediated by the gateway.
+
+These are not gaps in the *implementation* — they are properties of the trust model: a pack runs within the authority it was invoked under, and any GATEWAY-mediated capability (e.g. a future `host.model.*`) would be exposed through a typed host method rather than a raw transport. Ambient OS / env / network access is available to trusted pack server code exactly as it is to a tool or MCP server.
 
 ## REST API
 
@@ -268,6 +414,8 @@ All marketplace routes live in `server.ts::handleApiRoute()`. Full request/respo
 | `GET /api/marketplace/installed?projectId=` | List installed packs across scopes with provenance. |
 | `GET /api/marketplace/pack-order?scope=&projectId=` | Read a scope's market-pack order. |
 | `PUT /api/marketplace/pack-order` | `{ scope, projectId?, order }` — replace a scope's order. |
+| `GET /api/marketplace/pack-activation?scope=&projectId=&packName=` | Read a pack's activation state for a scope — returns the **unfiltered** `catalogue` (all toggleable entities the installed pack declares) + the current `disabled` refs. |
+| `PUT /api/marketplace/pack-activation` | `{ scope, projectId?, packName, disabled }` — replace a pack's activation overrides; returns the refreshed `catalogue` + normalized `disabled`, then invalidates caches. |
 | `GET /api/packs/conflicts?projectId=` | List same-name conflicts `(type, name, winner, shadowed[])`. |
 
 `scope` ∈ `"global-user" | "server" | "project"`; `projectId` is required when `scope === "project"`. Install/update/uninstall and pack-order changes invalidate the resolver cache and the slash-skills TTL cache synchronously, so a subsequent `GET /api/roles|tools|skills` reflects the change without a client reload.
@@ -280,8 +428,16 @@ Two routes serve the extension-host contributions (full contract + the security 
 
 | Method & path | Purpose |
 |---|---|
-| `GET /api/tools/:tool/renderer?projectId=` | Serve a **pack** tool's pre-built ESM renderer module bytes as `text/javascript`. Admin-bearer only (serving module bytes is static-asset-equivalent, not a capability invocation); 404 when the tool has no pack renderer. |
-| `POST /api/tools/:tool/actions/:action` | Invoke a pack tool's server action handler. Body `{ sessionId, toolUseId, args }`. **Authorized like a tool call** (the LLM can `curl` it directly): requires `x-bobbit-session-id`, `body.sessionId === header`, `:tool ∈ session.allowedTools`, `:action ∈ actions.names` (when declared), and a `toolUseId` that exists in the header-bound session and was a call of `:tool`. Returns the handler's JSON result. |
+| `GET /api/tools/:tool/renderer?projectId=` | Serve a **pack** tool's pre-built ESM renderer module bytes as `text/javascript`. Admin-bearer only (serving module bytes is static-asset-equivalent, not a capability invocation); 404 when the tool has no pack renderer. The internal containment check uses the **pack root**, so a `renderer: ../../lib/X.js` serves. |
+| `GET /api/ext/packs/:packId/panels/:panelId?projectId=` | Serve a **pack-scoped panel's** pre-built ESM module bytes. Pack-addressed because panel ids are only pack-unique. Bearer-only (static-asset-equivalent); 404 when the pack is not installed/active or the panel id is unknown in that pack. Replaces the old tool-keyed panel endpoint. |
+| `GET /api/ext/contributions?projectId=` | Project-scoped pack-contribution metadata for the client registries: one row per installed+active pack `{ packId, packName, panels, entrypoints, routeNames }` (empty arrays allowed — the always-emit contract keeps reconcile deterministic). **Activation-filtered** (disabled entrypoints omitted; panels/routes always present). |
+| `POST /api/tools/:tool/actions/:action` | Invoke a pack tool's server action handler. Body `{ sessionId, toolUseId, args }`. **Authorized like a tool call** (the LLM can `curl` it directly): requires `x-bobbit-session-id`, `body.sessionId === header`, `:tool ∈ session.allowedTools`, `:action ∈ actions.names` (when declared), and a `toolUseId` that exists in the header-bound session and was a call of `:tool`. Runs the handler in the confined worker; returns its JSON result. |
+| `POST /api/ext/surface-token` | Mint the **server-minted surface-binding token** (used internally by the trusted app). Accepts a **tool-bound** ref `{ sessionId, tool }` (gated by `allowedTools`) **or** a **pack-bound** ref `{ sessionId, contributionKind, contributionId, packId }` (gated by installed+active+own-session). The token binds `{sessionId, packId, contributionId, tool?}`; pack code never sees it. |
+| `POST /api/ext/store/:op` | `host.store.{get,put,list}`. Scoped via the surface token; keys namespaced by the server-derived `packId` (cross-pack reads rejected). For a tool-bound token `authorizeScopedRequest` also layers `allowedTools`; a pack-bound token skips it (the token already proved installed+active+own-session). |
+| `POST /api/ext/route/:name` | `host.callRoute(name, init)`. Derives `packId` from the surface token and resolves the route module via the pack-level `RouteRegistry` (`packId`-keyed), then dispatches it in the confined worker. No `<pack>` URL segment to forge; pack-bound (no-tool) tokens reach this path too. |
+| `GET /api/ext/session/transcript` · `GET /api/ext/session/tool-call` | `host.session.readTranscript` / `readToolCall`. Own-session reads (scoped to the header-bound session) mapped through the internal→contract adapter. |
+
+Session **writes** (`host.session.postMessage`) do **not** use a REST endpoint — they ride the app's authenticated session WebSocket (frames `ext_session_write_permit` → `ext_session_post`) so there is no capturable session secret on any `fetch`. The scoped endpoints (`store`/`route`/`session`-read) authorize through the surface token: a **tool-bound** token layers `authorizeScopedRequest` (the action guard **minus** the `toolUseId`-ownership step, so a panel/entrypoint surface with no owned tool call can still call them), while a **pack-bound** token (orphan/UI-only packs) skips the `allowedTools` gate entirely — its boundary is *installed + active in scope + own-session*. `invokeAction` keeps the full `authorizeActionRequest` (tool + `toolUseId` ownership).
 
 ## Architecture (developer)
 
@@ -334,7 +490,8 @@ See [docs/design/pack-based-marketplace.md](design/pack-based-marketplace.md) fo
 
 - **MCP and AGENTS are not installable.** `.mcp.json` and AGENTS/CLAUDE.md keep their own loaders and resolve as before; a pack may not ship `mcp/` or AGENTS content. MCP configs reference local binaries, absolute paths, and secrets that mostly won't run on the installer's machine; AGENTS.md describes one specific project. The resolver leaves an `mcp/` loader seam for when a parameterization/secrets model exists.
 - **Per-conflict pinning is deferred.** The only conflict-resolution mechanism is `pack_order` (plus user-pack customization). A future `pack_conflicts` schema is sketched in the design doc but not implemented, surfaced, or tested.
-- **No trust, signing, or sandboxing.** Installing any pack copies its contents as-is — tool packs copy executable code that runs in the Bobbit server process, and role/skill packs copy instructions for an LLM with shell access. The only safeguard is the blanket trust warning shown when adding a source (see the "Why?" disclosure for the per-entity-type threat model). A per-pack permission/signing gate would slot into the install pipeline later.
+- **No signing; isolation is stability-only, not a security sandbox.** Installing any pack copies its contents as-is — tool packs copy executable code, and role/skill packs copy instructions for an LLM with shell access. Pack source is **trusted** (the trust decision is the source-level warning when adding a source). Phase 2 runs pack server modules in a `worker_threads` worker, but that is **RESOURCE + CRASH isolation only** (terminate-on-timeout, memory/CPU caps, spawned-child kill) — explicitly **not** a security sandbox against a pack's own trusted code. Trusted pack server code runs with full ambient parity (normal `node:` built-ins, network globals, full `process` env), exactly like a tool or MCP server; there is no capability concept. Module-import resolution is contained to the pack root, but that is cheap loader/stability hygiene, not a security boundary (see the "Why?" disclosure and `extension-host.md §3.4`). The remaining gap is **per-pack realm isolation for UI** — pack UI shares the main thread's realm, so a deliberately malicious pack could monkey-patch globals; the surface-binding token and session-write permit close the accidental/non-pack-reachable paths but not a same-realm adversary. Per-pack signing and UI realm isolation are documented future hardenings.
 - **Git sync is synchronous.** Add-source, re-sync, and install run git inline and block until done.
 - **No hosted registry yet.** Sources are git repos or local dirs; the `MarketplaceSource` abstraction is kept open to a future hosted/searchable registry backend.
-- **Portable workflows and staff templates are not packable.** Workflows stay project-scoped inline in `project.yaml`; staff templates are noted as a gap. UI panels/plugins are the intended future headline entity type — the pack/loader format is designed to accommodate a `panels/` type additively.
+- **Portable workflows and staff templates are not packable.** Workflows stay project-scoped inline in `project.yaml`; staff templates are noted as a gap. (UI panels are now shipped as auto-discovered `panels/<panel>.yaml` pack contributions — see the [Extension Host](#extension-contributions-tool-renderers--server-actions) section.)
+- **Privilege-minting is not pack-expressible; typed inference is out of scope for v1.** A pack acts within the calling session's authority; it cannot `team_spawn` (mint a new principal). There is no *typed* `host.model.*` inference method — not because the worker lacks credentials (a trusted pack has full ambient env + network, like any tool), but because a gateway-mediated inference contract is deferred. A parent-side `host.model.*` is the highest-value future additive capability — see [What is (and isn't) pack-expressible in v1](#what-is-and-isnt-pack-expressible-in-v1).

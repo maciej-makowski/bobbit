@@ -39,10 +39,19 @@ import { shouldCreateWorktree } from "./agent/worktree-decision.js";
 import { resolveWorktreeSupport } from "./agent/worktree-support.js";
 import { RoleStore } from "./agent/role-store.js";
 import { RoleManager } from "./agent/role-manager.js";
-import { ToolManager, copyDirRecursive, __resetToolScanCache } from "./agent/tool-manager.js";
+import { ToolManager, copyDirRecursive, __resetToolScanCache, type MarketToolRoot } from "./agent/tool-manager.js";
 import { ActionDispatcher, ActionError, resolveActionToolManager } from "./extension-host/action-dispatcher.js";
-import { authorizeActionRequest, transcriptHasToolUse, type ActionGuardSession } from "./extension-host/action-guard.js";
+import { RouteDispatcher, RouteRegistry } from "./extension-host/route-dispatcher.js";
+import { ModuleHost } from "./extension-host/module-host-worker.js";
+import { authorizeActionRequest, authorizeScopedRequest, transcriptHasToolUse, type ActionGuardSession } from "./extension-host/action-guard.js";
+import { getPackStore, withStoreTimeout, PackStoreTimeoutError } from "./extension-host/pack-store.js";
 import { createServerHostApi } from "./extension-host/server-host-api.js";
+import { transcriptToHostMessages, transcriptToToolCall, buildTranscriptEnvelope } from "./extension-host/contract-adapter.js";
+import { resolvePackIdentityForTool } from "./extension-host/pack-identity.js";
+import { mintSurfaceToken, resolveSurfaceIdentity } from "./extension-host/surface-binding.js";
+import { PackContributionRegistry } from "./extension-host/pack-contribution-registry.js";
+import { loadPackContributions } from "./agent/pack-contributions.js";
+import { isPackPathWithinRoot } from "./extension-host/path-guard.js";
 import { buildGateStatusSummary } from "./gate-status-summary.js";
 import { buildGateVerificationSnapshot, UnknownVerificationStepError } from "./gate-verification-snapshot.js";
 import {
@@ -181,7 +190,7 @@ import { InboxManager, type InboxEntry } from "./agent/inbox-manager.js";
 import { InboxNudger } from "./agent/inbox-nudger.js";
 import type { InboxStore } from "./agent/inbox-store.js";
 import { PreferencesStore } from "./agent/preferences-store.js";
-import { ProjectConfigStore } from "./agent/project-config-store.js";
+import { ProjectConfigStore, type PackOrderScope } from "./agent/project-config-store.js";
 import { ToolGroupPolicyStore } from "./agent/tool-group-policy-store.js";
 import { getAllConfigDirectories, removeBuiltinDirectory, resetConfigDirectories } from "./agent/config-directories.js";
 import { checkDockerAvailability, buildSandboxImage, isBuildingImage, ensureImageAgentVersion } from "./agent/sandbox-status.js";
@@ -242,9 +251,10 @@ import { resolveScalarConfig } from "./agent/config-resolver.js";
 import { BuiltinConfigProvider } from "./agent/builtin-config.js";
 import { ConfigCascade, type MarketPackProvider } from "./agent/config-cascade.js";
 import { MarketplaceSourceStore, isValidSourceId } from "./agent/marketplace-source-store.js";
-import { MarketplaceInstaller, MarketplaceError, type InstallScope, type PackOrderStore } from "./agent/marketplace-install.js";
+import { builtinFirstPartyPackEntries, resolveBuiltinPacksDir } from "./agent/builtin-packs.js";
+import { MarketplaceInstaller, MarketplaceError, readPackEntityDescriptions, type InstallScope, type PackOrderStore, type PackEntityDescriptions } from "./agent/marketplace-install.js";
 import { scopeMarketPackEntries } from "./agent/pack-list.js";
-import { buildConflictsFor, type ConflictWire, type PackScope } from "./agent/pack-types.js";
+import { buildConflictsFor, type ConflictWire, type PackScope, type PackEntry } from "./agent/pack-types.js";
 
 import { initAssistantRegistry } from "./agent/assistant-registry.js";
 import {
@@ -890,7 +900,25 @@ export function createGateway(config: GatewayConfig) {
 	// Extension host (design docs/design/extension-host.md §4b): the action
 	// dispatcher lives for the gateway process lifetime; its module cache is
 	// dropped synchronously by invalidateResolverCaches() on pack mutations.
-	const actionDispatcher = new ActionDispatcher(toolManager);
+	// Slice C3: ONE shared confined worker host (server-module isolation, design §9)
+	// threaded into BOTH dispatchers — every pack action/route handler runs through
+	// `ModuleHost.invoke` in a terminate-able worker with empty env + a module-load
+	// deny-hook + memory caps. Isolation is UNCONDITIONAL: there is no config flag or
+	// env var that runs a pack server module in-process (no in-process seam exists).
+	const moduleHost = new ModuleHost();
+	const actionDispatcher = new ActionDispatcher(toolManager, { moduleHost });
+	// Slice B3: the route dispatcher (mirrors actionDispatcher) + the pack-level route
+	// registry. Both live for the gateway process lifetime; both caches are dropped by
+	// invalidateResolverCaches() on pack install/update/uninstall (rebuilds the index).
+	const routeDispatcher = new RouteDispatcher({ moduleHost });
+	// pack-schema-v1 §5.2/§5.3: the pack-contribution registry + the route registry
+	// built off it are constructed AFTER the market-pack provider + activation store
+	// wiring below (they enumerate via the same marketPackProvider).
+	let routeRegistry!: RouteRegistry;
+	let packContributionRegistry!: PackContributionRegistry;
+	// Slice B1: warm the process-singleton pack store (file-backed, pack-namespaced
+	// persistence behind `host.store.*` + the /api/ext/store/:op endpoint).
+	getPackStore();
 	const groupPolicyStore = new ToolGroupPolicyStore(configDir);
 	const sandboxTokenStore = new SandboxTokenStore();
 	const cookieStore = new CookieStore(stateDir);
@@ -981,8 +1009,14 @@ export function createGateway(config: GatewayConfig) {
 	// #1). Mirrors the cascade scope order (server < global-user < project) and
 	// dedups self-managed-project path collisions, keeping the FIRST (lowest)
 	// scope, exactly as `ConfigCascade.resolveEntities` does.
-	const marketToolRoots = (projectId?: string): string[] => {
-		const roots: string[] = [];
+	// Each root carries its pack's pack_activation `disabledTools` list at the
+	// resolving scope (pack-schema-v1 §7), so runtime resolution drops disabled
+	// pack tools and reinstates a lower-priority shadow EXACTLY as the cascade
+	// listing does — no split-brain between `/api/tools` and the renderer/action/
+	// surface-token/prompt-doc paths. `packActivationStore` is the SAME store the
+	// cascade reads (defined just below; referenced lazily at request time).
+	const marketToolRoots = (projectId?: string): MarketToolRoot[] => {
+		const roots: MarketToolRoot[] = [];
 		const seen = new Set<string>();
 		for (const scope of ["server", "global-user", "project"] as const) {
 			for (const e of marketPackProvider.marketEntries(scope, projectId)) {
@@ -990,7 +1024,11 @@ export function createGateway(config: GatewayConfig) {
 				const key = path.resolve(toolsDir);
 				if (seen.has(key)) continue;
 				seen.add(key);
-				roots.push(toolsDir);
+				const packName = e.manifest?.name;
+				const disabledTools = packName
+					? packActivationStore(scope, projectId)?.getPackActivation(scope, packName).tools
+					: undefined;
+				roots.push({ dir: toolsDir, disabledTools: disabledTools ?? undefined });
 			}
 		}
 		return roots;
@@ -1002,6 +1040,60 @@ export function createGateway(config: GatewayConfig) {
 	// roots (server < global-user < project) — applied to existing + future ctxs.
 	projectContextManager.setContextConfigurator((ctx) => {
 		ctx.toolManager.setMarketToolRootsProvider(() => marketToolRoots(ctx.project.id));
+	});
+
+	// pack-schema-v1 §6.7: resolve the pack_activation store for a scope+project.
+	// `server`/`global-user` overrides live in the server config; `project` in the
+	// project config (same split as pack_order).
+	const packActivationStore = (scope: PackScope, projectId?: string): ProjectConfigStore | null => {
+		if (scope === "server" || scope === "global-user") return projectConfigStore;
+		if (scope === "project") {
+			if (!projectId) return null;
+			return projectContextManager.getOrCreate(projectId)?.projectConfigStore ?? null;
+		}
+		return null;
+	};
+
+	// pack-schema-v1 §5.2: enumerate installed market-pack ENTRIES (low→high,
+	// deduped-on-path) for a project — the registry collapses to the winning pack
+	// per packId before indexing.
+	const marketPackEntriesForProject = (projectId?: string): PackEntry[] => {
+		const out: PackEntry[] = [];
+		const seen = new Set<string>();
+		// Built-in first-party band (built-in-first-party-packs §7.5): the shipped
+		// packs are NOT installed, so they must be injected here or their
+		// panels/entrypoints/routes never register. Push FIRST (lowest priority),
+		// deduped by resolved path with the same `seen` set, so a user-installed
+		// same-name pack (pushed later from a scope band) still wins when the
+		// registry collapses to one winning pack per packId.
+		for (const e of builtinFirstPartyPackEntries(resolveBuiltinPacksDir())) {
+			const key = path.resolve(e.path);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			out.push(e);
+		}
+		for (const scope of ["server", "global-user", "project"] as const) {
+			for (const e of marketPackProvider.marketEntries(scope, projectId)) {
+				const key = path.resolve(e.path);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				out.push(e);
+			}
+		}
+		return out;
+	};
+	packContributionRegistry = new PackContributionRegistry(
+		marketPackEntriesForProject,
+		(scope, projectId, packName) => packActivationStore(scope as PackScope, projectId)?.getPackActivation(scope as PackOrderScope, packName).entrypoints ?? [],
+	);
+	routeRegistry = new RouteRegistry(packContributionRegistry);
+
+	// pack-schema-v1 §7: feed pack_activation into the roles/tools cascade so a
+	// disabled entity is dropped BEFORE precedence merge (a shadow may reappear).
+	configCascade.setPackActivationProvider({
+		disabled(scope, projectId, packName) {
+			return packActivationStore(scope as PackScope, projectId)?.getPackActivation(scope as PackOrderScope, packName) ?? {};
+		},
 	});
 
 	const staffManager = new StaffManager(projectContextManager);
@@ -1209,7 +1301,7 @@ export function createGateway(config: GatewayConfig) {
 			// Enable via BOBBIT_TIMING_LOG=1 to print "[timing] METHOD path ms" for each API call.
 			const _timingEnabled = process.env.BOBBIT_TIMING_LOG === "1";
 			const _timingStart = _timingEnabled ? performance.now() : 0;
-			await handleApiRoute(url, req, res, sessionManager, config, colorStore, prStatusStore, teamManager, roleManager, toolManager, projectContextManager, bgProcessManager, staffManager, verificationHarness, preferencesStore, projectConfigStore, groupPolicyStore, broadcastToGoal, broadcastToAll, sandboxManager, projectRegistry, configCascade, sandboxScope, sandboxTokenStore, reviewAnnotationStore, broadcastToSession, roleStore, inboxManager, prWalkthroughAgentManager, marketplaceSourceStore, marketplaceInstaller, cookieStore, actionDispatcher);
+			await handleApiRoute(url, req, res, sessionManager, config, colorStore, prStatusStore, teamManager, roleManager, toolManager, projectContextManager, bgProcessManager, staffManager, verificationHarness, preferencesStore, projectConfigStore, groupPolicyStore, broadcastToGoal, broadcastToAll, sandboxManager, projectRegistry, configCascade, sandboxScope, sandboxTokenStore, reviewAnnotationStore, broadcastToSession, roleStore, inboxManager, prWalkthroughAgentManager, marketplaceSourceStore, marketplaceInstaller, cookieStore, actionDispatcher, routeDispatcher, routeRegistry, packContributionRegistry);
 			if (_timingEnabled) {
 				const dur = performance.now() - _timingStart;
 				if (dur >= 100) console.log(`[timing] ${req.method} ${url.pathname}${url.search} ${dur.toFixed(1)}ms`);
@@ -1623,7 +1715,7 @@ export function createGateway(config: GatewayConfig) {
 		}
 
 		wss.handleUpgrade(req, socket, head, (ws) => {
-			handleWebSocketConnection(ws, sessionId, req, sessionManager, config.authToken, rateLimiter, projectConfigStore, isLocalhostServer, sandboxTokenStore, projectContextManager);
+			handleWebSocketConnection(ws, sessionId, req, sessionManager, config.authToken, rateLimiter, projectConfigStore, isLocalhostServer, sandboxTokenStore, projectContextManager, toolManager, packContributionRegistry);
 		});
 	});
 
@@ -2259,11 +2351,21 @@ async function handleApiRoute(
 	marketplaceInstaller?: MarketplaceInstaller,
 	cookieStore?: CookieStore,
 	actionDispatcher?: ActionDispatcher,
+	routeDispatcherArg?: RouteDispatcher,
+	routeRegistryArg?: RouteRegistry,
+	packContributionRegistryArg?: PackContributionRegistry,
 ) {
 	// These are always wired by the sole caller; the optional markers are only to avoid
 	// touching every existing signature site.
 	const serverRoleStore = roleStore!;
 	const dispatcher = actionDispatcher!;
+	// Slice B3: the route dispatcher + pack-level route registry (always wired by the
+	// sole caller alongside actionDispatcher).
+	const routeDispatcher = routeDispatcherArg!;
+	const routeRegistry = routeRegistryArg!;
+	// pack-schema-v1 §5.2: the project-scoped pack-contribution registry (panels /
+	// entrypoints / routes), always wired by the sole caller.
+	const packContributionRegistry = packContributionRegistryArg!;
 	/** Serialize a cascade-resolved item with origin/overrides + market-pack tags (design §5.2). */
 	const withOrigin = (r: { item: Record<string, unknown>; origin: unknown; overrides?: unknown; originPackId?: string | null; originPackName?: string | null }): Record<string, unknown> => ({
 		...r.item,
@@ -2279,7 +2381,24 @@ async function handleApiRoute(
 	// marketplace pack-list mutation (design §9.1 / finding #1) so newly
 	// installed/updated/removed market-pack tool roots are re-scanned (Windows
 	// coarse-mtime can otherwise serve a stale scan after a re-copy update).
-	const invalidateResolverCaches = (): void => { invalidateSlashSkillsCache(); __resetToolScanCache(); dispatcher.invalidate(); };
+	const invalidateResolverCaches = (): void => { invalidateSlashSkillsCache(); __resetToolScanCache(); dispatcher.invalidate(); routeDispatcher.invalidate(); routeRegistry.invalidate(); packContributionRegistry.invalidate(); };
+	// pack-schema-v1 §6.6: scoped-endpoint authorization for a PACK-BOUND surface
+	// token (no carrier tool). The token validation already proved installed +
+	// active + own-session via the pack-contribution registry, so allowedTools is
+	// NOT consulted (the new trust boundary, §4.5); we only re-check that the body
+	// session matches the header-canonical session and that the session resolves.
+	const packBoundScopedGuard = (
+		headerSid: string | undefined,
+		bodySid: unknown,
+		resolveSession: (id: string) => ActionGuardSession | undefined,
+	): { ok: true; sessionId: string } | { ok: false; status: number; error: string } => {
+		if (!headerSid) return { ok: false, status: 403, error: "missing session" };
+		if (bodySid !== undefined && bodySid !== null && bodySid !== headerSid) {
+			return { ok: false, status: 403, error: "session mismatch" };
+		}
+		if (!resolveSession(headerSid)) return { ok: false, status: 403, error: "unknown session" };
+		return { ok: true, sessionId: headerSid };
+	};
 	const json = (data: unknown, status = 200) => {
 		res.writeHead(status, { "Content-Type": "application/json" });
 		res.end(JSON.stringify(data));
@@ -2373,6 +2492,16 @@ async function handleApiRoute(
 			projectBase: ctx?.project.rootPath,
 			serverConfigStore: projectConfigStore,
 			projectConfigStore: ctx?.projectConfigStore,
+			// pack-schema-v1 §7: thread the SAME pack_activation store the roles/tools
+			// cascade uses (single source of truth) so disabled market-pack skills are
+			// filtered out of /api/slash-skills, /api/slash-skills/details, and the
+			// conflicts endpoint before the precedence merge. server/global-user read
+			// the server config store; project reads the project's config store — the
+			// same scope→store split as the cascade's `packActivationStore`.
+			packActivation: (scope, packName) => {
+				const store = scope === "project" ? ctx?.projectConfigStore : projectConfigStore;
+				return store?.getPackActivation(scope as PackOrderScope, packName) ?? {};
+			},
 		};
 	}
 
@@ -5114,7 +5243,25 @@ async function handleApiRoute(
 	if (url.pathname === "/api/tools" && req.method === "GET") {
 		const projectId = url.searchParams.get("projectId") || undefined;
 		const resolved = configCascade.resolveTools(projectId);
-		const tools: Array<Record<string, unknown>> = resolved.map(r => withOrigin(r as any));
+		// pack-schema-v1: expose each market-pack tool's STRUCTURAL packId (the
+		// `market-packs/<name>` dir segment via the same `resolvePackIdentityForTool`
+		// the renderer/action endpoints + /api/ext/contributions use) so a tool
+		// renderer's `host.ui.openPanel({panelId})` resolves the panel WITHIN its own
+		// pack (panel ids are pack-local) via /api/ext/packs/:packId/panels/:panelId.
+		// Empty/absent for builtins. Tool-scoped origin identity only — NOT a
+		// pack-scoped contribution field.
+		const toolPackTm = resolveActionToolManager(
+			toolManager,
+			projectId ? projectContextManager.getOrCreate(projectId)?.toolManager : undefined,
+		);
+		const tools: Array<Record<string, unknown>> = resolved.map(r => {
+			const out = withOrigin(r as any);
+			if (r.originPackId && toolPackTm) {
+				const packId = resolvePackIdentityForTool(toolPackTm, r.item.name).packId;
+				if (packId) out.packId = packId;
+			}
+			return out;
+		});
 		// Include MCP/external tools not covered by the config cascade
 		if (toolManager) {
 			const resolvedNames = new Set(resolved.map(r => r.item.name));
@@ -5149,7 +5296,10 @@ async function handleApiRoute(
 			const cascadeEntry = configCascade.resolveTools(projectId).find(r => r.item.name === name);
 			if (cascadeEntry) {
 				const withMeta = withOrigin(cascadeEntry as any);
-				json({ ...tool, origin: withMeta.origin, ...(withMeta.overrides ? { overrides: withMeta.overrides } : {}), originPackId: withMeta.originPackId, originPackName: withMeta.originPackName });
+				// pack-schema-v1: mirror the LIST endpoint's structural packId so the
+				// tools edit page keeps the same own-pack identity for a market-pack tool.
+				const packId = cascadeEntry.originPackId ? resolvePackIdentityForTool(tm, name).packId : "";
+				json({ ...tool, origin: withMeta.origin, ...(withMeta.overrides ? { overrides: withMeta.overrides } : {}), originPackId: withMeta.originPackId, originPackName: withMeta.originPackName, ...(packId ? { packId } : {}) });
 			} else {
 				json(tool);
 			}
@@ -5228,11 +5378,13 @@ async function handleApiRoute(
 			json({ error: "no pack renderer for this tool" }, 404);
 			return;
 		}
+		// The renderer resolves RELATIVE to the tool YAML's dir, but containment is
+		// against the PACK ROOT (pack-schema-v1 §6.2), so `renderer: ../../lib/X.js`
+		// serves while an out-of-pack path is rejected.
 		const groupAbs = path.join(loc.baseDir, loc.groupDir || "");
+		const packRoot = path.dirname(loc.baseDir);
 		const fileAbs = path.resolve(groupAbs, loc.rendererFile);
-		// Path-traversal re-validation: fileAbs must stay within the group dir.
-		const rel = path.relative(groupAbs, fileAbs);
-		if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+		if (!isPackPathWithinRoot(packRoot, fileAbs)) {
 			json({ error: "invalid renderer path" }, 404);
 			return;
 		}
@@ -5247,6 +5399,70 @@ async function handleApiRoute(
 		res.end(source);
 		return;
 	}
+
+	// GET /api/ext/packs/:packId/panels/:panelId?projectId= — serve a PACK's
+	// pre-built ESM side-panel module bytes (pack-schema-v1 §6.3). Panels are
+	// pack-addressed (panel ids are only pack-unique), NOT tool-keyed. Admin-bearer
+	// ONLY / static-asset-equivalent — NO allowedTools check (serving bytes is not a
+	// capability invocation, same as the renderer endpoint). The panel `entry`
+	// resolves relative to its declaring panels/<file>.yaml and is re-validated to
+	// stay within the pack root.
+	const extPanelMatch = url.pathname.match(/^\/api\/ext\/packs\/([^/]+)\/panels\/([^/]+)$/);
+	if (extPanelMatch && req.method === "GET") {
+		const packId = decodeURIComponent(extPanelMatch[1]);
+		const panelId = decodeURIComponent(extPanelMatch[2]);
+		const panelProjectId = url.searchParams.get("projectId") || undefined;
+		const panel = packContributionRegistry.getPanel(panelProjectId, packId, panelId);
+		if (!panel) {
+			json({ error: "no such panel in this pack" }, 404);
+			return;
+		}
+		const fileAbs = path.resolve(path.dirname(panel.sourceFile), panel.entry);
+		if (!isPackPathWithinRoot(panel.packRoot, fileAbs)) {
+			json({ error: "invalid panel path" }, 404);
+			return;
+		}
+		let source: string;
+		try {
+			source = fs.readFileSync(fileAbs, "utf-8");
+		} catch {
+			json({ error: "panel module not found" }, 404);
+			return;
+		}
+		res.writeHead(200, { "Content-Type": "text/javascript", "Cache-Control": "no-cache" });
+		res.end(source);
+		return;
+	}
+
+	// GET /api/ext/contributions?projectId= — project-scoped pack-contribution
+	// metadata for the client registries (pack-schema-v1 §6.4). Activation filtering
+	// is already applied by the registry (disabled entrypoints omitted). EVERY
+	// installed + active pack emits a row (empty arrays allowed) — the frozen
+	// always-emit contract so the client reconcile is deterministic.
+	if (url.pathname === "/api/ext/contributions" && req.method === "GET") {
+		const contribProjectId = url.searchParams.get("projectId") || undefined;
+		const packs = packContributionRegistry.list(contribProjectId).map((p) => ({
+			packId: p.packId,
+			packName: p.packName,
+			panels: p.panels.map((panel) => (panel.title !== undefined ? { id: panel.id, title: panel.title } : { id: panel.id })),
+			entrypoints: p.entrypoints.map((e) => {
+				const out: Record<string, unknown> = { id: e.id, kind: e.kind, listName: e.listName };
+				if (e.label !== undefined) out.label = e.label;
+				if (e.routeId !== undefined) out.routeId = e.routeId;
+				if (e.target !== undefined) out.target = e.target;
+				if (e.paramKeys !== undefined) out.paramKeys = e.paramKeys;
+				return out;
+			}),
+			routeNames: p.routes?.names ?? [],
+		}));
+		json({ packs });
+		return;
+	}
+
+	// Fix B: there is NO server-side own-session message poster — driving the agent
+	// is a client-only, user-activation + session-secret gated capability. A server
+	// route/action handler has no user gesture, so the server Host API exposes no
+	// `session.postMessage` (see server-host-api.ts).
 
 	// POST /api/tools/:tool/actions/:action — invoke a pack tool's server action
 	// handler (design §4b / §5). The LLM can curl this directly, so the
@@ -5321,13 +5537,35 @@ async function handleApiRoute(
 		// endpoint is same-origin and built here, so there is no caller-supplied URL
 		// or Authorization header to sanitize. `ctx.host` carries only the bound
 		// identity (+ frozen Phase-2 stubs).
+		// Slice A: derive the pack identity SERVER-SIDE from the SAME session-project
+		// resolver the dispatcher loads the winning module from (no split-brain). The
+		// client never sends a packId — it names only a tool, and the server maps
+		// tool → winning pack (design extension-host-phase2.md §2.2).
+		const ident = resolvePackIdentityForTool(sessionToolManager, tool);
+		// Slice B2: own-session transcript reader for ctx.host.session.read*. Reads the
+		// HEADER-BOUND session only (single-sourced identity) via the same own-session
+		// read the transcript endpoint uses.
+		const readOwnTranscript = async (): Promise<string | null> => {
+			const ps = sessionManager.getPersistedSession(guard.sessionId);
+			if (!ps?.agentSessionFile) return null;
+			const fsCtx: SessionFsContext = { sandboxed: ps.sandboxed, projectId: ps.projectId };
+			return sessionFileRead(fsCtx, ps.agentSessionFile, sandboxManager);
+		};
 		const host = createServerHostApi({
 			sessionId: guard.sessionId,
 			toolUseId,
+			packId: ident.packId,
+			contributionId: ident.contributionId,
+			packStore: getPackStore(),
+			readOwnTranscript,
 		});
+		// The session working dir the confined worker uses as its process.cwd() (tool
+		// parity — prefer the worktree path; fall back to the recorded cwd).
+		const actionPs = sessionManager.getPersistedSession(guard.sessionId);
+		const actionWorkingDir = actionPs?.worktreePath ?? actionPs?.cwd;
 		const start = Date.now();
 		try {
-			const result = await dispatcher.dispatch(tool, action, { host, sessionId: guard.sessionId, toolUseId, tool }, args, sessionToolManager);
+			const result = await dispatcher.dispatch(tool, action, { host, sessionId: guard.sessionId, toolUseId, tool, workingDir: actionWorkingDir }, args, sessionToolManager);
 			console.log(`[ext-action] tool=${tool} action=${action} session=${guard.sessionId} toolUseId=${toolUseId} caller=${guard.sessionId} outcome=ok durationMs=${Date.now() - start}`);
 			json(result ?? null);
 		} catch (err) {
@@ -5338,6 +5576,387 @@ async function handleApiRoute(
 		}
 		return;
 	}
+
+	// POST /api/ext/surface-token — mint a SERVER-MINTED surface binding token for a
+	// pack surface (renderer / panel / entrypoint), called by the TRUSTED app loader
+	// the first time it constructs that surface's Host API (design extension-host-
+	// phase2.md §2.3 + §10). Authorize via authorizeScopedRequest (header-canonical
+	// session, body===header, session resolves, `tool` ∈ allowedTools), SERVER-derive
+	// the winning {packId, contributionId} from `tool`, reject a non-pack caller, and
+	// mint a token BOUND to {sessionId, packId, contributionId, tool}. The client holds
+	// the opaque token in the Host API closure and echoes it on every scoped call; the
+	// scoped endpoints DERIVE {packId, tool} from the validated token and ignore any
+	// caller-supplied tool/pack — closing the cross-pack identity hole the bare `tool`
+	// field left open. (A same-realm malicious pack can still mint its own token for an
+	// arbitrary tool name — the documented Model-A residual, marketplace.md threat model.)
+	if (url.pathname === "/api/ext/surface-token" && req.method === "POST") {
+		const body = (await readBody(req)) ?? {};
+		const headerSessionId = req.headers["x-bobbit-session-id"] as string | string[] | undefined;
+		const mintHeaderSid = Array.isArray(headerSessionId) ? headerSessionId[0] : headerSessionId;
+		const mintSessionProjectId = mintHeaderSid
+			? (sessionManager.getSession(mintHeaderSid)?.projectId
+				?? sessionManager.getPersistedSession(mintHeaderSid)?.projectId)
+			: undefined;
+		const resolveSession = (id: string): ActionGuardSession | undefined => {
+			const live = sessionManager.getSession(id);
+			if (live) return { allowedTools: live.allowedTools };
+			const persisted = sessionManager.getPersistedSession(id);
+			if (persisted) return { allowedTools: persisted.allowedTools };
+			return undefined;
+		};
+		const contributionKind = (body as { contributionKind?: unknown }).contributionKind;
+
+		// ── Pack-bound surface (panel / entrypoint / route) — pack-schema-v1 §6.5.
+		//    No carrier tool, so NO allowedTools gate; the trust boundary is
+		//    installed + active in the session's scope + caller's own session (§4.5).
+		if (typeof contributionKind === "string") {
+			if (contributionKind !== "panel" && contributionKind !== "entrypoint" && contributionKind !== "route") {
+				json({ error: "invalid contributionKind" }, 400);
+				return;
+			}
+			const bodySid = (body as { sessionId?: unknown }).sessionId;
+			if (!mintHeaderSid || typeof bodySid !== "string" || bodySid !== mintHeaderSid) {
+				json({ error: "session mismatch" }, 403);
+				return;
+			}
+			if (!resolveSession(mintHeaderSid)) {
+				json({ error: "unknown session" }, 403);
+				return;
+			}
+			const packId = typeof (body as { packId?: unknown }).packId === "string" ? (body as { packId: string }).packId : "";
+			const contributionRef = typeof (body as { contributionId?: unknown }).contributionId === "string" ? (body as { contributionId: string }).contributionId : "";
+			if (!packId || !contributionRef) {
+				json({ error: "packId and contributionId are required" }, 400);
+				return;
+			}
+			// Validate the pack is installed + active in scope AND the contribution exists.
+			const pack = packContributionRegistry.getPack(mintSessionProjectId, packId);
+			let exists = false;
+			if (pack) {
+				if (contributionKind === "panel") exists = !!packContributionRegistry.getPanel(mintSessionProjectId, packId, contributionRef);
+				else if (contributionKind === "entrypoint") exists = !!packContributionRegistry.getEntrypoint(mintSessionProjectId, packId, contributionRef);
+				else exists = packContributionRegistry.hasRoute(mintSessionProjectId, packId, contributionRef);
+			}
+			if (!pack || !exists) {
+				json({ error: "surface tokens are available only to installed, active pack contributions" }, 403);
+				return;
+			}
+			const contributionId = `${contributionKind}:${contributionRef}`;
+			const token = mintSurfaceToken({ sessionId: mintHeaderSid, packId, contributionId });
+			console.log(`[ext-surface-token] kind=${contributionKind} contribution=${contributionRef} packId=${packId} session=${mintHeaderSid} outcome=ok`);
+			json({ token });
+			return;
+		}
+
+		// ── Tool-bound surface (renderer / action) — UNCHANGED. ──
+		const tool = typeof (body as { tool?: unknown }).tool === "string" ? (body as { tool: string }).tool : "";
+		const mintToolManager = resolveActionToolManager(
+			toolManager,
+			mintSessionProjectId ? projectContextManager.getOrCreate(mintSessionProjectId)?.toolManager : undefined,
+		);
+		const guard = authorizeScopedRequest({
+			tool,
+			headerSessionId,
+			bodySessionId: (body as { sessionId?: unknown }).sessionId,
+			resolveSession,
+		});
+		if (!guard.ok) {
+			json({ error: guard.error }, guard.status);
+			return;
+		}
+		const ident = resolvePackIdentityForTool(mintToolManager, tool);
+		if (!ident.isPack || !ident.packId) {
+			json({ error: "surface tokens are available only to market-pack tools" }, 403);
+			return;
+		}
+		const token = mintSurfaceToken({ sessionId: guard.sessionId, packId: ident.packId, contributionId: ident.contributionId, tool });
+		console.log(`[ext-surface-token] tool=${tool} packId=${ident.packId} session=${guard.sessionId} outcome=ok`);
+		json({ token });
+		return;
+	}
+
+	// POST /api/ext/store/:op — pack-namespaced KV persistence behind `host.store.*`
+	// (design extension-host-phase2.md §3 B1.2). Pack-scoped (NOT tool-call-scoped):
+	// the caller proves identity via a SERVER-MINTED surface token (NOT a caller-
+	// supplied `tool` — closing the cross-pack identity hole); the server DERIVES
+	// {packId, tool} from the validated token, then layers the per-session guard
+	// (header-canonical session, body===header, session resolves, derived tool ∈
+	// allowedTools — NO toolUseId-ownership, so a panel/entrypoint with no owned
+	// toolUseId can persist). Keys are namespaced by the derived packId.
+	const storeMatch = url.pathname.match(/^\/api\/ext\/store\/([^/]+)$/);
+	if (storeMatch && req.method === "POST") {
+		const op = decodeURIComponent(storeMatch[1]);
+		if (op !== "get" && op !== "put" && op !== "list") {
+			json({ error: `Unknown store op "${op}"` }, 404);
+			return;
+		}
+		const body = (await readBody(req)) ?? {};
+		const headerSessionId = req.headers["x-bobbit-session-id"] as string | string[] | undefined;
+		const storeHeaderSid = Array.isArray(headerSessionId) ? headerSessionId[0] : headerSessionId;
+		// Resolve the tool through the SESSION's project-scoped tool manager (same
+		// no-split-brain resolution the action endpoint uses).
+		const storeSessionProjectId = storeHeaderSid
+			? (sessionManager.getSession(storeHeaderSid)?.projectId
+				?? sessionManager.getPersistedSession(storeHeaderSid)?.projectId)
+			: undefined;
+		const storeToolManager = resolveActionToolManager(
+			toolManager,
+			storeSessionProjectId ? projectContextManager.getOrCreate(storeSessionProjectId)?.toolManager : undefined,
+		);
+		const resolveSession = (id: string): ActionGuardSession | undefined => {
+			const live = sessionManager.getSession(id);
+			if (live) return { allowedTools: live.allowedTools };
+			const persisted = sessionManager.getPersistedSession(id);
+			if (persisted) return { allowedTools: persisted.allowedTools };
+			return undefined;
+		};
+		// 1. DERIVE {packId, tool?} from the SERVER-MINTED surface token — never a
+		//    caller-supplied `tool`. Rejects a missing/invalid/wrong-session/stale token.
+		//    For a PACK-BOUND token (no tool) the token validation already proved
+		//    installed+active+own-session against the pack-contribution registry.
+		const surf = resolveSurfaceIdentity({ token: (body as { surfaceToken?: unknown }).surfaceToken, headerSessionId: storeHeaderSid, resolver: storeToolManager, contributions: packContributionRegistry, projectId: storeSessionProjectId });
+		if (!surf.ok) {
+			json({ error: surf.error }, surf.status);
+			return;
+		}
+		const tool = surf.tool;
+		const ident = { packId: surf.packId };
+		// 2. Authorize: TOOL-bound tokens layer the allowedTools+session guard;
+		//    PACK-bound tokens (no tool) skip allowedTools (new trust boundary §4.5)
+		//    and only re-check the body===header session match.
+		const guard = tool !== undefined
+			? authorizeScopedRequest({ tool, headerSessionId, bodySessionId: (body as { sessionId?: unknown }).sessionId, resolveSession })
+			: packBoundScopedGuard(storeHeaderSid, (body as { sessionId?: unknown }).sessionId, resolveSession);
+		if (!guard.ok) {
+			json({ error: guard.error }, guard.status);
+			return;
+		}
+		const key = (body as { key?: unknown }).key;
+		const prefix = (body as { prefix?: unknown }).prefix;
+		const start = Date.now();
+		try {
+			const packStore = getPackStore();
+			let result: unknown;
+			// Bound each store op by a wall-time (design §3 B1.2): a stuck/slow backend
+			// rejects with PackStoreTimeoutError → 504 rather than holding the request
+			// open outside the blast-radius control.
+			if (op === "get") {
+				result = await withStoreTimeout(packStore.get(ident.packId, key as string), undefined, `store ${op}`);
+			} else if (op === "put") {
+				await withStoreTimeout(packStore.put(ident.packId, key as string, (body as { value?: unknown }).value), undefined, `store ${op}`);
+				result = { ok: true };
+			} else {
+				result = await withStoreTimeout(packStore.list(ident.packId, typeof prefix === "string" ? prefix : undefined), undefined, `store ${op}`);
+			}
+			console.log(`[ext-store] op=${op} tool=${tool} packId=${ident.packId} session=${guard.sessionId} outcome=ok durationMs=${Date.now() - start}`);
+			json(result ?? null);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			// A timed-out store op is a 5xx (backend unavailable); other errors (quota,
+			// bad input) stay 4xx.
+			const status = err instanceof PackStoreTimeoutError ? 504 : 400;
+			console.warn(`[ext-store] op=${op} tool=${tool} packId=${ident.packId} session=${guard.sessionId} outcome=error(${status}) durationMs=${Date.now() - start}: ${message}`);
+			json({ error: message }, status);
+		}
+		return;
+	}
+
+	// GET /api/ext/session/{transcript,tool-call} — Slice B2 pack-scoped, OWN-SESSION
+	// transcript reads (design extension-host-phase2.md §4 B2.2). The HEADER-BOUND
+	// session is the single canonical identity; there is NO parameter for another
+	// session — reads are own-session by construction. `tool` (query) gates on the
+	// session's allowedTools through the SAME `authorizeScopedRequest` core the
+	// action endpoint uses (no toolUseId required — panels/entrypoints may originate
+	// the read). `sessionId` (query) is the body-vs-header fail-fast input.
+	const extSessionTranscript = url.pathname === "/api/ext/session/transcript";
+	const extSessionToolCall = url.pathname === "/api/ext/session/tool-call";
+	if ((extSessionTranscript || extSessionToolCall) && req.method === "GET") {
+		const extHeaderSid = req.headers["x-bobbit-session-id"] as string | string[] | undefined;
+		const extCanonSid = Array.isArray(extHeaderSid) ? extHeaderSid[0] : extHeaderSid;
+		const extResolveSession = (id: string): ActionGuardSession | undefined => {
+			const live = sessionManager.getSession(id);
+			if (live) return { allowedTools: live.allowedTools };
+			const persisted = sessionManager.getPersistedSession(id);
+			if (persisted) return { allowedTools: persisted.allowedTools };
+			return undefined;
+		};
+		// Resolve the SESSION's project-scoped tool manager up front (no split-brain),
+		// then DERIVE {packId, tool} from the SERVER-MINTED surface token (query param) —
+		// never a caller-supplied `tool`. authorizeScopedRequest only gates allowedTools
+		// (an UNRESTRICTED session has none), so identity MUST come from the validated
+		// token; a missing/invalid/wrong-session/stale token (or non-pack tool) is rejected
+		// BEFORE any transcript byte is read — session reads are pack-only + own-session.
+		const extSessionProjectId = extCanonSid
+			? (sessionManager.getSession(extCanonSid)?.projectId
+				?? sessionManager.getPersistedSession(extCanonSid)?.projectId)
+			: undefined;
+		const extToolManager = resolveActionToolManager(
+			toolManager,
+			extSessionProjectId ? projectContextManager.getOrCreate(extSessionProjectId)?.toolManager : undefined,
+		);
+		const surf = resolveSurfaceIdentity({ token: url.searchParams.get("surfaceToken"), headerSessionId: extCanonSid, resolver: extToolManager, contributions: packContributionRegistry, projectId: extSessionProjectId });
+		if (!surf.ok) {
+			json({ error: surf.error }, surf.status);
+			return;
+		}
+		// TOOL-bound tokens layer the allowedTools+session guard; PACK-bound tokens
+		// (no tool) skip allowedTools (§4.5) and only re-check the session match.
+		const extGuard = surf.tool !== undefined
+			? authorizeScopedRequest({ tool: surf.tool, headerSessionId: extHeaderSid, bodySessionId: url.searchParams.get("sessionId"), resolveSession: extResolveSession })
+			: packBoundScopedGuard(extCanonSid, url.searchParams.get("sessionId"), extResolveSession);
+		if (!extGuard.ok) {
+			json({ error: extGuard.error }, extGuard.status);
+			return;
+		}
+		// Read the HEADER-BOUND session's transcript ONLY (own-session by construction).
+		const extPs = sessionManager.getPersistedSession(extGuard.sessionId);
+		let extJsonl: string | null = null;
+		if (extPs?.agentSessionFile) {
+			const fsCtx: SessionFsContext = { sandboxed: extPs.sandboxed, projectId: extPs.projectId };
+			extJsonl = await sessionFileRead(fsCtx, extPs.agentSessionFile, sandboxManager);
+		}
+		if (extSessionToolCall) {
+			const toolUseId = url.searchParams.get("toolUseId");
+			if (!toolUseId) { json({ error: "toolUseId required" }, 400); return; }
+			json(transcriptToToolCall(extJsonl, toolUseId));
+			return;
+		}
+		const parseIntQ = (name: string): number | undefined => {
+			const raw = url.searchParams.get(name);
+			if (raw === null) return undefined;
+			const n = Number(raw);
+			return Number.isFinite(n) ? n : undefined;
+		};
+		try {
+			const envelope = buildTranscriptEnvelope(transcriptToHostMessages(extJsonl), {
+				offset: parseIntQ("offset"),
+				limit: parseIntQ("limit"),
+				pattern: url.searchParams.get("pattern") ?? undefined,
+			});
+			json(envelope);
+		} catch (err) {
+			json({ error: err instanceof Error ? err.message : String(err) }, 400);
+		}
+		return;
+	}
+
+	// POST /api/ext/route/:name — pack-scoped typed route call behind `host.callRoute`
+	// (design extension-host-phase2.md §5 B3.2). Pack-scoped (NOT tool-call-scoped):
+	// authorize via authorizeScopedRequest (NO toolUseId-ownership — a panel/entrypoint
+	// with no owned toolUseId may call routes), then derive the trusted packId SERVER-
+	// side from the opener `tool` and resolve the route MODULE via the pack-level
+	// RouteRegistry (opener-INDEPENDENT) so a route declared on tool Y is reachable from
+	// a surface opened by tool X in the SAME pack. There is NO `<pack>` URL segment to
+	// forge — the routed pack is derived from a tool the caller proves it owns.
+	const routeMatch = url.pathname.match(/^\/api\/ext\/route\/([^/]+)$/);
+	if (routeMatch && req.method === "POST") {
+		const routeName = decodeURIComponent(routeMatch[1]);
+		const body = (await readBody(req)) ?? {};
+		const headerSessionId = req.headers["x-bobbit-session-id"] as string | string[] | undefined;
+		const routeHeaderSid = Array.isArray(headerSessionId) ? headerSessionId[0] : headerSessionId;
+		// Resolve the tool through the SESSION's project-scoped tool manager (same
+		// no-split-brain resolution the action + store endpoints use).
+		const routeSessionProjectId = routeHeaderSid
+			? (sessionManager.getSession(routeHeaderSid)?.projectId
+				?? sessionManager.getPersistedSession(routeHeaderSid)?.projectId)
+			: undefined;
+		const routeToolManager = resolveActionToolManager(
+			toolManager,
+			routeSessionProjectId ? projectContextManager.getOrCreate(routeSessionProjectId)?.toolManager : undefined,
+		);
+		const resolveSession = (id: string): ActionGuardSession | undefined => {
+			const live = sessionManager.getSession(id);
+			if (live) return { allowedTools: live.allowedTools };
+			const persisted = sessionManager.getPersistedSession(id);
+			if (persisted) return { allowedTools: persisted.allowedTools };
+			return undefined;
+		};
+		// 1. DERIVE the trusted {packId, tool} from the SERVER-MINTED surface token —
+		//    never a caller-supplied `tool` (closing the cross-pack identity hole). The
+		//    derived tool is the OPENER (the surface's contributing tool); the route
+		//    MODULE is resolved opener-INDEPENDENTLY below via the pack-level registry.
+		const surf = resolveSurfaceIdentity({ token: (body as { surfaceToken?: unknown }).surfaceToken, headerSessionId: routeHeaderSid, resolver: routeToolManager, contributions: packContributionRegistry, projectId: routeSessionProjectId });
+		if (!surf.ok) {
+			json({ error: surf.error }, surf.status);
+			return;
+		}
+		const routeTool = surf.tool;
+		const ident = { packId: surf.packId, contributionId: surf.contributionId };
+		// 2. Authorize: TOOL-bound tokens layer the allowedTools+session guard;
+		//    PACK-bound tokens (no tool — orphan/UI-only pack) skip allowedTools
+		//    (§4.5) and only re-check the session match. NO toolUseId-ownership.
+		const guard = routeTool !== undefined
+			? authorizeScopedRequest({ tool: routeTool, headerSessionId, bodySessionId: (body as { sessionId?: unknown }).sessionId, resolveSession })
+			: packBoundScopedGuard(routeHeaderSid, (body as { sessionId?: unknown }).sessionId, resolveSession);
+		if (!guard.ok) {
+			json({ error: guard.error }, guard.status);
+			return;
+		}
+		// 4. Resolve the route MODULE via the pack-level registry (off pack-level
+		//    routes, opener-independent — pack-schema-v1 §5.3).
+		const resolved = routeRegistry.resolve(ident.packId, routeName, routeSessionProjectId);
+		if (!resolved) {
+			json({ error: `pack "${ident.packId}" declares no route "${routeName}"` }, 404);
+			return;
+		}
+		// 5. Dispatch the registry's DECLARING-tool module with the packId-bound host
+		//    context (identity from ident, NOT the opener tool).
+		const toolUseId = typeof (body as { toolUseId?: unknown }).toolUseId === "string"
+			? (body as { toolUseId: string }).toolUseId
+			: undefined;
+		const init = ((body as { init?: unknown }).init ?? {}) as { method?: unknown; query?: unknown; body?: unknown };
+		const method = typeof init.method === "string" ? init.method : "GET";
+		let query: Record<string, string> | undefined;
+		if (init.query && typeof init.query === "object") {
+			query = {};
+			for (const [k, v] of Object.entries(init.query as Record<string, unknown>)) {
+				if (v !== undefined && v !== null) query[k] = String(v);
+			}
+		}
+		const readOwnTranscript = async (): Promise<string | null> => {
+			const ps = sessionManager.getPersistedSession(guard.sessionId);
+			if (!ps?.agentSessionFile) return null;
+			const fsCtx: SessionFsContext = { sandboxed: ps.sandboxed, projectId: ps.projectId };
+			return sessionFileRead(fsCtx, ps.agentSessionFile, sandboxManager);
+		};
+		const host = createServerHostApi({
+			sessionId: guard.sessionId,
+			toolUseId,
+			packId: ident.packId,
+			contributionId: ident.contributionId,
+			packStore: getPackStore(),
+			readOwnTranscript,
+		});
+		const start = Date.now();
+		try {
+			// The session working dir the confined worker uses as its process.cwd()
+			// (tool parity — prefer the worktree path; fall back to the recorded cwd).
+			const routePs = sessionManager.getPersistedSession(guard.sessionId);
+			const routeWorkingDir = routePs?.worktreePath ?? routePs?.cwd;
+			const result = await routeDispatcher.dispatch(
+				resolved.modulePath,
+				resolved.packRoot,
+				routeName,
+				{ host, sessionId: guard.sessionId, toolUseId: toolUseId ?? "", tool: ident.contributionId, workingDir: routeWorkingDir },
+				{ method, query, body: init.body },
+			);
+			console.log(`[ext-route] name=${routeName} tool=${routeTool ?? ident.contributionId} packId=${ident.packId} session=${guard.sessionId} outcome=ok durationMs=${Date.now() - start}`);
+			json(result ?? null);
+		} catch (err) {
+			const status = err instanceof ActionError ? err.status : 500;
+			const message = err instanceof Error ? err.message : String(err);
+			console.warn(`[ext-route] name=${routeName} tool=${routeTool ?? ident.contributionId} packId=${ident.packId} session=${guard.sessionId} outcome=error(${status}) durationMs=${Date.now() - start}: ${message}`);
+			json({ error: message }, status);
+		}
+		return;
+	}
+
+	// NOTE: the C2 session WRITE (`host.session.postMessage`) is intentionally NOT an
+	// HTTP endpoint. It is driven over the TRUSTED session WebSocket
+	// (`ext_session_post` in src/server/ws/handler.ts) so that no capturable session
+	// secret ever rides a pack-monkey-patchable `fetch`, and pack code — which has no
+	// handle to the WS — cannot send it. A raw same-realm `fetch` to any session
+	// endpoint therefore cannot drive the agent. See docs/design/extension-host-phase2.md §8 C2.1.
 
 	// POST /api/tools/:name/customize — copy tool group to a target scope
 	const toolCustomizeMatch = url.pathname.match(/^\/api\/tools\/([^/]+)\/customize$/);
@@ -5584,6 +6203,18 @@ async function handleApiRoute(
 		const installer = marketplaceInstaller;
 		const sourceStore = marketplaceSourceStore;
 
+		// ── Built-in first-party source (built-in-first-party-packs §4.4, §6.4) ──
+		// The built-in source is synthetic + non-persisted: it is composed only here
+		// and points at the shipped first-party packs resolved in place.
+		const BUILTIN_SOURCE_ID = "builtin";
+		const builtinSource = { id: BUILTIN_SOURCE_ID, url: "builtin:", builtin: true, addedAt: new Date(0).toISOString() };
+		// A pack name is "built-in" iff a shipped first-party pack declares it.
+		const isBuiltinPackName = (name: string): boolean =>
+			builtinFirstPartyPackEntries(resolveBuiltinPacksDir()).some((e) => e.manifest?.name === name);
+		// True iff a real user install of `(scope, packName)` exists in the ledger.
+		const hasUserInstall = (scope: InstallScope, packName: string, projectId?: string): boolean =>
+			installer.listInstalled(allContexts(projectId)).some((p) => p.scope === scope && p.packName === packName);
+
 		const MARKET_SCOPES = new Set(["global-user", "server", "project"]);
 		const parseScope = (raw: unknown): InstallScope | null =>
 			typeof raw === "string" && MARKET_SCOPES.has(raw) ? (raw as InstallScope) : null;
@@ -5637,7 +6268,8 @@ async function handleApiRoute(
 		// ── Sources ───────────────────────────────────────────────
 		// GET /api/marketplace/sources
 		if (url.pathname === "/api/marketplace/sources" && req.method === "GET") {
-			json({ sources: sourceStore.list() });
+			// Prepend the synthetic, non-removable built-in source (§4.4).
+			json({ sources: [builtinSource, ...sourceStore.list()] });
 			return;
 		}
 		// POST /api/marketplace/sources { url, ref? }
@@ -5666,6 +6298,34 @@ async function handleApiRoute(
 		if (sourceMatch) {
 			const id = decodeURIComponent(sourceMatch[1]);
 			const sub = sourceMatch[2];
+			// Built-in source (§4.4): special-cased BEFORE the 404 check because
+			// `sourceStore.get("builtin")` is undefined (never persisted).
+			if (id === BUILTIN_SOURCE_ID) {
+				if (!sub && req.method === "DELETE") {
+					json({ error: "the built-in source cannot be removed" }, 403);
+					return;
+				}
+				if (sub === "/sync" && req.method === "POST") {
+					// No-op resync: built-in packs ride the app upgrade.
+					json({ source: builtinSource });
+					return;
+				}
+				if (sub === "/packs" && req.method === "GET") {
+					// Map the shipped first-party packs to the same browse-row shape
+					// `installer.browsePacks` returns, flagged builtin + provided.
+					const packs = builtinFirstPartyPackEntries(resolveBuiltinPacksDir()).map((e) => ({
+						...e.manifest!,
+						dirName: e.manifest!.name,
+						hasTools: e.manifest!.contents.tools.length > 0,
+						builtin: true,
+						provided: true,
+					}));
+					json({ packs });
+					return;
+				}
+				json({ error: "unsupported built-in source operation" }, 405);
+				return;
+			}
 			if (!isValidSourceId(id) || !sourceStore.get(id)) { json({ error: `unknown source: ${id}` }, 404); return; }
 
 			if (!sub && req.method === "DELETE") {
@@ -5696,6 +6356,8 @@ async function handleApiRoute(
 			if (!scope) { json({ error: "invalid scope" }, 400); return; }
 			const dirName = typeof body?.dirName === "string" ? body.dirName : (typeof body?.packName === "string" ? body.packName : undefined);
 			if (typeof body?.sourceId !== "string" || typeof dirName !== "string") { json({ error: "sourceId and dirName are required" }, 400); return; }
+			// Built-in packs are resolved in place; they cannot be copy-installed (§4.4).
+			if (body.sourceId === BUILTIN_SOURCE_ID) { json({ error: "built-in packs are provided in place and cannot be installed" }, 403); return; }
 			const st = resolveScopeTarget(scope, body?.projectId);
 			if (!st.ok) { json({ error: st.error }, st.status); return; }
 			try {
@@ -5711,6 +6373,13 @@ async function handleApiRoute(
 			const scope = parseScope(body?.scope);
 			if (!scope) { json({ error: "invalid scope" }, 400); return; }
 			if (typeof body?.packName !== "string") { json({ error: "packName is required" }, 400); return; }
+			// Built-in packs update with the app; a server-scope built-in with no
+			// ledger entry has nothing to update (§4.4). A genuine user install of
+			// the same name proceeds normally below.
+			if (scope === "server" && isBuiltinPackName(body.packName) && !hasUserInstall("server", body.packName, body?.projectId)) {
+				json({ error: "built-in packs update with the app; nothing to update" }, 403);
+				return;
+			}
 			const st = resolveScopeTarget(scope, body?.projectId);
 			if (!st.ok) { json({ error: st.error }, st.status); return; }
 			try {
@@ -5726,6 +6395,13 @@ async function handleApiRoute(
 			const scope = parseScope(body?.scope);
 			if (!scope) { json({ error: "invalid scope" }, 400); return; }
 			if (typeof body?.packName !== "string") { json({ error: "packName is required" }, 400); return; }
+			// Built-in packs are not in the install ledger and cannot be uninstalled
+			// (§4.4); only enable/disable applies. A genuine user install of the same
+			// name (ledger entry present) proceeds normally below.
+			if (isBuiltinPackName(body.packName) && !hasUserInstall(scope, body.packName, body?.projectId)) {
+				json({ error: "built-in packs cannot be uninstalled" }, 403);
+				return;
+			}
 			const st = resolveScopeTarget(scope, body?.projectId);
 			if (!st.ok) { json({ error: st.error }, st.status); return; }
 			try {
@@ -5738,7 +6414,24 @@ async function handleApiRoute(
 		// GET /api/marketplace/installed?projectId=
 		if (url.pathname === "/api/marketplace/installed" && req.method === "GET") {
 			const projectId = url.searchParams.get("projectId") || undefined;
-			try { json({ installed: installer.listInstalled(allContexts(projectId)) }); } catch (err) { jsonError(500, err); }
+			try {
+				// Prepend synthetic built-in pack rows (§6.4): a distinct non-install
+				// row kind (no meta/ledger entry) flagged `builtin: true`. A
+				// user-installed same-name pack still appears as its own ledger row.
+				const builtinRows = builtinFirstPartyPackEntries(resolveBuiltinPacksDir()).map((e) => ({
+					scope: "server" as InstallScope,
+					packName: e.manifest!.name,
+					manifest: e.manifest!,
+					meta: e.meta,
+					status: "ok" as const,
+					builtin: true,
+					// Built-in packs ship with the app: no upstream source to check, never
+					// "update available" (they update with the app upgrade, §4.2).
+					updateAvailable: false,
+					sourceStatus: "ok" as const,
+				}));
+				json({ installed: [...builtinRows, ...installer.listInstalled(allContexts(projectId))] });
+			} catch (err) { jsonError(500, err); }
 			return;
 		}
 
@@ -5771,6 +6464,97 @@ async function handleApiRoute(
 			st.target.store.setPackOrder(scope, normalized);
 			invalidateResolverCaches();
 			json({ scope, order: normalized });
+			return;
+		}
+
+		// ── pack-activation (pack-schema-v1 §6.7) ──────────────────
+		// The `catalogue` is the UNFILTERED authoritative source for the Market UI
+		// toggles: read straight from the INSTALLED pack's pack.yaml manifest
+		// contents (NOT from the runtime-filtered /api/tools or /api/ext/contributions),
+		// so a disabled entity still appears and can be re-enabled. `disabled` is the
+		// current pack_activation override; checked = name ∉ disabled[kind].
+		const buildActivationCatalogue = (
+			scope: InstallScope,
+			projectBase: string | undefined,
+			store: PackOrderStore,
+			packName: string,
+		): { roles: string[]; tools: string[]; skills: string[]; entrypoints: Array<{ listName: string; label?: string }>; descriptions: PackEntityDescriptions } | null => {
+			const base = scope === "server" ? getProjectRoot() : scope === "global-user" ? os.homedir() : projectBase;
+			if (base === undefined) return null;
+			const entries = scopeMarketPackEntries(scope as PackScope, base, store.getPackOrder(scope));
+			let entry = entries.find((e) => e.manifest?.name === packName);
+			// Built-in first-party packs (§7.4) have NO install-ledger entry but ARE
+			// toggleable at server scope — resolve their catalogue from the built-in band.
+			if ((!entry || !entry.manifest) && scope === "server") {
+				entry = builtinFirstPartyPackEntries(resolveBuiltinPacksDir()).find((e) => e.manifest?.name === packName);
+			}
+			if (!entry || !entry.manifest) return null;
+			const c = entry.manifest.contents;
+			// Entrypoint display labels (best-effort) from the entrypoint files.
+			const labelByListName = new Map<string, string>();
+			try {
+				for (const ep of loadPackContributions(entry.path, entry.manifest).entrypoints) {
+					if (ep.label) labelByListName.set(ep.listName, ep.label);
+				}
+			} catch { /* labels are optional; listName is the stable key */ }
+			return {
+				roles: [...c.roles],
+				tools: [...c.tools],
+				skills: [...c.skills],
+				entrypoints: (c.entrypoints ?? []).map((listName) => {
+					const label = labelByListName.get(listName);
+					return label !== undefined ? { listName, label } : { listName };
+				}),
+				// One-line per-entity descriptions for the activation disclosure (R3).
+				// Read from the SAME installed pack dir as the catalogue above — never
+				// from the runtime-filtered /api/tools or /api/ext/contributions.
+				descriptions: readPackEntityDescriptions(entry.path, entry.manifest),
+			};
+		};
+		if (url.pathname === "/api/marketplace/pack-activation" && req.method === "GET") {
+			const scope = parseScope(url.searchParams.get("scope"));
+			if (!scope) { json({ error: "invalid scope" }, 400); return; }
+			const projectId = url.searchParams.get("projectId") || undefined;
+			const packName = url.searchParams.get("packName") || "";
+			if (!packName) { json({ error: "packName is required" }, 400); return; }
+			const st = resolveScopeTarget(scope, projectId);
+			if (!st.ok) { json({ error: st.error }, st.status); return; }
+			const catalogue = buildActivationCatalogue(scope, st.target.projectBase, st.target.store, packName);
+			if (!catalogue) { json({ error: "pack not installed at this scope" }, 404); return; }
+			const cfgStore = st.target.store as unknown as ProjectConfigStore;
+			const disabled = cfgStore.getPackActivation(scope as PackOrderScope, packName);
+			json({ scope, packName, catalogue, disabled });
+			return;
+		}
+		if (url.pathname === "/api/marketplace/pack-activation" && req.method === "PUT") {
+			const body = (await readBody(req)) as any;
+			const scope = parseScope(body?.scope);
+			if (!scope) { json({ error: "invalid scope" }, 400); return; }
+			const packName = typeof body?.packName === "string" ? body.packName : "";
+			if (!packName) { json({ error: "packName is required" }, 400); return; }
+			const st = resolveScopeTarget(scope, body?.projectId);
+			if (!st.ok) { json({ error: st.error }, st.status); return; }
+			const catalogue = buildActivationCatalogue(scope, st.target.projectBase, st.target.store, packName);
+			if (!catalogue) { json({ error: "pack not installed at this scope" }, 404); return; }
+			// Normalize the requested disabled refs against the pack's declared
+			// catalogue (drop refs for entities the pack does not declare).
+			const reqDisabled = (body?.disabled ?? {}) as Record<string, unknown>;
+			const catalogueEntrypointNames = new Set(catalogue.entrypoints.map((e) => e.listName));
+			const normaliseKind = (kind: "roles" | "tools" | "skills" | "entrypoints", valid: Set<string>): string[] => {
+				const raw = reqDisabled[kind];
+				if (!Array.isArray(raw)) return [];
+				return raw.filter((x): x is string => typeof x === "string" && valid.has(x));
+			};
+			const normalized = {
+				roles: normaliseKind("roles", new Set(catalogue.roles)),
+				tools: normaliseKind("tools", new Set(catalogue.tools)),
+				skills: normaliseKind("skills", new Set(catalogue.skills)),
+				entrypoints: normaliseKind("entrypoints", catalogueEntrypointNames),
+			};
+			const cfgStore = st.target.store as unknown as ProjectConfigStore;
+			cfgStore.setPackActivation(scope as PackOrderScope, packName, normalized);
+			invalidateResolverCaches();
+			json({ scope, packName, catalogue, disabled: cfgStore.getPackActivation(scope as PackOrderScope, packName) });
 			return;
 		}
 
@@ -6698,7 +7482,21 @@ async function handleApiRoute(
 		// Enrich with workflow gate definitions
 		const enriched = gates.map(g => {
 			const def = goal.workflow?.gates.find(wg => wg.id === g.gateId);
-			return { ...g, name: def?.name, dependsOn: def?.dependsOn, content: def?.content, injectDownstream: def?.injectDownstream, metadata: def?.metadata || g.currentMetadata, signalCount: g.signals.length };
+			const base = { ...g, name: def?.name, dependsOn: def?.dependsOn, content: def?.content, injectDownstream: def?.injectDownstream, metadata: def?.metadata || g.currentMetadata, signalCount: g.signals.length };
+			// Surface human-bypass audit fields as canonical top-level fields so the
+			// UI does not have to couple to internal signal shape.
+			if (g.status === "bypassed") {
+				const bypassSignal = gateStore.getLatestBypassSignal(g);
+				if (bypassSignal?.metadata) {
+					return {
+						...base,
+						whyBypassed: bypassSignal.metadata.whyBypassed,
+						whoAmI: bypassSignal.metadata.whoAmI,
+						bypassedAt: bypassSignal.metadata.bypassedAt,
+					};
+				}
+			}
+			return base;
 		});
 		if (url.searchParams.get("view") === "summary") {
 			const summary = buildGateStatusSummary({
@@ -7009,6 +7807,83 @@ async function handleApiRoute(
 		return;
 	}
 
+	// POST /api/goals/:goalId/gates/:gateId/bypass — human-only gate bypass.
+	// NOT advertised to agents: no MCP tool, no prompt/doc mention. The
+	// isInitiatedByHuman guard is the runtime backstop. Modeled on the reset
+	// endpoint above.
+	const gateBypassMatch = url.pathname.match(/^\/api\/goals\/([^/]+)\/gates\/([^/]+)\/bypass$/);
+	if (gateBypassMatch && req.method === "POST") {
+		if (sandboxScope) {
+			json({ error: "Forbidden: sandbox token cannot bypass gates" }, 403);
+			return;
+		}
+
+		const [, goalId, gateId] = gateBypassMatch;
+		const goal = getGoalAcrossProjects(goalId);
+		if (!goal) { json({ error: "Goal not found" }, 404); return; }
+		if (goal.archived) { json({ error: "Goal is archived" }, 409); return; }
+		if (goal.state === "shelved") { json({ error: "Goal is shelved" }, 409); return; }
+		if (!goal.workflow) { json({ error: "Goal has no workflow" }, 400); return; }
+
+		const gateBypassCtx = projectContextManager.getContextForGoal(goalId);
+		if (!gateBypassCtx) { json({ error: "Goal not found in any project" }, 404); return; }
+		const gateStore = gateBypassCtx.gateStore;
+		const bypassGateDef = goal.workflow.gates.find(g => g.id === gateId);
+		if (!bypassGateDef) { json({ error: `Unknown gate: ${gateId}` }, 404); return; }
+
+		const bypassBody = await readBody(req);
+		if (bypassBody?.isInitiatedByHuman !== true) {
+			json({ error: "This method is currently intended for human use only. Bypassing a gate as an agent is not acting in the best interest of the outcome." }, 400);
+			return;
+		}
+		const whyBypassed = bypassBody?.whyBypassed;
+		const whoAmI = bypassBody?.whoAmI;
+		if (typeof whyBypassed !== "string" || !whyBypassed.trim()) { json({ error: "whyBypassed is required" }, 400); return; }
+		if (typeof whoAmI !== "string" || !whoAmI.trim()) { json({ error: "whoAmI is required" }, 400); return; }
+
+		try {
+			await verificationHarness.cancelStaleVerificationsForGates(goalId, [gateId]);
+		} catch (err) {
+			console.error(`[api] Error cancelling verifications for bypassed gate ${gateId}:`, err);
+		}
+
+		const bypassSignal = gateStore.bypassGate(goalId, gateId, { whyBypassed, whoAmI });
+		const bypassedAt = bypassSignal.metadata?.bypassedAt ?? String(bypassSignal.timestamp);
+
+		broadcastToGoal(goalId, { type: "gate_status_changed", goalId, gateId, status: "bypassed" });
+
+		let teamLeadNotified = false;
+		try {
+			const notification = [
+				`Gate bypassed: ${bypassGateDef.name || gateId}`,
+				"",
+				`This gate was forced past verification by a human overseer (${whoAmI}).`,
+				"",
+				"Reason:",
+				whyBypassed,
+				"",
+				"The bypassed gate now counts as satisfied for dependency ordering, but the goal still requires explicit human confirmation before it can be completed.",
+			].join("\n");
+			const team = teamManager.getTeamState(goalId);
+			if (team?.teamLeadSessionId) {
+				const teamLeadSession = sessionManager.getSession(team.teamLeadSessionId);
+				if (teamLeadSession && teamLeadSession.status !== "terminated") {
+					if (teamLeadSession.status === "streaming") {
+						await sessionManager.deliverLiveSteer(team.teamLeadSessionId, notification, { source: "system" });
+					} else {
+						await sessionManager.enqueuePrompt(team.teamLeadSessionId, notification, { isSteered: true, source: "system" });
+					}
+					teamLeadNotified = true;
+				}
+			}
+		} catch (err) {
+			console.error(`[api] Failed to notify team lead for gate bypass ${goalId}/${gateId}:`, err);
+		}
+
+		json({ ok: true, gateId, status: "bypassed", whyBypassed, whoAmI, bypassedAt, teamLeadNotified });
+		return;
+	}
+
 	// POST /api/goals/:goalId/gates/:gateId/signal — signal a gate
 	const gateSignalMatch = url.pathname.match(/^\/api\/goals\/([^/]+)\/gates\/([^/]+)\/signal$/);
 	if (gateSignalMatch && req.method === "POST") {
@@ -7033,7 +7908,8 @@ async function handleApiRoute(
 		// Validate dependencies are met
 		for (const depId of gateDef.dependsOn) {
 			const depGate = gateStore.getGate(goalId, depId);
-			if (!depGate || depGate.status !== "passed") {
+			// A bypassed upstream gate counts as satisfied (like passed).
+			if (!depGate || (depGate.status !== "passed" && depGate.status !== "bypassed")) {
 				const depDef = goal.workflow.gates.find(g => g.id === depId);
 				json({ error: `Upstream gate "${depDef?.name || depId}" has not passed yet` }, 409);
 				return;
@@ -8078,8 +8954,18 @@ async function handleApiRoute(
 			}, 409);
 			return;
 		}
+		const completeBody = await readBody(req);
+		const confirmBypassedGates = completeBody?.confirmBypassedGates === true;
+		// Bypassed-gate confirmation is a HUMAN-only override. A sandbox-scoped
+		// agent token must not be able to confirm completion past bypassed gates
+		// by hitting this REST endpoint directly — that would defeat the
+		// human-in-the-loop trust boundary the bypass feature enforces.
+		if (confirmBypassedGates && sandboxScope) {
+			json({ error: "Forbidden: sandbox token cannot confirm completion of bypassed gates" }, 403);
+			return;
+		}
 		try {
-			await teamManager.completeTeam(goalId);
+			await teamManager.completeTeam(goalId, { allowBypassedGates: confirmBypassedGates });
 			json({ ok: true });
 		} catch (err) {
 			jsonError(400, err);

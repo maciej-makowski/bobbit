@@ -132,6 +132,11 @@
 	border-radius: 0.5rem;
 	padding: 0.625rem 0.75rem;
 	background: var(--background);
+	transition: border-color 0.15s, background 0.15s;
+}
+
+.market-pack-card:hover {
+	border-color: color-mix(in oklch, var(--border) 60%, var(--foreground));
 }
 
 .market-pack-card--drop {
@@ -173,6 +178,19 @@
 .market-entity-chip[data-kind="skill"] {
 	background: color-mix(in oklch, var(--chart-3) 14%, transparent);
 	color: var(--chart-3);
+}
+
+.market-builtin-badge {
+	display: inline-flex;
+	align-items: center;
+	padding: 1px 6px;
+	font-size: 10px;
+	font-weight: 500;
+	border-radius: 4px;
+	line-height: 1.4;
+	white-space: nowrap;
+	background: color-mix(in oklch, var(--primary) 14%, transparent);
+	color: var(--primary);
 }
 
 .market-corrupt,
@@ -296,4 +314,135 @@
 	border: 1px solid color-mix(in oklch, var(--negative, var(--destructive)) 35%, transparent);
 	background: color-mix(in oklch, var(--negative, var(--destructive)) 8%, transparent);
 	color: var(--negative, var(--destructive));
+}
+
+/* ── Activation controls (pack schema V1 §9) ─────────────────────────────────
+ * Per-pack toggles for user-facing entities only (roles/tools/skills/entrypoints).
+ * Support surfaces (panels/routes/stores/renderers/actions/lib) are NOT toggled. */
+.market-activation {
+	margin-top: 0.5rem;
+	padding-top: 0.5rem;
+	border-top: 1px dashed var(--border);
+	display: flex;
+	flex-direction: column;
+	gap: 0.375rem;
+}
+
+.market-activation-group {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+}
+
+.market-activation-group-title {
+	font-size: 0.625rem;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--muted-foreground);
+}
+
+.market-activation-toggles {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem 0.625rem;
+}
+
+.market-activation-toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.375rem;
+	font-size: 0.6875rem;
+	color: var(--foreground);
+	cursor: pointer;
+	user-select: none;
+}
+
+.market-activation-toggle input {
+	accent-color: var(--primary);
+	cursor: pointer;
+}
+
+.market-activation-toggle--off {
+	color: var(--muted-foreground);
+}
+
+/* ── Status lozenges (theme tokens only) ─────────────────────────────────────
+ * Non-button status indicators: "Source not found" (R2) and the Browse
+ * "Installed" marker (R4). A muted base + a warning variant. */
+.market-lozenge {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.1875rem;
+	padding: 0.1875rem 0.4375rem;
+	font-size: 0.6875rem;
+	font-weight: 500;
+	line-height: 1.3;
+	white-space: nowrap;
+	border-radius: 0.375rem;
+	border: 1px solid var(--border);
+	background: var(--muted);
+	color: var(--muted-foreground);
+}
+
+.market-lozenge--warning {
+	border-color: color-mix(in oklch, var(--warning, var(--chart-4)) 35%, transparent);
+	background: color-mix(in oklch, var(--warning, var(--chart-4)) 12%, transparent);
+	color: var(--warning, var(--chart-4));
+}
+
+/* ── Per-entity description disclosure (R3) ──────────────────────────────────
+ * Collapsed by default; visually subordinate (small, muted summary). Shared by
+ * the Installed activation list and the Browse pack card. */
+.market-entity-details {
+	margin-top: 0.125rem;
+	font-size: 0.6875rem;
+	color: var(--muted-foreground);
+}
+
+.market-entity-details > summary {
+	cursor: pointer;
+	font-weight: 500;
+	color: var(--muted-foreground);
+	user-select: none;
+	width: fit-content;
+}
+
+.market-entity-details > summary:hover,
+.market-entity-details > summary:focus-visible {
+	color: var(--foreground);
+}
+
+.market-entity-desc-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0.1875rem;
+	margin-top: 0.25rem;
+	padding-left: 0.5rem;
+	border-left: 2px solid var(--border);
+}
+
+.market-entity-desc {
+	display: flex;
+	align-items: baseline;
+	gap: 0.375rem;
+	min-width: 0;
+}
+
+.market-entity-desc-name {
+	flex-shrink: 0;
+	font-weight: 600;
+	color: var(--foreground);
+}
+
+.market-entity-desc-text {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	color: var(--muted-foreground);
+}
+
+.market-entity-desc-text::before {
+	content: "— ";
 }

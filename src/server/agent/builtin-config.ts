@@ -86,6 +86,10 @@ function toolInfoFrom(data: any, fallbackGroup: string, baseDir: string, filePat
 		rendererKind: computeRendererKind(baseDir, data.renderer),
 		hasActions: !!contributions.actions,
 		actionNames: contributions.actions?.names,
+		// pack-schema-v1 §6.1: a tool YAML carries ONLY the tool-scoped contributions
+		// (renderer + actions). Pack-scoped declarations (panels/entrypoints/routes/
+		// stores) moved off tools to their own pack-level sites and reach the client
+		// through /api/ext/contributions, NOT /api/tools — so nothing else is emitted here.
 		grantPolicy: data.grantPolicy,
 		params: Array.isArray(data.params)
 			? data.params.filter((p: unknown): p is string => typeof p === "string")

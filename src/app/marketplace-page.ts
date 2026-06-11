@@ -28,20 +28,25 @@ import { setHashRoute } from "./routing.js";
 import {
 	addMarketplaceSource,
 	browseMarketplacePacks,
+	getPackActivation,
 	getPackConflicts,
 	installMarketplacePack,
 	listInstalledPacks,
 	listMarketplaceSources,
 	removeMarketplaceSource,
+	setPackActivation,
 	setPackOrder,
 	syncMarketplaceSource,
 	uninstallMarketplacePack,
 	updateInstalledPack,
 	type BrowsePackWire,
 	type ConflictWire,
+	type DisabledRefs,
 	type InstalledPackWire,
 	type MarketplaceSource,
 	type MarketScope,
+	type PackActivationResponse,
+	type PackEntityDescriptions,
 } from "./api.js";
 
 // ============================================================================
@@ -64,6 +69,13 @@ let browseLoading = false;
 let installed: InstalledPackWire[] = [];
 let installedError = "";
 let conflicts: ConflictWire[] = [];
+
+/** Per-installed-pack activation catalogue + disabled overrides, keyed by
+ *  `${scope}:${packName}` (pack schema V1 §6.7/§9). This is the UNFILTERED
+ *  authoritative source for the activation toggles — read from the installed
+ *  pack manifest's `contents`, NOT from the runtime-filtered /api/tools or
+ *  /api/ext/contributions — so a DISABLED entity stays visible + re-enableable. */
+const activationByPack = new Map<string, PackActivationResponse>();
 
 let newSourceUrl = "";
 let newSourceRef = "";
@@ -106,6 +118,7 @@ export function clearMarketplaceState(): void {
 	installed = [];
 	installedError = "";
 	conflicts = [];
+	activationByPack.clear();
 	newSourceUrl = "";
 	newSourceRef = "";
 	addingSource = false;
@@ -154,12 +167,33 @@ export function activeSessionProjectId(): string | undefined {
  *  `registerPackRenderers` also tears down renderers no longer present — the
  *  uninstall reconciliation path (§4a). Best-effort; never throws. */
 export async function reconcileRenderersForActiveSession(): Promise<void> {
-	const [{ fetchTools }, { registerPackRenderers }] = await Promise.all([
+	const [
+		{ fetchTools, fetchContributions },
+		{ registerPackRenderers },
+		{ registerPackPanels, panelInfosFromContributions },
+		{ registerPackEntrypoints, entrypointInfosFromContributions },
+	] = await Promise.all([
 		import("./api.js"),
 		import("./pack-renderers.js"),
+		import("./pack-panels.js"),
+		import("./pack-entrypoints.js"),
 	]);
 	const projectId = activeSessionProjectId();
-	registerPackRenderers(await fetchTools(projectId), projectId);
+	// Tool renderers stay TOOL-scoped — reconcile from /api/tools (pack schema V1 §8.3).
+	const tools = await fetchTools(projectId);
+	registerPackRenderers(tools, projectId);
+	// Panels + entrypoints are PACK-scoped — reconcile from /api/ext/contributions
+	// (pack schema V1 §8.1/§8.2). Force re-register directly from the freshly-fetched
+	// metadata (the dedupe guard would skip an unchanged project); uninstall reconcile
+	// drops removed panels/entrypoints/routes so a stale deep-link no longer resolves.
+	// `invalidateLoaded` drops cached panel MODULES for surviving panels too: a
+	// same-project UPDATE/reinstall re-registers the same {packId, panelId} behind the
+	// same serving URL with fresh bytes, so without forcing it the stale module would
+	// keep serving until a full reload (this path runs ONLY on real pack mutations /
+	// activation toggles, never on a benign session-switch reconcile).
+	const packs = await fetchContributions(projectId);
+	registerPackPanels(panelInfosFromContributions(packs), projectId, { invalidateLoaded: true });
+	registerPackEntrypoints(entrypointInfosFromContributions(packs), projectId);
 }
 
 export async function loadMarketplaceData(showLoading = true): Promise<void> {
@@ -178,7 +212,13 @@ export async function loadMarketplaceData(showLoading = true): Promise<void> {
 	if (srcRes.ok) {
 		sources = srcRes.data.sources || [];
 		sourcesError = "";
-		if (!selectedSourceId && sources.length > 0) selectedSourceId = sources[0].id;
+		// Default the browse selection to the first USER source, not the synthetic
+		// built-in source (its packs are provided-in-place, not installable, so it's a
+		// poor default browse target). Fall back to whatever exists (e.g. only the
+		// built-in source is present) so the picker is never empty.
+		if (!selectedSourceId && sources.length > 0) {
+			selectedSourceId = (sources.find((s) => !s.builtin) ?? sources[0]).id;
+		}
 	} else {
 		sources = [];
 		sourcesError = srcRes.error;
@@ -197,7 +237,75 @@ export async function loadMarketplaceData(showLoading = true): Promise<void> {
 	loading = false;
 	renderApp();
 
+	// Activation catalogues are fetched in the background (one GET per installed
+	// pack) so the page paints immediately; the toggles appear once they resolve.
+	void loadActivationForInstalled();
+
 	if (selectedSourceId) await loadBrowse(selectedSourceId);
+}
+
+/** Fetch the UNFILTERED activation catalogue + disabled overrides for every
+ *  installed pack (pack schema V1 §6.7/§9). The catalogue is the SINGLE source
+ *  for the toggle UI — never the runtime-filtered /api/tools or
+ *  /api/ext/contributions, which would hide a disabled entity and make it
+ *  impossible to re-enable. Best-effort; repaints when done. */
+async function loadActivationForInstalled(): Promise<void> {
+	const snapshot = installed.slice();
+	const results = await Promise.all(snapshot.map(async (p) => {
+		const projectId = p.scope === "project" ? currentProjectId() : undefined;
+		const res = await getPackActivation(p.scope, p.packName, projectId);
+		return { key: `${p.scope}:${p.packName}`, res };
+	}));
+	let changed = false;
+	for (const { key, res } of results) {
+		if (res.ok) { activationByPack.set(key, res.data); changed = true; }
+	}
+	if (changed) renderApp();
+}
+
+/** Maps the singular testid kind → the `DisabledRefs` array key. */
+const ACTIVATION_KIND_KEY: Record<"role" | "tool" | "skill" | "entrypoint", keyof DisabledRefs> = {
+	role: "roles",
+	tool: "tools",
+	skill: "skills",
+	entrypoint: "entrypoints",
+};
+
+/** Toggle a user-facing pack entity's activation. Computes the new `disabled`
+ *  set, PUTs it (the response carries the refreshed catalogue + normalized
+ *  disabled — no follow-up GET), then re-runs the marketplace reconcile so a
+ *  disabled entrypoint disappears from launchers/deep-links WITHOUT a reload
+ *  (pack schema V1 §9). Entrypoints are keyed by `listName`. */
+async function handleToggleActivation(
+	pack: InstalledPackWire,
+	kind: "role" | "tool" | "skill" | "entrypoint",
+	name: string,
+	enable: boolean,
+): Promise<void> {
+	const cacheKey = `${pack.scope}:${pack.packName}`;
+	const current = activationByPack.get(cacheKey);
+	const kindKey = ACTIVATION_KIND_KEY[kind];
+	const set = new Set(current?.disabled?.[kindKey] ?? []);
+	if (enable) set.delete(name); else set.add(name);
+	const disabled: DisabledRefs = { ...(current?.disabled ?? {}), [kindKey]: [...set] };
+	const projectId = pack.scope === "project" ? currentProjectId() : undefined;
+	const busyKey = `activation:${cacheKey}:${kind}:${name}`;
+	busy.add(busyKey);
+	renderApp();
+	const res = await setPackActivation({ scope: pack.scope, projectId, packName: pack.packName, disabled });
+	busy.delete(busyKey);
+	if (res.ok) {
+		// The PUT returns the refreshed UNFILTERED catalogue + normalized disabled.
+		activationByPack.set(cacheKey, res.data);
+		// Re-run the same reconcile a marketplace mutation triggers so the runtime
+		// registries (renderers/panels/entrypoints) drop/restore the toggled entity
+		// without a reload (the catalogue source above is unaffected).
+		await refreshConfigPages();
+		renderApp();
+	} else {
+		installedError = res.error;
+		renderApp();
+	}
 }
 
 async function loadBrowse(sourceId: string): Promise<void> {
@@ -355,7 +463,9 @@ async function handleUninstall(pack: InstalledPackWire): Promise<void> {
 // ============================================================================
 
 function packsForScope(scope: MarketScope): InstalledPackWire[] {
-	return installed.filter((p) => p.scope === scope);
+	// Built-in first-party packs (§7.4) render in their OWN top group and are NOT
+	// in pack_order — exclude them from the per-scope (reorderable) groups.
+	return installed.filter((p) => p.scope === scope && !p.builtin);
 }
 
 function handleDragStart(e: DragEvent, scope: MarketScope, index: number): void {
@@ -494,6 +604,56 @@ function entityChips(pack: BrowsePackWire | InstalledPackWire): TemplateResult {
 	return html`<div class="flex flex-wrap gap-1">${chips}</div>`;
 }
 
+/** Declared-entity name lists for the description disclosure, across all four
+ *  kinds. Entry points carry an optional display `label`. */
+interface EntityNameLists {
+	roles: string[];
+	tools: string[];
+	skills: string[];
+	entrypoints: Array<{ listName: string; label?: string }>;
+}
+
+/** Shared collapsed "Show details" disclosure (R3) — one row per declared
+ *  entity that HAS a one-line description, across roles/tools/skills/entry
+ *  points. Used by BOTH the Installed activation list and the Browse pack card.
+ *  Rows with no description are omitted; the disclosure is omitted entirely when
+ *  no row would render. Tools are keyed by GROUP name; entrypoints by `listName`
+ *  (kind `entrypoint`). */
+function renderEntityDetails(packName: string, descriptions: PackEntityDescriptions | undefined, entities: EntityNameLists): TemplateResult {
+	if (!descriptions) return html``;
+	const rows: TemplateResult[] = [];
+	const pushRows = (
+		kind: "role" | "tool" | "skill" | "entrypoint",
+		map: Record<string, string> | undefined,
+		names: string[],
+		labelFor?: (n: string) => string,
+	): void => {
+		if (!map) return;
+		for (const name of names) {
+			const desc = map[name];
+			if (!desc) continue;
+			rows.push(html`
+				<div class="market-entity-desc" data-testid="market-entity-desc-${kind}-${name}">
+					<span class="market-entity-desc-name">${labelFor ? labelFor(name) : name}</span>
+					<span class="market-entity-desc-text">${desc}</span>
+				</div>
+			`);
+		}
+	};
+	pushRows("role", descriptions.roles, entities.roles);
+	pushRows("tool", descriptions.tools, entities.tools);
+	pushRows("skill", descriptions.skills, entities.skills);
+	const epLabel = new Map(entities.entrypoints.map((e) => [e.listName, e.label || e.listName]));
+	pushRows("entrypoint", descriptions.entrypoints, entities.entrypoints.map((e) => e.listName), (n) => epLabel.get(n) || n);
+	if (rows.length === 0) return html``;
+	return html`
+		<details class="market-entity-details" data-testid="market-entity-details-${packName}">
+			<summary>Show details</summary>
+			<div class="market-entity-desc-list">${rows}</div>
+		</details>
+	`;
+}
+
 function renderSourcesPanel(): TemplateResult {
 	return html`
 		<section class="market-panel" data-testid="market-sources-panel">
@@ -553,19 +713,37 @@ function renderSourcesPanel(): TemplateResult {
 function renderSourceRow(src: MarketplaceSource): TemplateResult {
 	const isSelected = selectedSourceId === src.id;
 	const syncing = busy.has(`sync:${src.id}`);
+	// The synthetic built-in source (§4.4/§7.4) is non-removable and resolves its
+	// packs in place — render it as a distinct "Built-in" row, omit the Remove
+	// control entirely, and hide Re-sync (a harmless no-op server-side) to reduce
+	// confusion. It stays clickable so users can browse the shipped packs.
+	const isBuiltin = src.builtin === true;
 	return html`
-		<div class="market-source-row ${isSelected ? "market-source-row--selected" : ""}" data-testid="market-source-row">
+		<div
+			class="market-source-row ${isSelected ? "market-source-row--selected" : ""}"
+			data-testid="market-source-row"
+			data-builtin=${isBuiltin ? "true" : "false"}
+		>
 			<button class="flex-1 min-w-0 text-left" @click=${() => { activeTab = "browse"; loadBrowse(src.id); }} title="Browse packs">
-				<div class="text-sm font-medium truncate">${src.id}</div>
+				<div class="flex items-center gap-1.5">
+					<span class="text-sm font-medium truncate">${src.id}</span>
+					${isBuiltin ? html`<span class="market-builtin-badge" data-testid="market-source-builtin-badge">Built-in</span>` : ""}
+				</div>
 				<div class="text-[11px] text-muted-foreground truncate">${src.url}${src.ref ? html` <span class="opacity-70">@${src.ref}</span>` : ""}</div>
-				${src.lastCommit ? html`<div class="text-[10px] text-muted-foreground/80">commit ${src.lastCommit.slice(0, 7)}</div>` : ""}
+				${isBuiltin
+					? html`<div class="text-[10px] text-muted-foreground/80">Shipped core features — always available, enable/disable per pack.</div>`
+					: src.lastCommit ? html`<div class="text-[10px] text-muted-foreground/80">commit ${src.lastCommit.slice(0, 7)}</div>` : ""}
 			</button>
-			<button class="market-icon-btn" title="Re-sync" data-testid="market-sync-source" ?disabled=${syncing} @click=${() => handleSyncSource(src.id)}>
-				${icon(RotateCw, "xs", syncing ? "animate-spin" : "")}
-			</button>
-			<button class="market-icon-btn market-icon-btn--danger" title="Remove source" data-testid="market-remove-source" @click=${() => handleRemoveSource(src.id)}>
-				${icon(Trash2, "xs")}
-			</button>
+			${isBuiltin
+				? ""
+				: html`
+					<button class="market-icon-btn" title="Re-sync" data-testid="market-sync-source" ?disabled=${syncing} @click=${() => handleSyncSource(src.id)}>
+						${icon(RotateCw, "xs", syncing ? "animate-spin" : "")}
+					</button>
+					<button class="market-icon-btn market-icon-btn--danger" title="Remove source" data-testid="market-remove-source" @click=${() => handleRemoveSource(src.id)}>
+						${icon(Trash2, "xs")}
+					</button>
+				`}
 		</div>
 	`;
 }
@@ -626,8 +804,49 @@ function renderBrowsePanel(): TemplateResult {
 	`;
 }
 
+/** Find the installed copy of a browse pack AT THE CURRENTLY-SELECTED install
+ *  scope (R4). For project scope the Installed list must be loaded for the
+ *  picked project — if `installProjectId` and `currentProjectId()` diverge we
+ *  treat the pack as not-installed for that project (avoids a wrong-project
+ *  false positive; preserves finding #2). */
+function installedMatchForBrowse(pack: BrowsePackWire): InstalledPackWire | undefined {
+	if (installScope === "project") {
+		if (!installProjectId || installProjectId !== currentProjectId()) return undefined;
+		return installed.find((p) => p.scope === "project" && p.packName === pack.name);
+	}
+	return installed.find((p) => p.scope === installScope && p.packName === pack.name);
+}
+
 function renderBrowsePackCard(pack: BrowsePackWire): TemplateResult {
 	const installing = busy.has(`install:${pack.dirName}`);
+	const match = installedMatchForBrowse(pack);
+	let action: TemplateResult;
+	if (pack.builtin) {
+		// Built-in (first-party) packs are resolved in place — provided, not
+		// installable; manage them from the Installed tab's toggles (§4.4/§7.4).
+		action = html`<span class="market-builtin-badge shrink-0" data-testid="market-browse-provided" title="Shipped with Bobbit — manage it from the Installed tab's toggles">Provided (built-in)</span>`;
+	} else if (!match) {
+		action = html`
+			<button
+				class="market-btn market-btn--primary shrink-0"
+				data-testid="market-install-pack"
+				?disabled=${installing}
+				@click=${() => handleInstall(pack)}
+			>${icon(Download, "xs")} ${installing ? "Installing…" : "Install"}</button>`;
+	} else if (pack.version !== match.meta.version) {
+		// Installed but behind the source's latest version → offer an update.
+		const isBusy = busy.has(`${match.scope}:${match.packName}`);
+		action = html`
+			<button
+				class="market-btn shrink-0"
+				data-testid="market-browse-update-pack"
+				?disabled=${isBusy}
+				@click=${() => handleUpdate(match)}
+			>${icon(RotateCw, "xs", isBusy ? "animate-spin" : "")} Update</button>`;
+	} else {
+		action = html`<span class="market-lozenge shrink-0" data-testid="market-browse-installed">${icon(Package, "xs")} Installed</span>`;
+	}
+	const entrypointNames = (pack.contents?.entrypoints ?? []).map((listName) => ({ listName }));
 	return html`
 		<div class="market-pack-card" data-testid="market-browse-pack" data-pack-name=${pack.name}>
 			<div class="flex items-start justify-between gap-3">
@@ -638,13 +857,14 @@ function renderBrowsePackCard(pack: BrowsePackWire): TemplateResult {
 					</div>
 					<div class="text-xs text-muted-foreground mt-0.5">${pack.description}</div>
 					<div class="mt-1.5">${entityChips(pack)}</div>
+					${renderEntityDetails(pack.name, pack.descriptions, {
+						roles: pack.contents?.roles ?? [],
+						tools: pack.contents?.tools ?? [],
+						skills: pack.contents?.skills ?? [],
+						entrypoints: entrypointNames,
+					})}
 				</div>
-				<button
-					class="market-btn market-btn--primary shrink-0"
-					data-testid="market-install-pack"
-					?disabled=${installing}
-					@click=${() => handleInstall(pack)}
-				>${icon(Download, "xs")} ${installing ? "Installing…" : "Install"}</button>
+				${action}
 			</div>
 		</div>
 	`;
@@ -659,16 +879,89 @@ function conflictsForPack(pack: InstalledPackWire): ConflictWire[] {
 	);
 }
 
+/** §6.4/§7.4 — is the built-in row shadowed by a same-name user install?
+ *
+ *  The built-in band sits BELOW every user scope band, and the resolver /
+ *  contribution registry collapse to ONE winning pack per packId by list position
+ *  — so a same-name pack installed at ANY user scope (server/global-user/project)
+ *  ALWAYS wins over the built-in, regardless of which entity kinds it ships. We
+ *  therefore detect the shadow by the presence of a non-corrupt same-name install,
+ *  NOT via `/api/packs/conflicts`: that endpoint only reports role/tool/skill
+ *  conflicts, so an ENTRYPOINT/panel/route-only pack (e.g. `pr-walkthrough`, whose
+ *  `contents.roles/tools/skills` are all empty) would never appear there and the
+ *  built-in row would wrongly stay live (the winner-owns-the-toggle rule broken).
+ *  A `corrupt` install is excluded from resolution, so it never wins and never
+ *  suppresses the built-in toggle. With no non-corrupt same-name install, the
+ *  built-in row owns the live (server, packName) toggle. */
+function builtinRowShadowed(packName: string): boolean {
+	return installed.some(
+		(p) => !p.builtin && p.packName === packName && p.status !== "corrupt",
+	);
+}
+
 function renderInstalledPanel(): TemplateResult {
+	const builtinPacks = installed.filter((p) => p.builtin);
 	const scopesWithPacks = SCOPE_ORDER.filter((s) => packsForScope(s).length > 0);
+	const isEmpty = builtinPacks.length === 0 && scopesWithPacks.length === 0;
 	return html`
 		<section class="market-panel" data-testid="market-installed-panel">
 			<h2 class="market-panel-title">${icon(Package, "sm")} Installed</h2>
 			${installedError ? html`<div class="market-error" data-testid="market-installed-error">${installedError}</div>` : ""}
-			${scopesWithPacks.length === 0
+			${isEmpty
 				? html`<p class="text-sm text-muted-foreground italic">No packs installed.</p>`
-				: scopesWithPacks.map(renderScopeGroup)}
+				: html`
+					${builtinPacks.length > 0 ? renderBuiltinGroup(builtinPacks) : ""}
+					${scopesWithPacks.map(renderScopeGroup)}
+				`}
 		</section>
+	`;
+}
+
+/** Built-in first-party packs (§7.4) — their own top group. Shipped/core, so the
+ *  cards offer enable/disable toggles only (no Uninstall/Update/reorder). */
+function renderBuiltinGroup(packs: InstalledPackWire[]): TemplateResult {
+	return html`
+		<div class="flex flex-col gap-1.5 mb-3" data-testid="market-builtin-group">
+			<div class="text-xs font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
+				Built-in (shipped)
+			</div>
+			<div class="text-[10px] text-muted-foreground/80 -mt-0.5">Core features that ship with Bobbit. Disable to remove a feature; re-enable any time.</div>
+			${packs.map(renderBuiltinPackCard)}
+		</div>
+	`;
+}
+
+/** A built-in first-party pack card (§7.4): toggle-only. No Uninstall/Update/
+ *  reorder (not in `pack_order`, no install ledger). When a user-installed pack of
+ *  the same name wins resolution (§6.4), the built-in row is SHADOWED — its server
+ *  activation entry is moot, so the live toggles are suppressed and the winning
+ *  installed row keeps its toggles. */
+function renderBuiltinPackCard(pack: InstalledPackWire): TemplateResult {
+	const isCorrupt = pack.status === "corrupt";
+	const shadowed = builtinRowShadowed(pack.packName);
+	return html`
+		<div
+			class="market-pack-card"
+			data-testid="market-installed-pack"
+			data-pack-name=${pack.packName}
+			data-scope=${pack.scope}
+			data-builtin="true"
+		>
+			<div class="flex items-start gap-2">
+				<div class="flex-1 min-w-0">
+					<div class="flex items-center gap-2 flex-wrap">
+						<span class="text-sm font-semibold">${pack.packName}</span>
+						<span class="market-builtin-badge" data-testid="market-pack-builtin-badge">Built-in</span>
+						<span class="text-[11px] text-muted-foreground">v${pack.meta?.version || pack.manifest?.version || "?"}</span>
+						${isCorrupt ? html`<span class="market-corrupt" data-testid="market-pack-corrupt">${icon(AlertTriangle, "xs")} corrupt</span>` : ""}
+					</div>
+					${pack.manifest?.description ? html`<div class="text-xs text-muted-foreground mt-0.5">${pack.manifest.description}</div>` : ""}
+					${shadowed
+						? html`<div class="market-activation-help text-[11px] text-muted-foreground/70 italic mt-2" data-testid="market-builtin-shadowed">Shadowed by an installed pack — manage activation on the installed copy.</div>`
+						: renderActivationControls(pack)}
+				</div>
+			</div>
+		</div>
 	`;
 }
 
@@ -716,6 +1009,7 @@ function renderInstalledPackCard(pack: InstalledPackWire, scope: MarketScope, in
 					${pack.manifest?.description ? html`<div class="text-xs text-muted-foreground mt-0.5">${pack.manifest.description}</div>` : ""}
 					${renderProvenance(pack)}
 					${expanded && hasConflict ? renderConflictDetails(packConflicts) : ""}
+					${renderActivationControls(pack)}
 				</div>
 				<div class="flex flex-col items-end gap-1 shrink-0">
 					<div class="flex items-center gap-1">
@@ -723,7 +1017,11 @@ function renderInstalledPackCard(pack: InstalledPackWire, scope: MarketScope, in
 						<button class="market-icon-btn" data-testid="market-move-down" title="Move down (higher precedence)" ?disabled=${index === total - 1} @click=${() => movePack(scope, pack.packName, 1)}>${icon(ChevronDown, "xs")}</button>
 					</div>
 					<div class="flex items-center gap-1">
-						<button class="market-btn" data-testid="market-update-pack" ?disabled=${isBusy} @click=${() => handleUpdate(pack)}>${icon(RotateCw, "xs", isBusy ? "animate-spin" : "")} Update</button>
+						${pack.updateAvailable
+							? html`<button class="market-btn" data-testid="market-update-pack" ?disabled=${isBusy} @click=${() => handleUpdate(pack)}>${icon(RotateCw, "xs", isBusy ? "animate-spin" : "")} Update</button>`
+							: pack.sourceStatus === "unknown"
+								? html`<span class="market-lozenge market-lozenge--warning" data-testid="market-source-unknown" title="The originating source is not registered or has not been synced — can't check for updates">${icon(AlertTriangle, "xs")} Source not found</span>`
+								: ""}
 						<button class="market-btn market-btn--danger" data-testid="market-uninstall-pack" ?disabled=${isBusy} @click=${() => handleUninstall(pack)}>${icon(Trash2, "xs")} Uninstall</button>
 					</div>
 				</div>
@@ -743,6 +1041,68 @@ function renderProvenance(pack: InstalledPackWire): TemplateResult {
 			${m.commit ? html`<span title="Commit">commit ${m.commit.slice(0, 7)}</span>` : ""}
 			<span title="Installed">installed ${installed}</span>
 			${updated !== installed ? html`<span title="Updated">updated ${updated}</span>` : ""}
+		</div>
+	`;
+}
+
+/** Per-pack activation controls (pack schema V1 §9). Toggles ONLY user-facing
+ *  entities — roles, tools, skills, entrypoints. Panels/routes/stores/renderers/
+ *  actions/lib are support surfaces and are NOT toggleable (not shown as
+ *  switches). Rendered SOLELY from the UNFILTERED `catalogue` returned by
+ *  `GET /api/marketplace/pack-activation` (never from /api/tools or
+ *  /api/ext/contributions), so a disabled entity stays visible + re-enableable;
+ *  each toggle's checked state = `name ∉ disabled[kind]`. */
+function renderActivationControls(pack: InstalledPackWire): TemplateResult {
+	const activation = activationByPack.get(`${pack.scope}:${pack.packName}`);
+	if (!activation) return html``;
+	const cat = activation.catalogue;
+	const disabled = activation.disabled || {};
+	const isEnabled = (kindKey: keyof DisabledRefs, name: string) => !(disabled[kindKey] ?? []).includes(name);
+
+	const toggle = (kind: "role" | "tool" | "skill" | "entrypoint", name: string, label: string): TemplateResult => {
+		const kindKey = ACTIVATION_KIND_KEY[kind];
+		const checked = isEnabled(kindKey, name);
+		const busyKey = `activation:${pack.scope}:${pack.packName}:${kind}:${name}`;
+		return html`
+			<label class="market-activation-toggle ${checked ? "" : "market-activation-toggle--off"}" title=${`${kind}: ${name}`}>
+				<input
+					type="checkbox"
+					data-testid="market-toggle-${kind}-${name}"
+					.checked=${checked}
+					?disabled=${busy.has(busyKey)}
+					@change=${(e: Event) => handleToggleActivation(pack, kind, name, (e.target as HTMLInputElement).checked)}
+				/>
+				<span>${label}</span>
+			</label>
+		`;
+	};
+
+	const group = (title: string, toggles: TemplateResult[]): TemplateResult => html`
+		<div class="market-activation-group">
+			<div class="market-activation-group-title">${title}</div>
+			<div class="market-activation-toggles">${toggles}</div>
+		</div>
+	`;
+
+	const groups: TemplateResult[] = [];
+	if (cat.roles.length) groups.push(group("Roles", cat.roles.map((n) => toggle("role", n, n))));
+	if (cat.tools.length) groups.push(group("Tools", cat.tools.map((n) => toggle("tool", n, n))));
+	if (cat.skills.length) groups.push(group("Skills", cat.skills.map((n) => toggle("skill", n, n))));
+	if (cat.entrypoints.length) {
+		groups.push(group("Entry points", cat.entrypoints.map((e) => toggle("entrypoint", e.listName, e.label || e.listName))));
+	}
+	if (groups.length === 0) return html``;
+
+	return html`
+		<div class="market-activation" data-testid="market-activation-${pack.packName}">
+			<div class="text-[11px] font-medium text-muted-foreground uppercase tracking-wide mt-2">Activation</div>
+			${groups}
+			${renderEntityDetails(pack.packName, cat.descriptions, {
+				roles: cat.roles,
+				tools: cat.tools,
+				skills: cat.skills,
+				entrypoints: cat.entrypoints,
+			})}
 		</div>
 	`;
 }

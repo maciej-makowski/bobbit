@@ -36,6 +36,7 @@ import {
 	showStopTeamDialog,
 } from "./dialogs-lazy.js";
 import { countDescendants } from "./goal-descendants-count.js";
+import { isInitialSessionsLoad } from "./session-load-state.js";
 
 /** Track previous session statuses to detect streaming→idle transitions. */
 const _prevSessionStatus = new Map<string, string>();
@@ -285,8 +286,22 @@ export function stopSessionPolling(): void {
 	}
 }
 
+/**
+ * Clear any sessions-fetch error and re-fetch. Used by the sidebar/landing
+ * "Retry" buttons: clearing the error lets `isInitialSessionsLoad` show the
+ * one-time spinner again on a genuine retry after an initial-load failure.
+ */
+export function retryLoadSessions(): void {
+	state.sessionsError = "";
+	refreshSessions();
+}
+
 export async function refreshSessions(): Promise<void> {
-	const isInitial = state.gatewaySessions.length === 0 && !state.sessionsError;
+	const isInitial = isInitialSessionsLoad({
+		gatewaySessionsLength: state.gatewaySessions.length,
+		sessionsGeneration: state.sessionsGeneration,
+		sessionsError: state.sessionsError,
+	});
 	if (isInitial) {
 		state.sessionsLoading = true;
 		state.sessionsError = "";
@@ -941,7 +956,7 @@ export async function fetchArchivedSessionsPaginated(limit = 50, afterCursor?: n
 export interface GateStatusSummaryGate {
 	gateId: string;
 	name?: string;
-	status: "pending" | "passed" | "failed";
+	status: "pending" | "passed" | "failed" | "bypassed";
 	effectiveStatus: "pending" | "passed" | "failed" | "running";
 	running: boolean;
 	awaitingSignoffCount: number;
@@ -953,6 +968,10 @@ export interface GateStatusSummaryGate {
 
 export interface GateStatusSummary {
 	passed: number;
+	/** Count of gates a human forced past verification. Distinct from passed. */
+	bypassed: number;
+	/** Alias for `bypassed` — server emits both names. */
+	bypassedCount: number;
 	total: number;
 	verifying: boolean;
 	verifyingCount: number;
@@ -965,6 +984,8 @@ export interface GateStatusSummary {
 function emptyGateStatusSummary(): GateStatusSummary {
 	return {
 		passed: 0,
+		bypassed: 0,
+		bypassedCount: 0,
 		total: 0,
 		verifying: false,
 		verifyingCount: 0,
@@ -979,8 +1000,13 @@ function normalizeGateStatusSummary(data: any): GateStatusSummary {
 	const raw = data?.summary && typeof data.summary === "object" ? data.summary : data;
 	const awaitingSignoffCount = typeof raw?.awaitingSignoffCount === "number" ? raw.awaitingSignoffCount : 0;
 	const runningGateIds = Array.isArray(raw?.runningGateIds) ? raw.runningGateIds.filter((id: unknown): id is string => typeof id === "string") : [];
+	const bypassed = typeof raw?.bypassed === "number"
+		? raw.bypassed
+		: (typeof raw?.bypassedCount === "number" ? raw.bypassedCount : 0);
 	return {
 		passed: typeof raw?.passed === "number" ? raw.passed : 0,
+		bypassed,
+		bypassedCount: bypassed,
 		total: typeof raw?.total === "number" ? raw.total : (Array.isArray(data?.gates) ? data.gates.length : 0),
 		verifying: typeof raw?.verifying === "boolean" ? raw.verifying : runningGateIds.length > 0,
 		verifyingCount: typeof raw?.verifyingCount === "number" ? raw.verifyingCount : runningGateIds.length,
@@ -1005,6 +1031,7 @@ function applyGateStatusSummary(goalId: string, summary: GateStatusSummary): boo
 	const prev = state.gateStatusCache.get(goalId);
 	const next = {
 		passed: summary.passed,
+		bypassed: summary.bypassed,
 		total: summary.total,
 		verifying: summary.verifying,
 		verifyingCount: summary.verifyingCount,
@@ -1015,6 +1042,7 @@ function applyGateStatusSummary(goalId: string, summary: GateStatusSummary): boo
 	};
 	if (!prev
 		|| prev.passed !== next.passed
+		|| prev.bypassed !== next.bypassed
 		|| prev.total !== next.total
 		|| prev.verifying !== next.verifying
 		|| prev.verifyingCount !== next.verifyingCount
@@ -1466,10 +1494,11 @@ export async function getTeamState(goalId: string): Promise<any | null> {
 	}
 }
 
-export async function completeTeam(goalId: string): Promise<boolean> {
+export async function completeTeam(goalId: string, opts?: { confirmBypassedGates?: boolean }): Promise<boolean> {
 	try {
 		const res = await gatewayFetch(`/api/goals/${goalId}/team/complete`, {
 			method: "POST",
+			body: JSON.stringify({ confirmBypassedGates: opts?.confirmBypassedGates === true }),
 		});
 		if (!res.ok) throw await errorFromResponse(res, `Failed: ${res.status}`);
 		await refreshSessions();
@@ -2076,7 +2105,71 @@ export interface ToolInfo {
 	hasActions?: boolean;
 	/** Optional declared action-name allowlist (from `actions.names`). */
 	actionNames?: string[];
+	/** Structural `packId` of the winning pack that contributed this tool (pack
+	 *  schema V1 — present only for `rendererKind:"pack"` tools). The client threads
+	 *  it into the tool renderer's host so `host.ui.openPanel({panelId})` resolves
+	 *  the panel within the renderer's OWN pack, never a global panel-id search that
+	 *  would collide when another installed pack shares the panel id. */
+	packId?: string;
 	grantPolicy?: string;
+}
+
+// ============================================================================
+// PACK-SCOPED CONTRIBUTIONS (pack schema V1 — design pack-schema-v1-rationalisation.md §6.4)
+//
+// Panels / entrypoints / routes are PACK-scoped (no longer anchored to a carrier
+// tool). They are served by GET /api/ext/contributions?projectId=, ONE row per
+// installed + active pack (after the winning-pack collapse), with empty arrays
+// when a pack declares none. Activation filtering is applied server-side
+// (disabled entrypoints omitted; panels/routes always present when the pack is
+// installed + active). The client registries (pack-panels / pack-entrypoints)
+// reconcile from THIS endpoint, not /api/tools.
+// ============================================================================
+
+/** One pack-contributed panel (id + optional display title; the ESM `entry`
+ *  path stays server-side — the client addresses panels by `{packId, panelId}`). */
+export interface PackPanelWire {
+	id: string;
+	title?: string;
+}
+
+/** One pack-contributed entrypoint. `listName` is the `contents.entrypoints[]`
+ *  basename — the SINGLE activation toggle key mapping onto both the launcher id
+ *  and (for `kind:"route"`) the deep-link routeId. */
+export interface PackEntrypointWire {
+	id: string;
+	kind: "composer-slash" | "git-widget-button" | "command-palette" | "route";
+	label?: string;
+	routeId?: string;
+	target?: { panelId?: string; route?: string; params?: Record<string, unknown> };
+	paramKeys?: string[];
+	listName: string;
+}
+
+/** All pack-scoped contributions for ONE installed + active pack (§6.4). */
+export interface PackContributionsWire {
+	packId: string;
+	packName: string;
+	panels: PackPanelWire[];
+	entrypoints: PackEntrypointWire[];
+	routeNames: string[];
+}
+
+/** Fetch the project-scoped pack-contribution metadata (§6.4). Returns one row
+ *  per installed + active pack (empty arrays when it declares no
+ *  panels/entrypoints/routes), so the client reconcile is deterministic
+ *  (reconcile-on-uninstall keys off a row disappearing, not becoming empty). */
+export async function fetchContributions(projectId?: string): Promise<PackContributionsWire[]> {
+	try {
+		const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+		const res = await gatewayFetch(`/api/ext/contributions${qs}`);
+		if (!res.ok) throw await errorFromResponse(res, `Failed to fetch contributions: ${res.status}`);
+		const data = await res.json();
+		return Array.isArray(data?.packs) ? (data.packs as PackContributionsWire[]) : [];
+	} catch (err) {
+		console.error("[pack-api] fetchContributions failed:", err);
+		return [];
+	}
 }
 
 export async function fetchTools(projectId?: string): Promise<ToolInfo[]> {
@@ -2434,6 +2527,9 @@ export interface PackManifest {
 		roles: string[];
 		tools: string[];
 		skills: string[];
+		/** Entrypoint `listName` basenames (pack-schema-v1 §1.2). Optional on the
+		 *  client wire — present on browse/installed payloads that declare them. */
+		entrypoints?: string[];
 	};
 }
 
@@ -2455,11 +2551,29 @@ export interface MarketplaceSource {
 	addedAt: string;
 	lastSyncedAt?: string;
 	lastCommit?: string;
+	/** Response-only: marks the synthetic, non-removable built-in source (§4.4). */
+	builtin?: boolean;
+}
+
+/** One-line per-entity descriptions sourced from the pack dir (R3). Keyed by the
+ *  same identity the toggles/chips use: roles/skills by name, tools by GROUP
+ *  name, entrypoints by `listName`. MUST stay in sync with the server type of
+ *  the same name (`src/server/agent/marketplace-install.ts`). */
+export interface PackEntityDescriptions {
+	roles?: Record<string, string>;
+	tools?: Record<string, string>;
+	skills?: Record<string, string>;
+	entrypoints?: Record<string, string>;
 }
 
 export interface BrowsePackWire extends PackManifest {
 	dirName: string;
 	hasTools: boolean;
+	/** Response-only: shipped first-party pack (built-in source). */
+	builtin?: boolean;
+	/** Response-only: resolved in place (not copy-installed). */
+	provided?: boolean;
+	descriptions?: PackEntityDescriptions;
 }
 
 export interface InstalledPackWire {
@@ -2468,6 +2582,15 @@ export interface InstalledPackWire {
 	manifest: PackManifest;
 	meta: PackMeta;
 	status: "ok" | "corrupt";
+	/** Response-only: a built-in first-party pack row (no install ledger entry). */
+	builtin?: boolean;
+	/** True iff the source's latest manifest version differs from the installed
+	 *  version AND the source could be checked. MUST stay in sync with the server
+	 *  `InstalledPackWire` (`src/server/agent/marketplace-install.ts`). */
+	updateAvailable: boolean;
+	/** `"unknown"` when the source can't be checked (removed / never-synced / no
+	 *  version data) — disambiguates "up to date" from "source unknown". */
+	sourceStatus: "ok" | "unknown";
 }
 
 export interface ConflictPackRef {
@@ -2572,4 +2695,51 @@ export function setPackOrder(opts: { scope: MarketScope; projectId?: string; ord
 export function getPackConflicts(projectId?: string): Promise<MarketResult<{ conflicts: ConflictWire[] }>> {
 	const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
 	return marketFetch(`/api/packs/conflicts${qs}`);
+}
+
+// ============================================================================
+// PACK ACTIVATION (pack schema V1 — design pack-schema-v1-rationalisation.md §6.7/§9)
+//
+// Per-scope/project activation overrides for USER-FACING entities only:
+// roles, tools, skills, entrypoints (entrypoints keyed by `listName`). Default
+// (absent) = all enabled. The GET/PUT `catalogue` is the UNFILTERED authoritative
+// source for the Market UI toggles — read straight from the installed pack
+// manifest's `contents`, NOT from the runtime-filtered /api/tools or
+// /api/ext/contributions — so a disabled entity stays visible + re-enableable.
+// ============================================================================
+
+/** Disabled entity refs by kind for one pack/scope. Entrypoints keyed by `listName`. */
+export interface DisabledRefs {
+	roles?: string[];
+	tools?: string[];
+	skills?: string[];
+	entrypoints?: string[];
+}
+
+/** The UNFILTERED catalogue of toggleable entities a pack DECLARES (§6.7). */
+export interface PackActivationCatalogue {
+	roles: string[];
+	tools: string[];
+	skills: string[];
+	entrypoints: Array<{ listName: string; label?: string }>;
+	/** One-line per-entity descriptions for the activation disclosure (R3). */
+	descriptions?: PackEntityDescriptions;
+}
+
+/** GET/PUT /api/marketplace/pack-activation response (§6.7). */
+export interface PackActivationResponse {
+	scope: MarketScope;
+	packName: string;
+	catalogue: PackActivationCatalogue;
+	disabled: DisabledRefs;
+}
+
+export function getPackActivation(scope: MarketScope, packName: string, projectId?: string): Promise<MarketResult<PackActivationResponse>> {
+	const params = new URLSearchParams({ scope, packName });
+	if (projectId) params.set("projectId", projectId);
+	return marketFetch(`/api/marketplace/pack-activation?${params}`);
+}
+
+export function setPackActivation(opts: { scope: MarketScope; projectId?: string; packName: string; disabled: DisabledRefs }): Promise<MarketResult<PackActivationResponse>> {
+	return marketFetch("/api/marketplace/pack-activation", jsonInit("PUT", opts));
 }

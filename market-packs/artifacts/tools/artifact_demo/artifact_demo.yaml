@@ -1,0 +1,22 @@
+name: artifact_demo
+description: >-
+  Litmus tool re-expressing the artifacts built-in as a market pack: an inline
+  artifact pill (renderer) that persists its payload to a pack-scoped store and
+  opens a viewer side-panel that rehydrates by id, plus a deep-linkable route so
+  the viewer reopens from a URL.
+group: Demo
+summary: Demo artifact tool — inline pill + viewer panel + pack store + deep-link route.
+# V1 schema: a tool YAML declares ONLY tool-scoped contributions (renderer +
+# actions) — they are the only contributions that depend on a tool call /
+# toolUseId. The pack-scoped surfaces live elsewhere in the pack:
+#  - the viewer panel is auto-discovered from panels/artifacts-viewer.yaml;
+#  - the kind:"route" deep-link is declared in entrypoints/artifacts-deeplink.yaml
+#    and listed in pack.yaml contents.entrypoints;
+#  - the store is implicit (created on first host.store.put, namespaced by the
+#    server-derived packId) — there is no `stores` schema.
+#
+# `renderer` resolves relative to THIS yaml and stays inside the pack root (the
+# built bundle is served tool-local here). A pack tool needs NO `provider:` —
+# the renderer endpoint resolves the tool's on-disk location via
+# ToolManager.resolveToolLocation().
+renderer: ArtifactRenderer.js

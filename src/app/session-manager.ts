@@ -17,6 +17,8 @@ import {
 import { gatewayFetch, saveDraftToServer, loadDraftFromServer, deleteDraftFromServer, refreshSessions, startSessionPolling, updateLocalSessionTitle, updateLocalSessionStatus, fetchGitStatus, refreshPrStatusCache, teardownTeam, promoteProject, fetchProjects, notifyProposalDecision } from "./api.js";
 import { formatProjectAssistantAutoPrompt } from "./project-assistant-autoprompt.js";
 import { reconcilePackRenderersForProject } from "./pack-renderers.js";
+import { reconcilePackPanelsForProject } from "./pack-panels.js";
+import { reconcilePackEntrypointsForProject } from "./pack-entrypoints.js";
 import { errorDetails } from "./error-helpers.js";
 import { runGitStatusRefresh, abortableSleep } from "./git-status-refresh.js";
 import { startTimeRefresh } from "./render-helpers.js";
@@ -31,13 +33,6 @@ import { setSelectedWorkflowId, showProposalToast, resetProposalAnnCount } from 
 import { clearProposalAnnotations } from "../ui/components/review/proposal-annotations.js";
 import { restorePersistedReviewDocuments } from "./review-sources.js";
 import { buildProjectConfigDiff } from "./project-proposal-diff.js";
-
-function restorePrWalkthroughPanelIfNeeded(sessionId: string, sessionData: { walkthroughJobId?: string; childKind?: string } | undefined): void {
-	if (!sessionData?.walkthroughJobId && sessionData?.childKind !== "pr-walkthrough") return;
-	void import("./pr-walkthrough.js").then(({ restorePrWalkthroughJobForSession }) => {
-		restorePrWalkthroughJobForSession(state, sessionId);
-	}).catch(() => { /* older server or walkthrough module unavailable */ });
-}
 
 // settings-page is dynamic-imported lazily below to keep it out of the main chunk.
 // See docs/design/ui-bundle-size-reduction.md (Task A).
@@ -1050,6 +1045,8 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 		// active/default resolves the right project-scope renderers (design §4a/§4c).
 		// Fire-and-forget — never block the session switch.
 		void reconcilePackRenderersForProject(sessionForPalette?.projectId).catch(() => {});
+		void reconcilePackPanelsForProject(sessionForPalette?.projectId).catch(() => {});
+		void reconcilePackEntrypointsForProject(sessionForPalette?.projectId).catch(() => {});
 
 		// Reset session-scoped global state so it doesn't bleed from the previous session.
 		// If the session was just created server-side (e.g. via a back-channel API
@@ -1093,7 +1090,6 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 		// without this, clicking "Create Goal" in the proposal form after switching
 		// away and back to a goal-assistant session fails with "Select a project…".
 		state.previewProjectId = sessionData?.projectId || "";
-		restorePrWalkthroughPanelIfNeeded(sessionId, sessionData);
 		state.previewTitleEdited = false;
 		state.previewSpecEdited = false;
 		state.previewCwdEdited = false;
@@ -1205,6 +1201,8 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 	applyProjectPalette(sessionForPalette?.projectId);
 	// Re-drive pack renderers for this session's project (see fast-path above).
 	void reconcilePackRenderersForProject(sessionForPalette?.projectId).catch(() => {});
+	void reconcilePackPanelsForProject(sessionForPalette?.projectId).catch(() => {});
+	void reconcilePackEntrypointsForProject(sessionForPalette?.projectId).catch(() => {});
 
 	// Phase 2: async hydrate
 	const gen = state.switchGeneration;
@@ -1916,7 +1914,6 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 		state.assistantTab = "chat";
 		state.assistantHasProposal = false;
 		state.isPreviewSession = options?.isPreview || sessionData?.preview || false;
-		restorePrWalkthroughPanelIfNeeded(sessionId, sessionData);
 		state.previewPanelMtime = 0;
 		state.previewPanelEntry = "";
 		state.previewPanelContentHash = "";
@@ -2275,6 +2272,8 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 				// The session's project may have only just become known here — re-drive
 				// pack renderers for it (deduped if unchanged; design §4a/§4c).
 				void reconcilePackRenderersForProject(sessionForRole?.projectId).catch(() => {});
+				void reconcilePackPanelsForProject(sessionForRole?.projectId).catch(() => {});
+				void reconcilePackEntrypointsForProject(sessionForRole?.projectId).catch(() => {});
 				// Apply cwd/branch if not set earlier (sessionData wasn't in gatewaySessions yet)
 				if (state.chatPanel?.agentInterface && !state.chatPanel.agentInterface.cwd && sessionForRole?.cwd) {
 					state.chatPanel.agentInterface.cwd = sessionForRole.cwd;

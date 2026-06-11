@@ -19,10 +19,22 @@ import {
 	HOST_API_VERSION,
 	HOST_CONTRACT_VERSION,
 	type HostApi,
+	type HostRouteInit,
+	type ReadTranscriptOpts,
+	type TranscriptEnvelope,
+	type ToolCallRecord,
+	type PostMessageInput,
+	type HostSessionEventName,
+	type HostSessionEventMap,
 } from "../shared/extension-host/host-api.js";
 import { gatewayFetch } from "./gateway-fetch.js";
 import { renderApp } from "./state.js";
 import { requestToolRender } from "../ui/tools/renderer-registry.js";
+import { openPackPanel, setPanelHostFactory } from "./pack-panels.js";
+import { consumeGesture } from "./gesture-context.js";
+import { postSessionMessageOverWs } from "./session-write-bridge.js";
+import { subscribeHostSessionEvent } from "./session-event-bus.js";
+import { navigateToTarget } from "./pack-entrypoints.js";
 
 /** Add the `x-bobbit-session-id` header to a fetch init, mirroring the
  *  propagation `defaults/tools/agent/extension.ts` uses (server reads it). The
@@ -32,6 +44,21 @@ function withSession(init: RequestInit | undefined, sessionId: string | undefine
 	const headers: Record<string, string> = { ...(init?.headers as Record<string, string> | undefined) };
 	if (sessionId) headers["x-bobbit-session-id"] = sessionId;
 	return { ...init, headers };
+}
+
+/** sha256 hex of `role + "\n" + text` — the content binding for a C2 session-write
+ *  permit. Computed with SubtleCrypto so the value matches the server's Node
+ *  `createHash("sha256")` exactly (same UTF-8 input, same hex encoding). Used by
+ *  `host.session.postMessage` to mint a content-bound, one-time write permit before
+ *  posting (design extension-host-phase2.md §8 C2.1 + session-write-permit.ts). */
+async function sessionWriteContentHash(role: string, text: string): Promise<string> {
+	const subtle = globalThis.crypto?.subtle;
+	if (!subtle) throw new Error("host.session.postMessage requires SubtleCrypto (secure context)");
+	const bytes = new TextEncoder().encode(`${role}\n${text}`);
+	const digest = await subtle.digest("SHA-256", bytes);
+	return Array.from(new Uint8Array(digest))
+		.map((b) => b.toString(16).padStart(2, "0"))
+		.join("");
 }
 
 /** Build the Phase-1 client Host API bound to a given session AND the
@@ -44,9 +71,99 @@ function withSession(init: RequestInit | undefined, sessionId: string | undefine
  *  `createServerHostApi({ sessionId, toolUseId, ... })` contract (§3.2), where
  *  pack identity is SERVER-DERIVED from the resolved winning contribution —
  *  never passed by extension code. */
-export function getHostApi(sessionId: string | undefined, toolUseId: string | undefined): HostApi {
-	const notImpl = (m: string): never => {
-		throw new Error(`host.${m} is reserved for Phase 2`);
+// A surface reference the TRUSTED app loader supplies to bind the Host API's
+// scoped capabilities (pack schema V1 §8.4). Renderer/action surfaces are
+// TOOL-bound (they need a tool call / `toolUseId`); panel/entrypoint/route
+// surfaces are PACK-bound (no carrier tool). The server mints the matching
+// server-derived surface token from whichever shape it receives.
+export type SurfaceRef =
+	// A TOOL-bound surface. `packId` is the structural packId of the renderer's
+	// OWN pack (threaded from /api/tools via `packIdForTool`); it is NOT sent to the
+	// server (the server derives the trusted packId from the `tool`) — it exists
+	// purely so `host.ui.openPanel({panelId})` resolves the panel WITHIN the
+	// renderer's pack (panel ids are pack-local). Absent for a built-in renderer.
+	| { kind: "tool"; tool: string; packId?: string }
+	| { kind: "pack"; packId: string; contributionKind: "panel" | "entrypoint" | "route"; contributionId: string };
+
+// Pack schema V1 §8.4: give pack PANELS a host API bound to the active session +
+// the panel's PACK-BOUND surface, so `panel.render(params, host)` can reach the
+// scoped capabilities (`store`/`callRoute`/`session`). A panel originates no tool
+// call, so `toolUseId` is undefined; its surface is `{kind:"pack", packId,
+// contributionKind:"panel", contributionId:panelId}`. Registered from host-api
+// (which already imports pack-panels) so pack-panels stays free of a reverse
+// import cycle.
+setPanelHostFactory((sessionId, packId, panelId) =>
+	getHostApi(sessionId, undefined, { kind: "pack", packId, contributionKind: "panel", contributionId: panelId }),
+);
+
+export function getHostApi(
+	sessionId: string | undefined,
+	toolUseId: string | undefined,
+	surface?: SurfaceRef,
+): HostApi {
+	// `surface` (the TRUSTED app loader passes it) identifies the renderer/panel's
+	// owning contribution. The Host API MINTS a SERVER-MINTED surface binding token
+	// bound to {sessionId, packId, contributionId, tool?} (the server resolves the
+	// winning contribution). The opaque token is captured in THIS closure — pack
+	// module code never sees or sets it — and echoed on every scoped call
+	// (store/callRoute/session). The server DERIVES {packId, tool?} from the validated
+	// token and IGNORES any caller-supplied tool/pack, closing the cross-pack identity
+	// hole (design pack-schema-v1-rationalisation.md §4 + §6.5). A pack-bound surface
+	// has NO tool — its gate is installed + active + own-session (§4.5), so an
+	// orphan/UI-only pack can use scoped surfaces without a tool in allowedTools.
+	let surfaceTokenPromise: Promise<string> | undefined;
+	const surfaceTokenBody = (): Record<string, unknown> => {
+		if (!surface) throw new Error("host scoped capabilities require a pack-served context");
+		if (surface.kind === "tool") return { sessionId, tool: surface.tool };
+		return {
+			sessionId,
+			packId: surface.packId,
+			contributionKind: surface.contributionKind,
+			contributionId: surface.contributionId,
+		};
+	};
+	const getSurfaceToken = (): Promise<string> => {
+		if (!surface) return Promise.reject(new Error("host scoped capabilities require a pack-served context"));
+		if (!surfaceTokenPromise) {
+			const p = (async (): Promise<string> => {
+				const resp = await gatewayFetch(
+					"/api/ext/surface-token",
+					withSession({ method: "POST", body: JSON.stringify(surfaceTokenBody()) }, sessionId),
+				);
+				if (!resp.ok) throw new Error(`surface-token HTTP ${resp.status}`);
+				const data = (await resp.json()) as { token?: string };
+				if (!data?.token) throw new Error("surface-token: empty response");
+				return data.token;
+			})();
+			// On failure (mint denied / offline) drop the memo so a later call re-mints.
+			p.catch(() => { if (surfaceTokenPromise === p) surfaceTokenPromise = undefined; });
+			surfaceTokenPromise = p;
+		}
+		return surfaceTokenPromise;
+	};
+	// Run a scoped fetch with the surface token threaded by `build`. On a 403 (e.g. a
+	// token that expired on a long-lived tab) the memo is dropped and the call re-mints
+	// + retries ONCE — so a stale token self-heals without surfacing to the pack.
+	const scopedFetch = async (build: (token: string) => { path: string; init: RequestInit }): Promise<Response> => {
+		const first = build(await getSurfaceToken());
+		let resp = await gatewayFetch(first.path, withSession(first.init, sessionId));
+		if (resp.status === 403) {
+			surfaceTokenPromise = undefined;
+			const retry = build(await getSurfaceToken());
+			resp = await gatewayFetch(retry.path, withSession(retry.init, sessionId));
+		}
+		return resp;
+	};
+	// Slice B1: POST a store op to /api/ext/store/:op carrying the SERVER-MINTED
+	// surface token (NOT a raw `tool`) so the server derives the trusted packId.
+	const storeOp = async (op: "get" | "put" | "list", payload: Record<string, unknown>): Promise<unknown> => {
+		if (!surface) throw new Error("host.store requires a pack-served renderer context");
+		const resp = await scopedFetch((token) => ({
+			path: `/api/ext/store/${op}`,
+			init: { method: "POST", body: JSON.stringify({ sessionId, toolUseId, surfaceToken: token, ...payload }) },
+		}));
+		if (!resp.ok) throw new Error(`store.${op} HTTP ${resp.status}`);
+		return resp.json();
 	};
 	// Phase-1 host: only invokeAction + requestRender are implemented. `capabilities`
 	// is the single source of truth; the throwing stubs below exist only for type
@@ -54,10 +171,13 @@ export function getHostApi(sessionId: string | undefined, toolUseId: string | un
 	const flags = {
 		invokeAction: true,
 		requestRender: true,
-		callRoute: false,
-		session: false,
-		ui: false,
-		store: false,
+		callRoute: true,
+		// Slice C2 flips `session` (reads B2 + writes C2); Slice C1 flips `ui`
+		// (openPanel B4 + navigate C1). With store (B1) + callRoute (B3) all Phase-2
+		// capabilities are now live (capability-signaling convention, design §0).
+		session: true,
+		ui: true,
+		store: true,
 	};
 	return {
 		version: HOST_API_VERSION,
@@ -95,22 +215,127 @@ export function getHostApi(sessionId: string | undefined, toolUseId: string | un
 			if (!resp.ok) throw new Error(`invokeAction ${tool}/${action} HTTP ${resp.status}`);
 			return resp.json();
 		},
-		// ── Phase 2 (frozen, not implemented) ──
-		callRoute: () => notImpl("callRoute"),
+		// ── Phase 2 ──
+		// Slice B3: POST to /api/ext/route/:name carrying the SERVER-MINTED surface
+		// token so the server authorizes the caller + derives the trusted packId from
+		// the token (the client never sends a packId). The server then resolves the
+		// route MODULE via the pack-level RouteRegistry (opener-independent) and
+		// dispatches it. The route is addressed by `name` within the pack's namespace
+		// — never a raw URL.
+		async callRoute<TResult = unknown>(name: string, init?: HostRouteInit): Promise<TResult> {
+			if (!surface) throw new Error("host.callRoute requires a pack-served renderer context");
+			const resp = await scopedFetch((token) => ({
+				path: `/api/ext/route/${encodeURIComponent(name)}`,
+				init: { method: "POST", body: JSON.stringify({ sessionId, toolUseId, surfaceToken: token, init }) },
+			}));
+			if (!resp.ok) throw new Error(`callRoute ${name} HTTP ${resp.status}`);
+			return resp.json() as Promise<TResult>;
+		},
 		session: {
-			readTranscript: () => notImpl("session.readTranscript"),
-			readToolCall: () => notImpl("session.readToolCall"),
-			postMessage: () => notImpl("session.postMessage"),
-			subscribe: () => notImpl("session.subscribe"),
+			// Slice B2: own-session READS over the namespaced /api/ext endpoints. The
+			// server scopes the read to the HEADER-BOUND session (own-session by
+			// construction — no other-session parameter). `tool` lets the server derive
+			// the trusted packId + gate on allowedTools (same guard as invokeAction).
+			// NOTE: `flags.session` stays FALSE until C2 wires writes — these bodies are
+			// internal-only until the whole namespace flips live (capability-signaling).
+			readTranscript: async (opts?: ReadTranscriptOpts): Promise<TranscriptEnvelope> => {
+				if (!surface) throw new Error("host.session.readTranscript requires a pack-served context");
+				const resp = await scopedFetch((token) => {
+					const params = new URLSearchParams();
+					if (sessionId) params.set("sessionId", sessionId);
+					params.set("surfaceToken", token);
+					if (opts?.offset != null) params.set("offset", String(opts.offset));
+					if (opts?.limit != null) params.set("limit", String(opts.limit));
+					if (opts?.pattern) params.set("pattern", opts.pattern);
+					return { path: `/api/ext/session/transcript?${params.toString()}`, init: { method: "GET" } };
+				});
+				if (!resp.ok) throw new Error(`session.readTranscript HTTP ${resp.status}`);
+				return resp.json();
+			},
+			readToolCall: async (toolUseId: string): Promise<ToolCallRecord | null> => {
+				if (!surface) throw new Error("host.session.readToolCall requires a pack-served context");
+				const resp = await scopedFetch((token) => {
+					const params = new URLSearchParams();
+					if (sessionId) params.set("sessionId", sessionId);
+					params.set("surfaceToken", token);
+					params.set("toolUseId", toolUseId);
+					return { path: `/api/ext/session/tool-call?${params.toString()}`, init: { method: "GET" } };
+				});
+				if (!resp.ok) throw new Error(`session.readToolCall HTTP ${resp.status}`);
+				return resp.json();
+			},
+			// Slice C2: WRITE — post a user/system message into the BOUND session,
+			// optionally resuming the agent turn. Drives the agent, so it has two
+			// independent gates:
+			//   1. TRANSPORT (unforgeable): the SEND rides the app's authenticated session
+			//      WebSocket via `postSessionMessageOverWs` — NOT a `fetch`. There is no
+			//      session secret on any request for a same-realm pack to monkey-patch /
+			//      capture / replay, and pack code has no handle to the WS so it cannot send
+			//      on it. The server targets the WS connection's OWN authenticated session,
+			//      authorizes the pack's `tool` ∈ allowedTools, derives the packId, and
+			//      audits every post; cross-session posting is structurally impossible.
+			//   2. REAL user activation (defense-in-depth) — consumeGesture() reads
+			//      navigator.userActivation SYNCHRONOUSLY at the prologue (before any await)
+			//      and THROWS when no genuine user gesture is active, so a render/mount-time
+			//      post fails loudly. A pack cannot fabricate transient activation.
+			postMessage: (msg: PostMessageInput): Promise<void> => {
+				// SYNCHRONOUS activation check (NOT inside the async body — an async throw
+				// would be a rejected promise, not a loud synchronous failure on mount).
+				if (!consumeGesture()) throw new Error("postMessage requires a user gesture");
+				if (!surface) throw new Error("host.session.postMessage requires a pack-served context");
+				// AFTER the transient-activation assertion: compute the content hash, then
+				// drive over the trusted WS (no fetch, no secret). The poster mints a
+				// server-minted, one-time, content-bound write permit (bound to this hash)
+				// and posts with the returned nonce — so a captured/replayed/tampered frame
+				// is rejected server-side (§8 C2.1 + session-write-permit.ts). `sessionId`
+				// selects the bound RemoteAgent's poster; the server ignores it as a target.
+				return (async () => {
+					// Mint (or reuse) the SERVER-MINTED surface token so the WS handler derives
+					// the trusted {packId, tool} from it — never a caller-supplied `tool`.
+					const surfaceToken = await getSurfaceToken();
+					const contentHash = await sessionWriteContentHash(msg.role, msg.text);
+					await postSessionMessageOverWs({
+						sessionId,
+						surfaceToken,
+						role: msg.role,
+						text: msg.text,
+						resumeTurn: msg.resumeTurn,
+						contentHash,
+					});
+				})();
+			},
+			// Slice C2: subscribe to live, TYPED session events bridged from the session
+			// WebSocket onto the frozen HostSessionEventMap (contract shapes via the
+			// client internal→contract mapper). Scoped to the BOUND session; returns an
+			// unsubscribe fn. No server round-trip — the per-session RemoteAgent feeds the bus.
+			subscribe: <E extends HostSessionEventName>(
+				event: E,
+				cb: (payload: HostSessionEventMap[E]) => void,
+			): (() => void) => subscribeHostSessionEvent(sessionId, event, cb),
 		} as HostApi["session"],
 		ui: {
-			openPanel: () => notImpl("ui.openPanel"),
-			navigate: () => notImpl("ui.navigate"),
+			// Slice B4: open (or focus) a pack-contributed side panel via the client
+			// pack-panel registry (lazy Blob-URL import + mount). PACK-RELATIVE: BOTH a
+			// pack-bound surface (panel/entrypoint) AND a tool-renderer surface supply
+			// their owning structural `packId` (the latter threaded from /api/tools via
+			// `packIdForTool`), so the {packId, panelId} lookup is EXACT and a tool
+			// renderer always opens ITS pack's panel even when another installed pack
+			// declares the same pack-local panel id (pack schema V1 §8.1).
+			openPanel: (target) => openPackPanel(target, surface?.packId),
+			// Slice C1: navigate the SPA to a pack-contributed deep-link route by
+			// STRUCTURED target. `navigateToTarget` resolves `target.route` through the
+			// client pack-route registry, filters params to the route's declared
+			// paramKeys, and serializes `#/ext/<routeId>?<params>` via the router — the
+			// pack never builds a URL (v1 §3 structured addressing). Unknown route =
+			// no-op (e.g. owning pack uninstalled).
+			navigate: (target) => navigateToTarget(target),
 		} as HostApi["ui"],
 		store: {
-			get: () => notImpl("store.get"),
-			put: () => notImpl("store.put"),
-			list: () => notImpl("store.list"),
+			get: async (key: string) => (await storeOp("get", { key })) as never,
+			put: async (key: string, value: unknown) => {
+				await storeOp("put", { key, value });
+			},
+			list: async (prefix?: string) => (await storeOp("list", { prefix })) as string[],
 		} as HostApi["store"],
 	};
 }
