@@ -24,8 +24,9 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { bobbitDir, globalAgentDir } from "../bobbit-dir.js";
+import { resolveBuiltinPacksDir } from "./builtin-packs.js";
 import { ensureSandboxAgentAuthFile } from "./host-tokens.js";
-import { toDockerPath } from "./rpc-bridge.js";
+import { BUILTIN_PACKS_CONTAINER_DIR, toDockerPath } from "./rpc-bridge.js";
 import { TOOLS_DIR } from "./tool-manager.js";
 import { serializeContainerRunSpec } from "./container-runtime/base-cli-runtime.js";
 import { DOCKER_RUN_ARG_HOOKS } from "./container-runtime/docker-runtime.js";
@@ -135,6 +136,7 @@ export function buildContainerRunSpec(config: DockerRunConfig): ContainerRunSpec
 
 	const toolsDir = TOOLS_DIR;
 	const builtinToolsDir = config.toolManager?.getBuiltinToolsDir();
+	const builtinPacksDir = resolveBuiltinPacksDir();
 
 	// ── Add-hosts: host-gateway (always) + cloud-metadata black-holes (network). ──
 	// Insertion order matters: the serializer emits the `"host-gateway"` entry in
@@ -173,6 +175,16 @@ export function buildContainerRunSpec(config: DockerRunConfig): ContainerRunSpec
 
 	if (builtinToolsDir && builtinToolsDir !== toolsDir) {
 		bind(toDockerPath(builtinToolsDir), "/tools-builtin", true);
+	}
+
+	// Mount shipped first-party market packs so pack-owned bobbit-extension tools
+	// (and any shared pack modules they import) resolve inside Docker sandboxes.
+	try {
+		if (fs.statSync(builtinPacksDir).isDirectory()) {
+			args.push("-v", `${toDockerPath(builtinPacksDir)}:${BUILTIN_PACKS_CONTAINER_DIR}:ro`);
+		}
+	} catch {
+		// Built-in pack dir is absent in source-only/dev test layouts before build:packs.
 	}
 
 	// ── Per-session preview mount (WP-A/F) ────────────────────────────
