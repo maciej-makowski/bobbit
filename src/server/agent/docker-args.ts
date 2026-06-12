@@ -27,9 +27,6 @@ import { bobbitDir, globalAgentDir } from "../bobbit-dir.js";
 import { ensureSandboxAgentAuthFile } from "./host-tokens.js";
 import { toDockerPath } from "./rpc-bridge.js";
 import { TOOLS_DIR } from "./tool-manager.js";
-import { serializeContainerRunSpec } from "./container-runtime/base-cli-runtime.js";
-import { DOCKER_RUN_ARG_HOOKS } from "./container-runtime/docker-runtime.js";
-import type { ContainerRunSpec, VolumeMount } from "./container-runtime/types.js";
 import type { PreferencesStore } from "./preferences-store.js";
 import type { ToolManager } from "./tool-manager.js";
 
@@ -109,21 +106,7 @@ export interface DockerRunConfig {
 
 // ── Builder ────────────────────────────────────────────────────────────────
 
-/**
- * Build a runtime-neutral {@link ContainerRunSpec} from a {@link DockerRunConfig}.
- *
- * This is the single source of truth for the long-lived sandbox container's
- * mounts/env/labels/resources. It performs all host-side prep (mkdir of bind
- * sources, `toDockerPath` rewriting, auth.json generation, git identity) and
- * emits a structured spec; the runtime serializes it to argv. Bind mounts are
- * tagged `relabel: true` so SELinux-aware runtimes (Podman) can relabel them;
- * named volumes are not.
- *
- * `buildDockerRunArgs` below is the Docker serialization of this spec and stays
- * byte-equivalent (as a multiset) to its historical output — pinned by
- * tests/container-runtime-run-args.test.ts.
- */
-export function buildContainerRunSpec(config: DockerRunConfig): ContainerRunSpec {
+export function buildDockerRunArgs(config: DockerRunConfig): string[] {
 	const {
 		image, workspaceDir,
 		label, labelVersion, labelPrefix, worktreePath,
@@ -136,112 +119,133 @@ export function buildContainerRunSpec(config: DockerRunConfig): ContainerRunSpec
 	const toolsDir = TOOLS_DIR;
 	const builtinToolsDir = config.toolManager?.getBuiltinToolsDir();
 
-	// ── Add-hosts: host-gateway (always) + cloud-metadata black-holes (network). ──
-	// Insertion order matters: the serializer emits the `"host-gateway"` entry in
-	// the resource block and the literal-IP entries after `--network`.
-	const addHosts: Record<string, string> = { "host.docker.internal": "host-gateway" };
+	const baseHostArgs = ["--add-host=host.docker.internal:host-gateway"];
+
+	// Resource limits — prevent containers from consuming all host resources
+	baseHostArgs.push(`--memory=${config.memoryLimit ?? "32g"}`);
+	baseHostArgs.push(`--cpus=${config.cpuLimit ?? "12"}`);
+	const pidsLimit = config.pidsLimit ?? "512";
+	if (pidsLimit !== "0") {
+		baseHostArgs.push(`--pids-limit=${pidsLimit}`);
+	}
+
+	// Attach to a restricted Docker network for sandboxed containers
 	if (sandboxNetwork) {
-		addHosts["metadata.google.internal"] = "0.0.0.0";
-		addHosts["metadata.internal"] = "0.0.0.0";
-		addHosts["169.254.169.254"] = "0.0.0.0";
+		baseHostArgs.push(`--network=${sandboxNetwork}`);
+		// Black-hole cloud metadata endpoints (defense-in-depth)
+		baseHostArgs.push("--add-host=metadata.google.internal:0.0.0.0");
+		baseHostArgs.push("--add-host=metadata.internal:0.0.0.0");
+		baseHostArgs.push("--add-host=169.254.169.254:0.0.0.0");
 	}
 
-	const labels: Record<string, string> = {};
+	const args: string[] = ["run", "-d", "--restart=unless-stopped", ...baseHostArgs];
+
+	// ── Labels ─────────────────────────────────────────────────────────
 	if (label && labelPrefix) {
-		labels[labelPrefix] = label;
-		if (labelVersion) labels[`${labelPrefix}-version`] = labelVersion;
-		if (worktreePath) labels[`${labelPrefix}-wt`] = worktreePath;
-	}
-
-	const volumes: VolumeMount[] = [];
-	const bind = (hostPathOrVolume: string, containerPath: string, readonly = false): void => {
-		volumes.push({ hostPathOrVolume, containerPath, readonly, relabel: true });
-	};
-
-	// ── Bind mounts / volumes ──────────────────────────────────────────
-	if (projectId) {
-		// Per-project container: named volumes (survive container recreation) — no relabel.
-		volumes.push({ hostPathOrVolume: `bobbit-workspace-${projectId}`, containerPath: "/workspace" });
-		volumes.push({ hostPathOrVolume: `bobbit-worktrees-${projectId}`, containerPath: "/workspace-wt" });
-	} else if (workspaceDir) {
-		// Legacy pool mode: bind-mount host directory as /workspace
-		bind(toDockerPath(workspaceDir), "/workspace");
-	}
-	// pi-coding-agent is baked into the image (avoids slow bind-mount I/O on
-	// Docker Desktop). No node_modules mount needed.
-	bind(toDockerPath(toolsDir), "/tools", true);
-
-	if (builtinToolsDir && builtinToolsDir !== toolsDir) {
-		bind(toDockerPath(builtinToolsDir), "/tools-builtin", true);
-	}
-
-	// ── Per-session preview mount (WP-A/F) ────────────────────────────
-	if (stateDir && projectId) {
-		const previewRoot = path.join(stateDir, "preview");
-		fs.mkdirSync(previewRoot, { recursive: true });
-		bind(toDockerPath(previewRoot), "/bobbit/preview-root");
-	} else if (stateDir && sessionId) {
-		const previewMount = path.join(stateDir, "preview", sessionId);
-		fs.mkdirSync(previewMount, { recursive: true });
-		bind(toDockerPath(previewMount), "/bobbit/preview");
-	}
-
-	// Bind ONLY specific state subdirectories — never the full state dir (which
-	// contains the host gateway token, TLS keys, sessions.json, etc.)
-	if (stateDir) {
-		for (const sub of ["sessions", "tool-guard", "html-snapshots"]) {
-			const hostPath = path.join(stateDir, sub);
-			fs.mkdirSync(hostPath, { recursive: true });
-			bind(toDockerPath(hostPath), `/bobbit-state/${sub}`);
+		args.push("--label", `${labelPrefix}=${label}`);
+		if (labelVersion) {
+			args.push("--label", `${labelPrefix}-version=${labelVersion}`);
+		}
+		if (worktreePath) {
+			args.push("--label", `${labelPrefix}-wt=${worktreePath}`);
 		}
 	}
 
-	// Host agent sessions dir — mount ONLY sessions, not the full agent dir, to
-	// keep auth.json credentials out of the sandbox.
+	// ── Bind mounts / volumes ──────────────────────────────────────────
+	if (projectId) {
+		// Per-project container: named Docker volumes (survive container recreation)
+		args.push("-v", `bobbit-workspace-${projectId}:/workspace`);
+		args.push("-v", `bobbit-worktrees-${projectId}:/workspace-wt`);
+	} else if (workspaceDir) {
+		// Legacy pool mode: bind-mount host directory as /workspace
+		args.push("-v", `${toDockerPath(workspaceDir)}:/workspace`);
+	}
+	// pi-coding-agent is baked into the Docker image (avoids 20x slower
+	// bind-mount I/O on Docker Desktop Windows/macOS). No node_modules mount needed.
+	args.push("-v", `${toDockerPath(toolsDir)}:/tools:ro`);
+
+	// Mount builtin tools directory for cascade-resolved builtin extensions
+	if (builtinToolsDir && builtinToolsDir !== toolsDir) {
+		args.push("-v", `${toDockerPath(builtinToolsDir)}:/tools-builtin:ro`);
+	}
+
+	// ── Per-session preview mount (WP-A/F) ────────────────────────────
+	// `<stateDir>/preview/<sid>/` is the single source of truth for the
+	// preview content; the gateway populates it via mount.writeInline /
+	// mount.mountFile. Bind it into the container so the agent (and any
+	// in-container tooling) can read back the same bytes. Replaces the
+	// old BOBBIT_HOST_CWD path-translation dance.
+	if (stateDir && projectId) {
+		// Per-project (long-lived) container: bind the parent so every
+		// session sharing the container resolves its own subtree.
+		const previewRoot = path.join(stateDir, "preview");
+		fs.mkdirSync(previewRoot, { recursive: true });
+		args.push("-v", `${toDockerPath(previewRoot)}:/bobbit/preview-root`);
+	} else if (stateDir && sessionId) {
+		// Per-session container: bind only this session's mount.
+		const previewMount = path.join(stateDir, "preview", sessionId);
+		fs.mkdirSync(previewMount, { recursive: true });
+		args.push("-v", `${toDockerPath(previewMount)}:/bobbit/preview`);
+	}
+
+	// Bind mount ONLY specific state subdirectories — never the full state dir,
+	// which contains the host gateway token, TLS keys, sessions.json, etc.
+	if (stateDir) {
+		const sandboxStateDirs = ["sessions", "tool-guard", "html-snapshots"];
+		for (const sub of sandboxStateDirs) {
+			const hostPath = path.join(stateDir, sub);
+			fs.mkdirSync(hostPath, { recursive: true });
+			args.push("-v", `${toDockerPath(hostPath)}:/bobbit-state/${sub}`);
+		}
+	}
+
+	// Host agent sessions dir (~/.bobbit/agent/sessions/) — mount ONLY sessions, not the
+	// full agent dir, to prevent sandboxed agents from accessing auth.json credentials.
 	const hostAgentDir = globalAgentDir();
 	const hostSessionsDir = path.join(hostAgentDir, "sessions");
 	fs.mkdirSync(hostSessionsDir, { recursive: true });
-	bind(toDockerPath(hostSessionsDir), "/home/node/.bobbit/agent/sessions");
+	args.push("-v", `${toDockerPath(hostSessionsDir)}:/home/node/.bobbit/agent/sessions`);
 
 	// Mount models.json (read-only) so the agent can discover available models.
 	const hostModelsJson = path.join(hostAgentDir, "models.json");
 	try {
 		if (fs.statSync(hostModelsJson).isFile()) {
-			bind(toDockerPath(hostModelsJson), "/home/node/.bobbit/agent/models.json", true);
+			args.push("-v", `${toDockerPath(hostModelsJson)}:/home/node/.bobbit/agent/models.json:ro`);
 		}
 	} catch {
 		// models.json doesn't exist — agent will rely on env vars for model discovery
 	}
 
 	// Mount a sandbox-scoped auth.json. When sandbox token policy does not allow
-	// OpenAI/Codex credentials, the file is an empty non-secret object.
+	// OpenAI/Codex credentials, the file is an empty non-secret object so Pi still
+	// sees the expected path without exposing host auth.
 	const sandboxAuthJson = ensureSandboxAgentAuthFile({
 		prefs: config.sandboxAgentAuthPrefs,
 		includeCodexAuth: config.sandboxAgentAuthAllowed === true,
 		scope: config.sandboxAgentAuthScope || projectId,
 	});
-	bind(toDockerPath(sandboxAuthJson), "/home/node/.bobbit/agent/auth.json", true);
+	args.push("-v", `${toDockerPath(sandboxAuthJson)}:/home/node/.bobbit/agent/auth.json:ro`);
 
 	// Session prompts directory
 	const sessionPromptsDir = path.join(bobbitDir(), "state", "session-prompts");
 	fs.mkdirSync(sessionPromptsDir, { recursive: true });
-	bind(toDockerPath(sessionPromptsDir), "/tmp/session-prompts");
+	args.push("-v", `${toDockerPath(sessionPromptsDir)}:/tmp/session-prompts`);
 
 	// Extra read-only bind mounts (e.g. remote-less sandbox clone source).
 	if (extraReadonlyMounts) {
 		for (const { hostPath, mountPath } of extraReadonlyMounts) {
 			if (!hostPath || !mountPath) continue;
-			bind(toDockerPath(hostPath), mountPath, true);
+			args.push("-v", `${toDockerPath(hostPath)}:${mountPath}:ro`);
 		}
 	}
 
-	// User-configured mounts (`host:container[:ro]`). Common forms map exactly;
-	// the host segment is rewritten via toDockerPath and `:ro` becomes readonly.
+	// User-configured mounts
 	if (sandboxMounts) {
 		for (const mount of sandboxMounts) {
 			const parts = mount.split(":");
 			if (parts.length >= 2) {
-				bind(toDockerPath(parts[0]), parts[1], parts.slice(2).includes("ro"));
+				parts[0] = toDockerPath(parts[0]);
+				args.push("-v", parts.join(":"));
 			}
 		}
 	}
@@ -250,17 +254,18 @@ export function buildContainerRunSpec(config: DockerRunConfig): ContainerRunSpec
 	// NOTE: BOBBIT_GATEWAY_URL and BOBBIT_TOKEN are intentionally NOT set here.
 	// PID 1 (sleep infinity) does not need them, and exposing them would leak
 	// the gateway auth token via /proc/1/environ. The agent process receives
-	// its scoped sandbox token via `<runtime> exec -e` in rpc-bridge.ts.
-	const env: Record<string, string> = {
-		NODE_TLS_REJECT_UNAUTHORIZED: "0",
-		NODE_OPTIONS: "--no-warnings",
-		PI_CODING_AGENT_DIR: "/home/node/.bobbit/agent",
-	};
+	// its scoped sandbox token via `docker exec -e` in rpc-bridge.ts.
+	args.push("-e", "NODE_TLS_REJECT_UNAUTHORIZED=0");
+	args.push("-e", "NODE_OPTIONS=--no-warnings");
+	args.push("-e", "PI_CODING_AGENT_DIR=/home/node/.bobbit/agent");
 
-	// Propagate PI_OFFLINE so pi-coding-agent in the sandbox skips GitHub
-	// fd/rg downloads when the host gateway detected no internet at startup.
+	// Propagate PI_OFFLINE into the container so pi-coding-agent inside the
+	// sandbox skips GitHub fd/rg downloads when the host gateway detected no
+	// internet at startup. The container has its own apt-installed binaries,
+	// so this is belt-and-braces — but if those are ever missing, pi fails
+	// fast instead of hanging on a doomed download.
 	if (process.env.PI_OFFLINE && process.env.PI_OFFLINE !== "") {
-		env.PI_OFFLINE = process.env.PI_OFFLINE;
+		args.push("-e", `PI_OFFLINE=${process.env.PI_OFFLINE}`);
 	}
 
 	// Sandbox credentials
@@ -270,61 +275,37 @@ export function buildContainerRunSpec(config: DockerRunConfig): ContainerRunSpec
 				console.warn(`[docker-args] Skipping invalid credential key: ${key}`);
 				continue;
 			}
-			env[key] = value;
+			args.push("-e", `${key}=${value}`);
 		}
 	}
 
 	// ── Git identity ───────────────────────────────────────────────────
-	// Inherit the host user's git identity so agents can commit without manual
-	// `git config` setup. Uses env vars (highest priority in git).
+	// Inherit the host user's git identity so agents can commit without
+	// manual `git config` setup. Uses env vars (highest priority in git).
 	const gitIdentity = getHostGitIdentity();
 	if (gitIdentity.name) {
-		env.GIT_AUTHOR_NAME = gitIdentity.name;
-		env.GIT_COMMITTER_NAME = gitIdentity.name;
+		args.push("-e", `GIT_AUTHOR_NAME=${gitIdentity.name}`);
+		args.push("-e", `GIT_COMMITTER_NAME=${gitIdentity.name}`);
 	}
 	if (gitIdentity.email) {
-		env.GIT_AUTHOR_EMAIL = gitIdentity.email;
-		env.GIT_COMMITTER_EMAIL = gitIdentity.email;
+		args.push("-e", `GIT_AUTHOR_EMAIL=${gitIdentity.email}`);
+		args.push("-e", `GIT_COMMITTER_EMAIL=${gitIdentity.email}`);
 	}
 
 	// ── MCP extensions ─────────────────────────────────────────────────
 	const mcpExtDir = path.join(bobbitDir(), "state", "mcp-extensions");
 	try {
 		if (fs.statSync(mcpExtDir).isDirectory()) {
-			bind(toDockerPath(mcpExtDir), "/mcp-extensions", true);
+			args.push("-v", `${toDockerPath(mcpExtDir)}:/mcp-extensions:ro`);
 		}
 	} catch {
 		// MCP extensions dir doesn't exist — skip
 	}
 
-	return {
-		image,
-		labels: Object.keys(labels).length > 0 ? labels : undefined,
-		volumes,
-		env,
-		network: sandboxNetwork,
-		addHosts,
-		resources: {
-			memory: config.memoryLimit ?? "32g",
-			cpus: config.cpuLimit ?? "12",
-			pids: config.pidsLimit ?? "512",
-		},
-		restart: "unless-stopped",
-		command: ["sleep", "infinity"],
-	};
-}
+	// ── Image + command ────────────────────────────────────────────────
+	args.push(image, "sleep", "infinity");
 
-/**
- * Serialize the sandbox container spec to a Docker `run …` argv.
- *
- * Thin adapter over {@link buildContainerRunSpec} + the shared serializer with
- * Docker run-arg hooks. Output is a multiset-equivalent of the historical
- * hand-rolled builder (arg order among `-v`/`-e` may differ, which is
- * semantically irrelevant to `docker run`). Retained as the Docker pinning
- * reference and for the sandbox security tests.
- */
-export function buildDockerRunArgs(config: DockerRunConfig): string[] {
-	return serializeContainerRunSpec(buildContainerRunSpec(config), DOCKER_RUN_ARG_HOOKS);
+	return args;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

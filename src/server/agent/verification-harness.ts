@@ -21,7 +21,6 @@ import { resolveRole as resolveRoleFromGoal, listAvailableRoles } from "./resolv
 import { GoalPausedError } from "./goal-paused-guard.js";
 import type { PersistedGoal } from "./goal-store.js";
 import { RpcBridge, type RpcBridgeOptions } from "./rpc-bridge.js";
-import { resolveContainerRuntime } from "./container-runtime/index.js";
 import { assembleSystemPrompt } from "./system-prompt.js";
 import { detectPrimaryBranch } from "../skills/git.js";
 import { type WorkflowGate, type VerifyStep } from "./workflow-store.js";
@@ -3772,31 +3771,23 @@ export class VerificationHarness {
 					const stepKillId = randomUUID().slice(0, 8);
 					const pidFile = `/tmp/.bobbit-step-${stepKillId}.pid`;
 					const wrappedCmd = `echo $$ > ${pidFile}; ${command}`;
-					// Resolve the project's container runtime; the runtime owns the
-					// `exec -w` argv construction + env shim. We MUST still route
-					// through spawnTracked (kill-tree; never `spawn({ timeout })`).
-					const runtime = resolveContainerRuntime(
-						streamCtx?.goalId ? this.resolveProjectConfigStore(streamCtx.goalId) : null,
-					);
-					const execCmd = runtime.buildExecCommand(containerId, ["/bin/sh", "-c", wrappedCmd], { cwd: normalizedCwd });
-					tracked = spawnTracked(execCmd.file, execCmd.args, {
+					tracked = spawnTracked("docker", ["exec", "-w", normalizedCwd, containerId, "/bin/sh", "-c", wrappedCmd], {
 						stdio: ["ignore", "pipe", "pipe"],
 						timeoutMs: timeoutSec * 1000,
-						env: execCmd.env,
+						env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" },
 						onTimeout: () => {
-							// Belt-and-braces: host-side tree-kill of `<runtime> exec`
+							// Belt-and-braces: host-side tree-kill of `docker exec`
 							// does not reliably reach in-container descendants.
 							// Kill the step's own process group via the persisted
-							// pid file — leaves other concurrent exec'd processes
-							// (agent sessions, other verification steps,
+							// pid file — leaves other concurrent docker exec'd
+							// processes (agent sessions, other verification steps,
 							// bg-processes) untouched.
 							try {
-								const killCmd = runtime.buildExecCommand(containerId, [
-									"/bin/sh", "-c",
+								const killer = spawn("docker", [
+									"exec", containerId, "/bin/sh", "-c",
 									`p=$(cat ${pidFile} 2>/dev/null) && kill -TERM -- -$p 2>/dev/null; sleep 0.2; p=$(cat ${pidFile} 2>/dev/null) && kill -KILL -- -$p 2>/dev/null; rm -f ${pidFile}`,
-								]);
-								const killer = spawn(killCmd.file, killCmd.args, { stdio: "ignore", env: killCmd.env });
-								killer.on("error", () => { /* runtime missing — best-effort */ });
+								], { stdio: "ignore" });
+								killer.on("error", () => { /* docker missing — best-effort */ });
 							} catch { /* ignore */ }
 						},
 					});
