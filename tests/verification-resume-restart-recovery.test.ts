@@ -22,7 +22,7 @@
  * so a regression can't hang the unit-test runner.
  */
 
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -33,6 +33,18 @@ const STATE_DIR = path.join(TEST_DIR, "state");
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
 const { VerificationHarness } = await import("../src/server/agent/verification-harness.js");
+
+// The resume path (and these tests' cold-reviewer stubs) bridge async gaps with
+// UNREF'd timers (waitForReady readiness wait, the pending-result grab poll, the
+// deadline racer). When this file runs with nothing else keeping the loop busy
+// (the unit runner at `--test-concurrency=1`, i.e. CI's 2-core box), those
+// unref'd timers are the sole pending work, so node:test declares the loop idle
+// and cancels the in-flight test ("Promise resolution is still pending but the
+// event loop has already resolved"). A single REF'd keepalive holds the loop
+// open for the file; `--test-force-exit` still tears the process down once both
+// tests finish. (Source stays byte-identical to upstream.)
+const __loopKeepalive = setInterval(() => {}, 1 << 30);
+after(() => clearInterval(__loopKeepalive));
 
 const GOAL_ID = "goal-test";
 const GATE_ID = "documentation";
