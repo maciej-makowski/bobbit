@@ -5,6 +5,8 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { bobbitDir, bobbitStateDir, globalAgentDir } from "../bobbit-dir.js";
 import { TOOLS_DIR, type ToolManager } from "./tool-manager.js";
+import { DockerRuntime } from "./container-runtime/docker-runtime.js";
+import type { ContainerRuntime } from "./container-runtime/types.js";
 import { THINKING_LEVELS } from "../../shared/thinking-levels.js";
 import { ensurePiAiBedrockHeadersPatch } from "./pi-ai-bedrock-headers-patch.js";
 
@@ -72,8 +74,10 @@ export interface RpcBridgeOptions {
 	gatewayUrl?: string;
 	/** Auth token for the agent */
 	gatewayToken?: string;
-	/** Container ID to use with docker exec (from sandbox pool) */
+	/** Container ID to use with `<runtime> exec` (from the project sandbox) */
 	containerId?: string;
+	/** Container runtime (docker/podman). Defaults to DockerRuntime when omitted. */
+	runtime?: ContainerRuntime;
 	/** Tool manager for resolving extension paths (optional — falls back to TOOLS_DIR). */
 	toolManager?: ToolManager;
 	/**
@@ -602,59 +606,52 @@ export class RpcBridge {
 	 * The container already has all bind mounts and env vars configured.
 	 */
 	private spawnDockerExec(containerId: string, _cliPath: string, agentArgs: string[]): ChildProcess {
-		const execArgs: string[] = ["exec", "-i"];
-
-		// Pass session-specific env vars via docker exec -e (overrides container env)
-		if (this.options.env?.BOBBIT_SESSION_ID) {
-			execArgs.push("-e", `BOBBIT_SESSION_ID=${this.options.env.BOBBIT_SESSION_ID}`);
-		}
-		// S1: the per-session capability secret reaches the sandboxed agent
-		// process via docker exec -e (NOT the pool container's PID 1 env — so it
+		// Session-specific env vars become `-e KEY=VAL` flags (container env). The
+		// runtime owns `-i`/`-w`/`-e`/env-shim construction; we own spawn + stdio.
+		const execEnv: Record<string, string> = {};
+		if (this.options.env?.BOBBIT_SESSION_ID) execEnv.BOBBIT_SESSION_ID = this.options.env.BOBBIT_SESSION_ID;
+		// S1: the per-session capability secret reaches the sandboxed agent process
+		// via the runtime's `exec -e` (NOT the pool container's PID 1 env — so it
 		// never appears in /proc/1/environ). See session-secret.ts.
-		if (this.options.env?.BOBBIT_SESSION_SECRET) {
-			execArgs.push("-e", `BOBBIT_SESSION_SECRET=${this.options.env.BOBBIT_SESSION_SECRET}`);
-		}
-		if (this.options.env?.BOBBIT_GOAL_ID) {
-			execArgs.push("-e", `BOBBIT_GOAL_ID=${this.options.env.BOBBIT_GOAL_ID}`);
-		}
-		if (this.options.gatewayToken) {
-			execArgs.push("-e", `BOBBIT_TOKEN=${this.options.gatewayToken}`);
-		}
-		if (this.options.gatewayUrl) {
-			execArgs.push("-e", `BOBBIT_GATEWAY_URL=${this.options.gatewayUrl}`);
-		}
-		execArgs.push("-e", "NODE_TLS_REJECT_UNAUTHORIZED=0");
-		execArgs.push("-e", "NODE_OPTIONS=--no-warnings");
+		if (this.options.env?.BOBBIT_SESSION_SECRET) execEnv.BOBBIT_SESSION_SECRET = this.options.env.BOBBIT_SESSION_SECRET;
+		if (this.options.env?.BOBBIT_GOAL_ID) execEnv.BOBBIT_GOAL_ID = this.options.env.BOBBIT_GOAL_ID;
+		if (this.options.gatewayToken) execEnv.BOBBIT_TOKEN = this.options.gatewayToken;
+		if (this.options.gatewayUrl) execEnv.BOBBIT_GATEWAY_URL = this.options.gatewayUrl;
+		execEnv.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+		execEnv.NODE_OPTIONS = "--no-warnings";
 
-		// Pass sandbox credentials (API keys, etc.) via docker exec env vars
+		// Pass sandbox credentials (API keys, etc.) as container env vars.
 		if (this.options.sandboxCredentials) {
 			for (const [key, value] of Object.entries(this.options.sandboxCredentials)) {
 				if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-				execArgs.push("-e", `${key}=${value}`);
+				execEnv[key] = value;
 			}
 		}
 
-		// Set the container process working directory via docker exec -w.
+		// Set the container process working directory via `<runtime> exec -w`.
 		// The agent CLI (pi) uses process.cwd() — not --cwd — to determine the
 		// working directory for tools and the system prompt's "Current working
-		// directory" line. Without -w, docker exec defaults to the container's
-		// WORKDIR (/workspace), which is wrong for worktree sessions.
+		// directory" line. Without -w, exec defaults to the container's WORKDIR
+		// (/workspace), which is wrong for worktree sessions.
 		const containerCwd = this.options.cwd || "/workspace";
-		execArgs.push("-w", containerCwd);
 
-		execArgs.push(
+		const runtime = this.options.runtime ?? new DockerRuntime();
+		const { file, args, env } = runtime.buildExecCommand(
 			containerId,
-			"node", "--disable-warning=DEP0123", "/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
-			...this.remapArgsForContainer(agentArgs),
+			[
+				"node", "--disable-warning=DEP0123", "/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+				...this.remapArgsForContainer(agentArgs),
+			],
+			{ interactive: true, cwd: containerCwd, env: execEnv },
 		);
 
-		console.log(`[rpc-bridge] Docker exec args: ${redactDockerArgs(execArgs)}`);
+		console.log(`[rpc-bridge] ${file} exec args: ${redactDockerArgs(args)}`);
 
 		// Host-side spawn doesn't need a specific cwd — the container working
-		// directory is set via `docker exec -w` above.
-		return spawn("docker", execArgs, {
+		// directory is set via the runtime's `exec -w` above.
+		return spawn(file, args, {
 			stdio: ["pipe", "pipe", "pipe"],
-			env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" },
+			env,
 		});
 	}
 

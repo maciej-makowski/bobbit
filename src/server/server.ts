@@ -231,6 +231,7 @@ import { ProjectConfigStore, type PackOrderScope } from "./agent/project-config-
 import { ToolGroupPolicyStore } from "./agent/tool-group-policy-store.js";
 import { getAllConfigDirectories, removeBuiltinDirectory, resetConfigDirectories } from "./agent/config-directories.js";
 import { checkDockerAvailability, buildSandboxImage, isBuildingImage, ensureImageAgentVersion } from "./agent/sandbox-status.js";
+import { resolveContainerRuntime, runtimeForContainerId, runtimeForContainerIdOrDocker } from "./agent/container-runtime/index.js";
 import { SandboxManager, type SandboxBootstrap } from "./agent/sandbox-manager.js";
 import { resolveSandboxCloneSource, type SandboxCloneSource } from "./agent/sandbox-clone-source.js";
 import { validateSandboxMounts } from "./agent/sandbox-mounts.js";
@@ -484,10 +485,9 @@ async function getCachedPrStatus(cwd: string, branch?: string, fallbackCwd?: str
 // ── Async git helpers (avoid blocking event loop) ──
 async function execGit(cmd: string, cwd: string, timeout = 5000, containerId?: string): Promise<string> {
 	if (containerId) {
-		// Run inside Docker container
-		const { stdout } = await execFileAsync("docker", [
-			"exec", "-w", cwd, containerId, "/bin/sh", "-c", cmd,
-		], { encoding: "utf-8", timeout, env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" } });
+		// Run inside the container via its resolved runtime (docker/podman).
+		const { stdout } = await runtimeForContainerIdOrDocker(containerId)
+			.exec(containerId, ["/bin/sh", "-c", cmd], { cwd, timeoutMs: timeout });
 		return stdout.trim();
 	}
 	const { stdout } = await execAsync(cmd, { cwd, encoding: "utf-8", timeout });
@@ -499,9 +499,8 @@ async function execGitSafe(cmd: string, cwd: string, fallback = "", containerId?
 
 async function execGitArgs(args: string[], cwd: string, timeout = 5000, containerId?: string): Promise<string> {
 	if (containerId) {
-		const { stdout } = await execFileAsync("docker", [
-			"exec", "-w", cwd, containerId, "git", ...args,
-		], { encoding: "utf-8", timeout, env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" } });
+		const { stdout } = await runtimeForContainerIdOrDocker(containerId)
+			.exec(containerId, ["git", ...args], { cwd, timeoutMs: timeout });
 		return stdout.trim();
 	}
 	const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf-8", timeout });
@@ -684,7 +683,7 @@ async function runBatchGitStatus(
 ): Promise<GitStatusResult | null> {
 	_runBatchGitStatusCount++;
 	if (_gitStatusFake) return _gitStatusFake(cwd, containerId, opts);
-	return runBatchGitStatusNative(cwd, { ...opts, containerId });
+	return runBatchGitStatusNative(cwd, { ...opts, containerId, runtime: runtimeForContainerId(containerId) });
 }
 
 // ── Git diff helper (shared between session and goal endpoints) ──
@@ -1848,22 +1847,23 @@ export function createGateway(config: GatewayConfig) {
 				}
 				const cfg = ctx.projectConfigStore;
 				const sandboxCfg = cfg.get("sandbox") || "none";
-				if (sandboxCfg !== "docker") return null;
+				if (sandboxCfg === "none") return null;
 
 				const projectDir = project.rootPath;
 				const imageName = cfg.get("sandbox_image") || "bobbit-agent";
+				const runtime = resolveContainerRuntime(cfg);
 
 				// Auto-build or rebuild image if missing or stale. Images are
-				// shared across projects (Docker image tags) so the first project
-				// to request a sandbox pays the build cost.
-				const imageStatus = await checkDockerAvailability(imageName);
+				// shared across projects (image tags) so the first project to
+				// request a sandbox pays the build cost.
+				const imageStatus = await checkDockerAvailability(imageName, runtime);
 				if (imageStatus.imageExists === false && imageStatus.dockerfileExists === true) {
-					const buildResult = await buildSandboxImage(imageName, projectDir);
+					const buildResult = await buildSandboxImage(imageName, projectDir, runtime);
 					if (!buildResult.success) {
 						console.error(`[sandbox] Auto-build failed for project ${projectId}; proceeding will likely error`);
 					}
 				} else if (imageStatus.imageExists === true) {
-					await ensureImageAgentVersion(imageName, projectDir);
+					await ensureImageAgentVersion(imageName, projectDir, runtime);
 				}
 
 				const isRepo = await isGitRepo(projectDir);
@@ -1946,6 +1946,7 @@ export function createGateway(config: GatewayConfig) {
 
 				const sandboxTokenEntries = cfg.getSandboxTokens();
 				return {
+					runtime,
 					projectId,
 					projectDir,
 					repoUrl,
@@ -2871,8 +2872,8 @@ async function handleApiRoute(
 	if (url.pathname === "/api/sandbox-status" && req.method === "GET") {
 		const sandboxConfig = projectConfigStore.get("sandbox") || "none";
 		const imageName = projectConfigStore.get("sandbox_image") || "bobbit-agent";
-		const configured = sandboxConfig === "docker";
-		const status = await checkDockerAvailability(configured ? imageName : undefined);
+		const configured = sandboxConfig !== "none";
+		const status = await checkDockerAvailability(configured ? imageName : undefined, resolveContainerRuntime(projectConfigStore));
 		json({ ...status, configured });
 		return;
 	}
@@ -2888,7 +2889,7 @@ async function handleApiRoute(
 			json({ error: "Build already in progress" }, 409);
 			return;
 		}
-		const result = await buildSandboxImage(imageName, config.defaultCwd);
+		const result = await buildSandboxImage(imageName, config.defaultCwd, resolveContainerRuntime(projectConfigStore));
 		if (result.success) {
 			json({ success: true });
 		} else {
@@ -3652,11 +3653,11 @@ async function handleApiRoute(
 						json({ field: "base_ref", error: `base_ref only supports the 'origin' remote today. Got: ${baseRefValue}. If you need a different primary remote, configure it as 'origin' in your local clone.` }, 400);
 						return;
 					}
-					// 4. Sandbox + local — when the project runs in a docker sandbox, only
+					// 4. Sandbox + local — when the project runs in a container sandbox, only
 					//    remote refs work because the container has separate ref visibility
 					//    from the host.
 					const sandboxResolved = ctx.projectConfigStore.getWithDefaults().sandbox || "none";
-					if (sandboxResolved === "docker" && !baseRefValue.startsWith("origin/")) {
+					if (sandboxResolved !== "none" && !baseRefValue.startsWith("origin/")) {
 						json({ field: "base_ref", error: `base_ref must be a remote ref (origin/...) for sandboxed projects. The container has separate ref visibility from the host. Got: ${baseRefValue}` }, 400);
 						return;
 					}
@@ -4345,20 +4346,20 @@ async function handleApiRoute(
 		if (sandboxScope) sandboxed = true;
 		if (sandboxed) {
 			const sandboxConfig = projectConfigStore.get("sandbox") || "none";
-			if (sandboxConfig !== "docker") {
-				json({ error: "Docker sandbox is not configured. Set sandbox: \"docker\" in project settings." }, 400);
+			if (sandboxConfig === "none") {
+				json({ error: "Sandbox is not configured. Set sandbox: \"docker\" or \"podman\" in project settings." }, 400);
 				return;
 			}
-			// Skip Docker check if sandbox manager has ready containers.
-			// Otherwise use a cached result to avoid running `docker info` on every session creation.
+			// Skip the runtime check if sandbox manager has ready containers.
+			// Otherwise use a cached result to avoid running `<runtime> info` on every session creation.
 			const hasReadyContainer = sessionManager.getSandboxManager()?.getStats().containers.some(c => c.status === "ready") ?? false;
 			if (!hasReadyContainer) {
 				if (!_dockerAvailCache || Date.now() - _dockerAvailCache.ts > 60_000) {
-					const dockerStatus = await checkDockerAvailability();
+					const dockerStatus = await checkDockerAvailability(undefined, resolveContainerRuntime(projectConfigStore));
 					_dockerAvailCache = { available: dockerStatus.available, error: dockerStatus.error, ts: Date.now() };
 				}
 				if (!_dockerAvailCache.available) {
-					json({ error: `Docker is not available: ${_dockerAvailCache.error || "Docker not detected"}` }, 503);
+					json({ error: `Container runtime is not available: ${_dockerAvailCache.error || "runtime not detected"}` }, 503);
 					return;
 				}
 			}
@@ -11028,9 +11029,9 @@ async function handleApiRoute(
 			// For sandboxed sessions, write temp file inside container
 			const msgFile = cid ? `/tmp/SQUASH_MSG_${Date.now()}` : path.join(cwd, ".git", "SQUASH_MSG");
 			if (cid) {
-				await execFileAsync("docker", [
-					"exec", "-w", cwd, cid, "/bin/sh", "-c", `cat > ${msgFile} << 'BOBBIT_EOF'\n${fullMessage}\nBOBBIT_EOF`,
-				], { encoding: "utf-8", timeout: 5000, env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" } });
+				await runtimeForContainerIdOrDocker(cid).exec(cid, [
+					"/bin/sh", "-c", `cat > ${msgFile} << 'BOBBIT_EOF'\n${fullMessage}\nBOBBIT_EOF`,
+				], { cwd, timeoutMs: 5000 });
 			} else {
 				fs.writeFileSync(msgFile, fullMessage, "utf-8");
 			}
@@ -11830,6 +11831,9 @@ async function handleApiRoute(
 		const body = await readBody(req);
 		if (!body?.command) { json({ error: "command is required" }, 400); return; }
 		try {
+			// The container runtime (docker/podman) is resolved inside the manager via
+			// the per-container runtime registry (runtimeForContainerIdOrDocker), so no
+			// runtime arg is threaded here.
 			const info = bgProcessManager.create(id, body.command, session.cwd, session.containerId, session.sandboxed, body.name);
 			json(info, 201);
 		} catch (err: any) {
