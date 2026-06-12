@@ -44,7 +44,7 @@ Where things live. Use this to orient, then `rg` for the symbol.
 - Prefer `file://` fixtures for new tests; use E2E only when you need a real server.
 - **Every user-facing feature MUST have a browser E2E** covering navigation, happy path, persistence across reload, cleanup/undo. Pattern: `tests/e2e/ui/settings.spec.ts`.
 - **Run tests before committing.** **No flaky tests** — every failure is a real bug.
-- See [docs/testing-strategy.md](docs/testing-strategy.md), [docs/testing-coverage.md](docs/testing-coverage.md).
+- See [docs/testing-coverage.md](docs/testing-coverage.md).
 
 ## Git conventions
 
