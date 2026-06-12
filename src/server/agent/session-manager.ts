@@ -1661,9 +1661,20 @@ export class SessionManager {
 		return { args, env: activation.env };
 	}
 
-	private resolveSessionRole(roleName?: string, assistantType?: string): import("./role-store.js").Role | undefined {
-		if (!this.roleManager) return undefined;
-		return this.roleManager.getRole(roleName || (assistantType ? "assistant" : "general"));
+	private resolveSessionRole(roleName?: string, assistantType?: string, projectId?: string): import("./role-store.js").Role | undefined {
+		const name = roleName || (assistantType ? "assistant" : "general");
+		// Cascade-first: pack-shipped roles (e.g. `pr-reviewer`) live in the config
+		// cascade, not the in-memory RoleManager. Resolving via roleManager alone
+		// returns `undefined` for a pack role, which on the restore / force-respawn
+		// paths drops its tools (guard falls through to group defaults). Mirror the
+		// cascade-first-then-roleManager pattern used by resolveRolePromptTemplate.
+		if (projectId && this.configCascade) {
+			try {
+				const match = this.configCascade.resolveRoles(projectId).find(r => r.item.name === name);
+				if (match) return match.item;
+			} catch { /* fall through to roleManager */ }
+		}
+		return this.roleManager?.getRole(name);
 	}
 
 	/** Generate tool docs and inject into prompt parts before assembly. */
@@ -3476,7 +3487,9 @@ export class SessionManager {
 		}
 		try {
 			await this.restoreSession(ps);
-			console.log(`[session-manager] Restored: "${ps.title}" (${ps.id})`);
+			// Per-session restore detail is debug-only — the `Restoring N session(s)`
+			// summary above covers the routine boot case; failures still log loudly.
+			if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Restored: "${ps.title}" (${ps.id})`);
 		} catch (err) {
 			const msg = err instanceof Error ? (err.stack || err.message) : String(err);
 			console.error(`[session-manager] Failed to restore "${ps.title}" (${ps.id}), will retry next restart:`, err);
@@ -3619,7 +3632,7 @@ export class SessionManager {
 		// role so Bobbit extension tools and group policies are restored.
 		const overrideAllowedTools: string[] | undefined = (ps as any)._overrideAllowedTools;
 		const persistedAllowedTools = Array.isArray(ps.allowedTools) && ps.allowedTools.length > 0 ? ps.allowedTools : undefined;
-		const restoredRole = this.resolveSessionRole(ps.role, ps.assistantType);
+		const restoredRole = this.resolveSessionRole(ps.role, ps.assistantType, ps.projectId);
 		const effectiveAllowed: EffectiveTool[] = overrideAllowedTools
 			? overrideAllowedTools.map(n => tagAllowedTool(n, this.toolManager))
 			: persistedAllowedTools
@@ -3877,8 +3890,17 @@ export class SessionManager {
 			catch (err) { console.warn(`[session-manager] bg-process restore failed for ${ps.id}:`, err); }
 		}
 
-		// If the agent was mid-turn when the server died, re-prompt it to continue
-		if (ps.wasStreaming) {
+		// If the agent was mid-turn when the server died, re-prompt it to continue.
+		// EXCEPTION: verification reviewer / agent-qa sessions are nonInteractive
+		// and are re-driven EXCLUSIVELY by the verification harness
+		// (`resumeInterruptedVerifications()` -> `_tryResumeFromSession`, which
+		// waits for readiness and sends its own reminder prompt). Firing the boot
+		// nudge here too would race two prompts on the same cold reviewer agent.
+		// We still clear `wasStreaming` so the flag doesn't leak across restarts.
+		if (ps.wasStreaming && ps.nonInteractive) {
+			console.log(`[session-manager] Session "${ps.title}" (${ps.id}) was interrupted mid-turn but is nonInteractive — leaving re-drive to the verification harness`);
+			restoreStore.update(ps.id, { wasStreaming: false });
+		} else if (ps.wasStreaming) {
 			console.log(`[session-manager] Session "${ps.title}" (${ps.id}) was interrupted mid-turn — re-prompting to continue`);
 			restoreStore.update(ps.id, { wasStreaming: false });
 			rpcClient.prompt(
@@ -3902,6 +3924,28 @@ export class SessionManager {
 		// Resolve projectId from opts or from the goal's project
 		const projectId = opts?.projectId ?? (goalId ? this.resolveGoal(goalId)?.projectId : undefined);
 		const ctx = this.buildPipelineContext(projectId);
+
+		// Spawn-path rolePrompt resolution. The orchestration spawn path
+		// (`host.agents.spawn` → OrchestrationCore.spawn → createSession) threads only
+		// `roleName` (no `rolePrompt`), so a pack-shipped role's promptTemplate — e.g.
+		// the pr-reviewer YAML schema — would otherwise NEVER reach the child's system
+		// prompt (assembleSystemPrompt only consumes `parts.rolePrompt`, never a
+		// roleName→template lookup). Resolve it cascade-first here (mirrors the restore
+		// path's buildRestoreRolePrompt) so a project-scoped reviewer child carries its
+		// role prompt. A caller that passes an explicit `rolePrompt` (team/staff) is
+		// untouched.
+		let resolvedRolePrompt = opts?.rolePrompt;
+		if (!resolvedRolePrompt && opts?.roleName) {
+			const template = this.resolveRolePromptTemplate(opts.roleName, projectId);
+			if (template) {
+				resolvedRolePrompt = resolveRolePrompt({ promptTemplate: template }, {
+					branch: goalId ? this.resolveGoal(goalId)?.branch : undefined,
+					agentId: `${opts.roleName}-${(goalId || id).slice(0, 8)}`,
+					roleManager: this.roleManager ?? undefined,
+					subGoalsEnabled: this.isSubgoalsEnabled,
+				});
+			}
+		}
 		const sandboxCwdOffset = opts?.sandboxed
 			? await this.resolveSandboxCwdOffset(cwd, projectId, goalId, opts?.sandboxCwdOffset)
 			: undefined;
@@ -4002,7 +4046,7 @@ export class SessionManager {
 				accessory: opts?.accessory,
 				agentArgs,
 				env: opts?.env,
-				rolePrompt: opts?.rolePrompt,
+				rolePrompt: resolvedRolePrompt,
 				roleName: opts?.roleName,
 				workflowContext: opts?.workflowContext,
 				effectiveAllowedTools: optsAllowedTagged,
@@ -4064,7 +4108,7 @@ export class SessionManager {
 			accessory: opts?.accessory,
 			agentArgs,
 			env: opts?.env,
-			rolePrompt: opts?.rolePrompt,
+			rolePrompt: resolvedRolePrompt,
 			roleName: opts?.roleName,
 			workflowContext: opts?.workflowContext,
 			reattemptGoalId: opts?.reattemptGoalId,
@@ -4469,6 +4513,15 @@ export class SessionManager {
 				if (t) return t;
 			} catch { /* fall through */ }
 		}
+		// The field-level cascade (resolveRolePromptTemplate → resolveRoleField) walks
+		// only project/server/builtin role STORES — it does NOT include pack-shipped
+		// roles (e.g. `pr-reviewer`, which lives in the marketplace pack resolver and
+		// is only surfaced by `resolveRoles`). Fall back to the full cascade-resolved
+		// role so a pack role's promptTemplate (carrying its required YAML schema)
+		// reaches the system prompt on BOTH spawn and restore. Without this a reviewer
+		// child has no schema and "learns it from validation feedback".
+		const packTemplate = this.resolveSessionRole(roleName, undefined, projectId)?.promptTemplate;
+		if (packTemplate) return packTemplate;
 		return this.roleManager?.getRole(roleName)?.promptTemplate;
 	}
 
@@ -4616,7 +4669,7 @@ export class SessionManager {
 					});
 					this._writeModelNameFile(session.id, sessionModelPref);
 					this.resolveStoreForSession(session.id).update(session.id, { modelProvider: provider, modelId });
-					console.log(`[session-manager] Set preferred model "${sessionModelPref}" for session ${session.id}${preSpawnPinned ? " (spawn-pinned)" : ""}`);
+					if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Set preferred model "${sessionModelPref}" for session ${session.id}${preSpawnPinned ? " (spawn-pinned)" : ""}`);
 					broadcast(session.clients, {
 						type: "state",
 						data: { model: { provider, id: modelId, reasoning: inferMeta(modelId).reasoning } },
@@ -4708,7 +4761,7 @@ export class SessionManager {
 		const roleThinking = this.resolveRoleThinkingLevel(session);
 		if (roleThinking) {
 			if (spawnPinnedThinking === roleThinking) {
-				console.log(`[session-manager] Role thinking level "${roleThinking}" already pinned at spawn for ${session.id}`);
+				if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Role thinking level "${roleThinking}" already pinned at spawn for ${session.id}`);
 				return;
 			}
 			try {
@@ -4748,7 +4801,7 @@ export class SessionManager {
 			}
 		} catch { /* best-effort */ }
 		if (spawnPinnedThinking === level) {
-			console.log(`[session-manager] Default thinking level "${level}" already pinned at spawn for ${session.id}`);
+			if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Default thinking level "${level}" already pinned at spawn for ${session.id}`);
 			return;
 		}
 		try {
@@ -6523,7 +6576,7 @@ export class SessionManager {
 			}
 
 			// Restore tool activation, including Bobbit extension tools and MCP policy filtering.
-			const role = this.resolveSessionRole(session.role, session.assistantType);
+			const role = this.resolveSessionRole(session.role, session.assistantType, session.projectId);
 			const effective = this.resolveEffectiveAllowedTools(role);
 			const forceActivation = this.buildToolActivationArgs(id, effective.length > 0 ? effective : undefined, role, session.cwd);
 			bridgeOptions.args = [...forceActivation.args, ...(bridgeOptions.args || [])];

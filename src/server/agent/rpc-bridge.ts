@@ -109,7 +109,7 @@ export type RpcEventListener = (event: any) => void;
 export interface IRpcBridge {
 	start(): Promise<void>;
 	stop(): Promise<void>;
-	prompt(text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>): Promise<any>;
+	prompt(text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>, timeoutMs?: number): Promise<any>;
 	steer(text: string): Promise<any>;
 	abort(): Promise<any>;
 	getState(): Promise<any>;
@@ -492,7 +492,7 @@ export class RpcBridge {
 
 	// --- Convenience methods matching the RPC protocol ---
 
-	prompt(text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>) {
+	prompt(text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>, timeoutMs?: number) {
 		// Defensive backstop: if a prompt carries image(s) but blank text, the
 		// model API rejects the blank ContentBlock. The primary fix synthesizes
 		// text upstream in session-manager.enqueuePrompt (where non-image
@@ -502,7 +502,7 @@ export class RpcBridge {
 		if (images?.length) {
 			console.log(`[rpc-bridge] Sending prompt with ${images.length} image(s), first image: type=${images[0].type}, mimeType=${images[0].mimeType}, data length=${images[0].data?.length}`);
 		}
-		return this.sendCommand({ type: "prompt", message: effectiveText, ...(images?.length ? { images } : {}) });
+		return this.sendCommand({ type: "prompt", message: effectiveText, ...(images?.length ? { images } : {}) }, timeoutMs);
 	}
 
 	steer(text: string) {
