@@ -181,7 +181,7 @@ export function buildContainerRunSpec(config: DockerRunConfig): ContainerRunSpec
 	// (and any shared pack modules they import) resolve inside Docker sandboxes.
 	try {
 		if (fs.statSync(builtinPacksDir).isDirectory()) {
-			args.push("-v", `${toDockerPath(builtinPacksDir)}:${BUILTIN_PACKS_CONTAINER_DIR}:ro`);
+			bind(toDockerPath(builtinPacksDir), BUILTIN_PACKS_CONTAINER_DIR, true);
 		}
 	} catch {
 		// Built-in pack dir is absent in source-only/dev test layouts before build:packs.
