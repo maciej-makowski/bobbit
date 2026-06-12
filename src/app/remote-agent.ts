@@ -524,7 +524,7 @@ export class RemoteAgent {
 	onGoalSetupEvent?: () => void;
 	/** Callback fired when compaction state changes (start/end). */
 	onCompactionChange?: (isCompacting: boolean) => void;
-	onBgProcessEvent?: (msg: { type: string; processId?: string; stream?: string; text?: string; ts?: number; exitCode?: number | null; endTime?: number | null; process?: any }) => void;
+	onBgProcessEvent?: (msg: { type: string; processId?: string; stream?: string; text?: string; ts?: number; exitCode?: number | null; terminalReason?: "normal" | "killed" | "unrecoverable" | null; endTime?: number | null; process?: any }) => void;
 	/** Callback fired when preview panel flag changes for a session. */
 	onPreviewChanged?: (sessionId: string, preview: boolean) => void;
 	/** Callback fired when server detects PR creation and busts the cache. */
@@ -1936,6 +1936,7 @@ export class RemoteAgent {
 			case "bg_process_created":
 			case "bg_process_output":
 			case "bg_process_exited":
+			case "bg_process_dismissed":
 				this.onBgProcessEvent?.(msg as any);
 				break;
 
@@ -2298,15 +2299,28 @@ export class RemoteAgent {
 			}
 		}
 
-		// Apply showTimestamps
+		// Apply showTimestamps — default ON when unset; only an explicit `false` opts out.
 		if ("showTimestamps" in prefs) {
-			document.documentElement.dataset.showTimestamps = prefs.showTimestamps ? "true" : "";
+			document.documentElement.dataset.showTimestamps = prefs.showTimestamps === false ? "" : "true";
 		}
 
 		// Apply playAgentFinishSound — default ON when unset.
 		if ("playAgentFinishSound" in prefs) {
 			document.documentElement.dataset.playAgentFinishSound =
 				prefs.playAgentFinishSound === false ? "false" : "true";
+			// Notify the header <bell-toggle> (and Settings checkbox) so they reflect
+			// a change pushed from another tab/client.
+			if (typeof window !== "undefined") {
+				window.dispatchEvent(new CustomEvent("bobbit-play-finish-sound-changed", {
+					detail: { enabled: prefs.playAgentFinishSound !== false },
+				}));
+			}
+		}
+
+		// Apply replaceBobbitWithText — default OFF (only explicit true opts in).
+		if ("replaceBobbitWithText" in prefs) {
+			document.documentElement.dataset.replaceBobbitWithText =
+				prefs.replaceBobbitWithText === true ? "true" : "false";
 		}
 
 		// Apply subgoalsEnabled — default OFF. See subgoals-flag.ts. Mirror

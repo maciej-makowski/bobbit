@@ -152,9 +152,6 @@ export interface SessionSetupPlan {
 	parentSessionId?: string;
 	childKind?: string;
 	readOnly?: boolean;
-	walkthroughJobId?: string;
-	walkthroughChangesetId?: string;
-	walkthroughTargetKey?: string;
 	/** Explicit session-scoped tool allowlist that must survive process restarts. */
 	sessionScopedAllowedTools?: string[];
 	taskId?: string;
@@ -338,23 +335,29 @@ function _resolveBridgeOptions(plan: SessionSetupPlan, ctx: PipelineContext): vo
 		// S1: inject the per-session capability secret alongside the session id.
 		// Only this session's process receives its own secret — see
 		// `src/server/auth/session-secret.ts`.
+		//
+		// Gateway-owned identity keys (BOBBIT_SESSION_ID / BOBBIT_SESSION_SECRET)
+		// are spread AFTER caller `plan.env` (toolEnv) so the gateway-issued values
+		// always WIN: a caller-supplied toolEnv key can never clobber the session
+		// identity or capability secret (which would let a child impersonate another
+		// session for the binding-routed PR-walkthrough tool routes). Pinned by a
+		// unit test in tests/session-setup-env.test.ts.
 		env: {
+			...plan.env,
 			BOBBIT_SESSION_ID: plan.id,
 			BOBBIT_SESSION_SECRET: ctx.sessionSecretStore.getOrCreateSecret(plan.id),
-			...plan.env,
 		},
 	};
 	if (ctx.agentCliPath) {
 		plan.bridgeOptions.cliPath = ctx.agentCliPath;
 	}
 
-	// Delegate-specific env
-	if (plan.delegateOf) {
-		plan.bridgeOptions.env = {
-			...plan.bridgeOptions.env,
-			BOBBIT_DELEGATE_OF: plan.delegateOf,
-		};
-	}
+	// NOTE: the legacy `BOBBIT_DELEGATE_OF` env var (the old delegate-recursion
+	// early-return guard in the agent extension) is intentionally NOT set here
+	// anymore. Recursion is now blocked by OrchestrationCore.assertCanSpawn +
+	// allowedTools subtraction (every spawn verb stripped from the child) — see
+	// docs/design/orchestration-core.md §7. The persisted `delegateOf` link
+	// (plan.delegateOf) is unchanged; only the env-var guard is removed.
 
 	// Wire tool manager for extension path resolution in RpcBridge
 	if (ctx.toolManager) {
@@ -435,6 +438,23 @@ function _resolveTools(plan: SessionSetupPlan, ctx: PipelineContext): void {
 	}
 
 	plan.effectiveAllowedTools = effectiveAllowedTools;
+
+	// Generic role-accessory application. When a session is created with a
+	// role (roleName/role) that resolves to a Role carrying an `accessory`, and
+	// the caller did NOT explicitly pass one, surface the role's accessory so it
+	// renders in the sidebar. This is how a role-carrying spawn that only threads
+	// `roleName` (e.g. the host.agents `pr-reviewer` reviewer child) gets its
+	// `review` accessory without the spawn caller plumbing it. Generic — not
+	// pr-walkthrough-specific; "none" is treated as "no accessory".
+	if (!plan.accessory || plan.accessory === "none") {
+		const roleName = plan.roleName ?? plan.role;
+		if (roleName) {
+			const resolvedRole = lookupRole(roleName, plan, ctx);
+			if (resolvedRole?.accessory && resolvedRole.accessory !== "none") {
+				plan.accessory = resolvedRole.accessory;
+			}
+		}
+	}
 }
 
 /** Look up a role by name, preferring the cascade-resolved version when available. */
@@ -607,7 +627,12 @@ export function resolveToolActivation(plan: SessionSetupPlan, ctx: PipelineConte
 	return profile("resolveToolActivation", () => _resolveToolActivation(plan, ctx));
 }
 function _resolveToolActivation(plan: SessionSetupPlan, ctx: PipelineContext): void {
-	const effectiveRole = (plan.roleName && ctx.roleManager) ? ctx.roleManager.getRole(plan.roleName) : undefined;
+	// Resolve the role cascade-first (pack-shipped roles like `pr-reviewer` live in
+	// the config cascade, NOT the in-memory RoleManager). Resolving via roleManager
+	// alone returns `undefined` for a pack role, which makes the guard fall through
+	// to group defaults (e.g. `PR Walkthrough: never`) and reject every reviewer
+	// tool call. `lookupRole` mirrors the cascade-first pattern used elsewhere.
+	const effectiveRole = plan.roleName ? lookupRole(plan.roleName, plan, ctx) : undefined;
 	const flatNames = plan.effectiveAllowedTools?.map(e => e.name);
 	const mcpExtPaths = ctx.mcpManager
 		? writeMcpProxyExtensions(ctx.mcpManager, flatNames, effectiveRole ?? undefined, ctx.toolManager ?? undefined, ctx.groupPolicyStore ?? undefined)
@@ -672,12 +697,13 @@ export function persistOnce(session: SessionInfo, plan: SessionSetupPlan, store:
 		nonInteractive: plan.nonInteractive,
 		sandboxed: plan.sandboxed,
 		delegateOf: plan.delegateOf,
+		// Durable delegate task — restored into the system prompt on reboot so the
+		// delegate comes back live with its task intact (mirrors a worker's goal spec).
+		instructions: plan.instructions,
+		context: plan.context,
 		parentSessionId: plan.parentSessionId,
 		childKind: plan.childKind,
 		readOnly: plan.readOnly,
-		walkthroughJobId: plan.walkthroughJobId,
-		walkthroughChangesetId: plan.walkthroughChangesetId,
-		walkthroughTargetKey: plan.walkthroughTargetKey,
 		allowedTools: plan.sessionScopedAllowedTools,
 		reattemptGoalId: plan.reattemptGoalId,
 		projectId: plan.projectId,
@@ -935,6 +961,13 @@ export async function executeWorktreeAsync(
 	const rpcClient = new RpcBridge(plan.bridgeOptions);
 	session.rpcClient = rpcClient;
 	session.allowedTools = plan.effectiveAllowedTools?.map(e => e.name);
+	// resolveTools may have applied the role's accessory (generic role-accessory
+	// application); mirror it onto the live worktree session so the sidebar
+	// renders it (the early placeholder persist predates accessory resolution).
+	if (plan.accessory && session.accessory !== plan.accessory) {
+		session.accessory = plan.accessory;
+		ctx.store.update(session.id, { accessory: plan.accessory });
+	}
 	if (plan.bridgeOptions.initialModel) session.spawnPinnedModel = plan.bridgeOptions.initialModel;
 	if (plan.bridgeOptions.initialThinkingLevel) session.spawnPinnedThinkingLevel = plan.bridgeOptions.initialThinkingLevel;
 
@@ -1080,9 +1113,6 @@ async function spawnAgent(plan: SessionSetupPlan, ctx: PipelineContext): Promise
 		parentSessionId: plan.parentSessionId,
 		childKind: plan.childKind,
 		readOnly: plan.readOnly,
-		walkthroughJobId: plan.walkthroughJobId,
-		walkthroughChangesetId: plan.walkthroughChangesetId,
-		walkthroughTargetKey: plan.walkthroughTargetKey,
 		allowedTools: plan.effectiveAllowedTools?.map(e => e.name),
 		// Mirror the spawn-time resolver fallback: when callers pass only
 		// `roleName`, surface it as `session.role` so the post-spawn

@@ -31,6 +31,7 @@ import {
 	mergeCompactionSidecarIntoMessages,
 } from "./compaction-sidecar.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
+import { BgProcessStore } from "./bg-process-store.js";
 import { SessionSecretStore } from "../auth/session-secret.js";
 import { shouldKeepDespiteOrphan, scanOrphanedTranscripts } from "./orphan-cleanup.js";
 import { getAssistantDef } from "./assistant-registry.js";
@@ -82,8 +83,7 @@ import { PrStatusStore } from "./pr-status-store.js";
 import { TaskStore } from "./task-store.js";
 import type { GateStore } from "./gate-store.js";
 import { bobbitStateDir, bobbitConfigDir, globalAgentDir, globalAuthPath } from "../bobbit-dir.js";
-import { rotateSubmissionProofForRestoredJob, WalkthroughAgentStore } from "../pr-walkthrough/walkthrough-agent-store.js";
-import { shouldReapWalkthroughChildOnBoot } from "../pr-walkthrough/walkthrough-reap.js";
+import { shouldReapChildOnBoot, type OrchestrationCore } from "./orchestration-core.js";
 
 import type { SandboxManager } from "./sandbox-manager.js";
 import { WorktreePool } from "./worktree-pool.js";
@@ -227,10 +227,11 @@ export interface SessionInfo {
 	childKind?: string;
 	/** Whether the session should be treated as read-only by clients/tools. */
 	readOnly?: boolean;
-	/** PR walkthrough job metadata for session-hosted walkthrough children. */
-	walkthroughJobId?: string;
-	walkthroughChangesetId?: string;
-	walkthroughTargetKey?: string;
+	/** Generic persisted terminal marker for a child session (orchestration-core
+	 *  Decision E). Stamped by `markChildTerminal`; drives the generic boot-reap. */
+	childTerminal?: boolean;
+	/** Epoch ms when `childTerminal` was stamped. */
+	terminalAt?: number;
 	/** Role in a team goal (e.g., 'coder', 'reviewer', 'tester', 'team-lead') */
 	role?: string;
 	/** The team goal ID this agent belongs to */
@@ -259,6 +260,14 @@ export interface SessionInfo {
 	promptQueue: PromptQueue;
 	/** Error message captured when restoreSession() failed; cleared on successful revive. */
 	restoreError?: string;
+	/**
+	 * True for a DORMANT entry (restored delegate/kinded child whose agent process
+	 * is NOT running — placeholder RpcBridge). Used by `isSessionLive` so the
+	 * OrchestrationCore wait path resolves such a child from persisted output
+	 * instead of blocking on a dead client (H1). Cleared once `restoreSession`
+	 * replaces the entry with a live one.
+	 */
+	dormant?: boolean;
 	/** In-flight persistSessionMetadata promise (awaited before terminate) */
 	pendingMetadataPersist?: Promise<void>;
 	/**
@@ -643,6 +652,7 @@ export class SessionManager {
 	private systemPromptPath?: string;
 	/** @internal Test-only session store (used when no PCM is available). */
 	private _testStore: SessionStore | null = null;
+	private _testBgProcessStore: BgProcessStore | null = null;
 	/** @internal Test-only cost tracker (used when no PCM is available). */
 	private _testCostTracker: CostTracker | null = null;
 	/** @internal Test-only search index (used when no PCM is available). */
@@ -726,6 +736,17 @@ export class SessionManager {
 
 	setSandboxManager(manager: SandboxManager | null): void {
 		this.sandboxManager = manager;
+	}
+
+	/**
+	 * OrchestrationCore wiring (docs/design/orchestration-core.md). Injected by
+	 * server.ts after construction (the core is built near teamManager and needs
+	 * a ref back to this manager's narrow view). Used by `restoreSessions` to
+	 * rebuild the in-memory child index + remind owners of live children on boot.
+	 */
+	private orchestrationCore: OrchestrationCore | null = null;
+	setOrchestrationCore(core: OrchestrationCore | null): void {
+		this.orchestrationCore = core;
 	}
 
 	setInboxNudger(nudger: import("./inbox-nudger.js").InboxNudger | null): void {
@@ -815,7 +836,7 @@ export class SessionManager {
 							console.warn(`[orphan-cleanup] WARN: would-archive ${session.id} but worktree+recent-transcript present — leaving live`);
 						} else {
 							console.warn(`[session-manager] Archiving session ${session.id} — worktree unrecoverable after container recreation`);
-							try { this.getSessionStore(session.projectId).archive(session.id); } catch { /* best-effort */ }
+							try { await this.archiveWithCascade(session.id, this.getSessionStore(session.projectId)); } catch { /* best-effort */ }
 							broadcastStatus(session, "terminated");
 						}
 						continue;
@@ -926,6 +947,7 @@ export class SessionManager {
 			// ProjectContextManager. Stores are created from the explicit stateDir.
 			const stateDir = bobbitStateDir();
 			this._testStore = new SessionStore(stateDir);
+			this._testBgProcessStore = new BgProcessStore(stateDir);
 			this._testCostTracker = new CostTracker(stateDir);
 			this._testSearchIndex = new SearchService({ stateDir, projectId: "__test__" });
 			this._testGoalManager = new GoalManager(new GoalStore(stateDir));
@@ -977,6 +999,18 @@ export class SessionManager {
 		}
 		if (this._testStore) return this._testStore;
 		throw new Error("No project context manager or test store available");
+	}
+
+	/** Resolve the BgProcessStore for a given project. Requires projectId when PCM is active. */
+	getBgProcessStore(projectId?: string): BgProcessStore {
+		if (this.projectContextManager) {
+			if (!projectId) throw new Error("Cannot resolve bg-process store: projectId is required");
+			const ctx = this.projectContextManager.getOrCreate(projectId);
+			if (!ctx) throw new Error(`Cannot resolve bg-process store: project "${projectId}" not found`);
+			return ctx.bgProcessStore;
+		}
+		if (this._testBgProcessStore) return this._testBgProcessStore;
+		throw new Error("No project context manager or test bg-process store available");
 	}
 
 	/** Resolve the GoalStore for a given project. Requires projectId when PCM is active. */
@@ -1627,9 +1661,20 @@ export class SessionManager {
 		return { args, env: activation.env };
 	}
 
-	private resolveSessionRole(roleName?: string, assistantType?: string): import("./role-store.js").Role | undefined {
-		if (!this.roleManager) return undefined;
-		return this.roleManager.getRole(roleName || (assistantType ? "assistant" : "general"));
+	private resolveSessionRole(roleName?: string, assistantType?: string, projectId?: string): import("./role-store.js").Role | undefined {
+		const name = roleName || (assistantType ? "assistant" : "general");
+		// Cascade-first: pack-shipped roles (e.g. `pr-reviewer`) live in the config
+		// cascade, not the in-memory RoleManager. Resolving via roleManager alone
+		// returns `undefined` for a pack role, which on the restore / force-respawn
+		// paths drops its tools (guard falls through to group defaults). Mirror the
+		// cascade-first-then-roleManager pattern used by resolveRolePromptTemplate.
+		if (projectId && this.configCascade) {
+			try {
+				const match = this.configCascade.resolveRoles(projectId).find(r => r.item.name === name);
+				if (match) return match.item;
+			} catch { /* fall through to roleManager */ }
+		}
+		return this.roleManager?.getRole(name);
 	}
 
 	/** Generate tool docs and inject into prompt parts before assembly. */
@@ -3197,26 +3242,64 @@ export class SessionManager {
 		const regular = persisted.filter(ps => !ps.delegateOf);
 		const delegates = persisted.filter(ps => !!ps.delegateOf);
 
-		console.log(`[session-manager] Restoring ${regular.length} session(s), deferring ${delegates.length} delegate(s)...`);
-
-		// Restore regular sessions in parallel (batched concurrency)
-		const CONCURRENCY = 5;
-		for (let i = 0; i < regular.length; i += CONCURRENCY) {
-			const batch = regular.slice(i, i + CONCURRENCY);
-			await Promise.all(batch.map(ps => this.restoreOneSession(ps)));
-		}
-
-		// Delegate sessions: dormant entries only — restored on-demand via addClient()
+		// Delegate boot-reap (orchestration-core §5): archive an orphaned delegate
+		// child (owner gone/archived) BEFORE dispatch. This reap MUST stay in
+		// restoreSessions() — the orphan-reap wiring test stubs restoreOneSession to
+		// a no-op and still expects the orphan archived, so it cannot move into the
+		// per-session path. Survivors are NOT deferred as dormant husks anymore:
+		// they ride the SAME live-restore path workers use (restoreOneSession →
+		// restoreSession), so a delegate comes back as a live process with its task
+		// rebuilt from the durable instructions/context fields, and the parent's
+		// team_wait re-attaches to a live child and collects a real result. A delegate
+		// that was mid-turn is re-driven by the shared wasStreaming boot-resume nudge
+		// in restoreSession() — no delegate-specific registry.
+		const delegateSurvivors: PersistedSession[] = [];
 		for (const ps of delegates) {
 			if (!ps.agentSessionFile) {
 				try { this.getSessionStore(ps.projectId).archive(ps.id); } catch { /* project gone */ }
 				continue;
 			}
-			// Existence check deferred to addClient() revive — add as dormant unconditionally
-			// (the file is in the agent's coordinate system; checking it here would require
-			// async docker exec for sandbox sessions, and the file may not be needed until
-			// the user opens the session)
-			this.addDormantSession(ps);
+			// Reap an orphaned delegate child whose owner session is gone or archived.
+			// A child whose owner is restoring (exists, not archived) survives and is
+			// restored live below.
+			const owner = ps.delegateOf ? this.getPersistedSession(ps.delegateOf) : undefined;
+			const reap = shouldReapChildOnBoot({
+				childKind: ps.childKind ?? "delegate",
+				ownerSessionId: ps.delegateOf,
+				ownerExists: !!owner,
+				ownerArchived: owner?.archived === true,
+			});
+			if (reap.reap) {
+				console.log(`[session-manager] Reaping orphaned delegate child ${ps.id} on boot — ${reap.reason}`);
+				try { this.getSessionStore(ps.projectId).archive(ps.id); } catch { /* project gone */ }
+				continue;
+			}
+			delegateSurvivors.push(ps);
+		}
+
+		const liveRestore = [...regular, ...delegateSurvivors];
+		console.log(`[session-manager] Restoring ${regular.length} session(s) + ${delegateSurvivors.length} delegate(s) live...`);
+
+		// Restore regular + surviving delegate sessions in parallel (batched concurrency)
+		const CONCURRENCY = 5;
+		for (let i = 0; i < liveRestore.length; i += CONCURRENCY) {
+			const batch = liveRestore.slice(i, i + CONCURRENCY);
+			await Promise.all(batch.map(ps => this.restoreOneSession(ps)));
+		}
+
+		// OrchestrationCore (§3/§4): rebuild the in-memory child index from the
+		// already-persisted link fields (delegateOf / parentSessionId+childKind)
+		// — no new persisted registry — then remind any owner with live restored
+		// children to re-collect them via team_wait (restart survival, no
+		// transparent tool-call resumption). Team-managed children (childKind
+		// "team") are skipped here; team-manager nudges those in resubscribeTeamEvents.
+		if (this.orchestrationCore) {
+			try {
+				this.orchestrationCore.rebuildIndexFromPersisted(persisted);
+				await this.orchestrationCore.remindOwnersWithLiveChildren(h => h.childKind !== "team");
+			} catch (err) {
+				console.warn("[session-manager] OrchestrationCore boot index/reminder failed:", err);
+			}
 		}
 
 		// Recover worktrees whose directories are missing OR whose .git metadata is broken.
@@ -3307,26 +3390,38 @@ export class SessionManager {
 			console.warn(`[session-manager] Skipping session ${ps.id} — project "${ps.projectId}" no longer registered`);
 			return;
 		}
-		// Reap finished/orphaned PR-walkthrough children instead of respawning them.
-		// They are persisted sessions linked by parentSessionId/childKind (not
-		// delegateOf), so without this they would be resurrected as live node
-		// processes on every restart (the session-leak bug).
-		if (ps.childKind === "pr-walkthrough") {
-			let jobStatus: string | undefined;
-			if (ps.walkthroughJobId) {
-				try { jobStatus = new WalkthroughAgentStore(bobbitStateDir()).get(ps.walkthroughJobId)?.status; }
-				catch (err) { console.warn(`[session-manager] Failed to read walkthrough job for ${ps.id}:`, err); }
+		// Generalized boot-reap for ANY child linked by parentSessionId+childKind
+		// (orchestration-core §5). Such children (pr-walkthrough, host-agents with
+		// lifecycle:"full", and future kinds) are persisted sessions NOT linked by
+		// `delegateOf` — so without this they would be resurrected as live node
+		// processes on every restart (the session-leak bug), and a child whose
+		// parent was archived while the server was down would come back as a LIVE
+		// ORPHAN. (delegateOf-linked children are reaped in restoreSessions()'s
+		// dormant-defer loop using the same helper.) pr-walkthrough additionally
+		// supplies the generic `childTerminal` terminal signal (set server-side by
+		// completing code) so a terminal reviewer is reaped with ZERO pack knowledge here.
+		if (ps.childKind && ps.parentSessionId && !ps.delegateOf) {
+			let kindTerminal = false;
+			let kindTerminalReason: string | undefined;
+			// GENERIC persisted terminal marker (orchestration-core Decision E /
+			// Findings 3–4): any child stamped `childTerminal:true` by completing
+			// server-side code is reapable on boot, with ZERO pack/kind knowledge here.
+			// host-agents reviewers (e.g. pr-walkthrough's host.agents reviewer) rely on this.
+			if (ps.childTerminal === true) {
+				kindTerminal = true;
+				kindTerminalReason = "child session marked terminal";
 			}
-			const parent = ps.parentSessionId ? this.getPersistedSession(ps.parentSessionId) : undefined;
-			const decision = shouldReapWalkthroughChildOnBoot({
-				walkthroughJobId: ps.walkthroughJobId,
-				parentSessionId: ps.parentSessionId,
-				jobStatus,
-				parentExists: !!parent,
-				parentArchived: parent?.archived === true,
+			const parent = this.getPersistedSession(ps.parentSessionId);
+			const decision = shouldReapChildOnBoot({
+				childKind: ps.childKind,
+				ownerSessionId: ps.parentSessionId,
+				ownerExists: !!parent,
+				ownerArchived: parent?.archived === true,
+				kindTerminal,
+				kindTerminalReason,
 			});
 			if (decision.reap) {
-				console.log(`[session-manager] Reaping PR-walkthrough child ${ps.id} on boot — ${decision.reason}`);
+				console.log(`[session-manager] Reaping ${ps.childKind} child ${ps.id} on boot — ${decision.reason}`);
 				sessionStore.archive(ps.id);
 				return;
 			}
@@ -3392,7 +3487,9 @@ export class SessionManager {
 		}
 		try {
 			await this.restoreSession(ps);
-			console.log(`[session-manager] Restored: "${ps.title}" (${ps.id})`);
+			// Per-session restore detail is debug-only — the `Restoring N session(s)`
+			// summary above covers the routine boot case; failures still log loudly.
+			if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Restored: "${ps.title}" (${ps.id})`);
 		} catch (err) {
 			const msg = err instanceof Error ? (err.stack || err.message) : String(err);
 			console.error(`[session-manager] Failed to restore "${ps.title}" (${ps.id}), will retry next restart:`, err);
@@ -3408,6 +3505,7 @@ export class SessionManager {
 			status: "terminated",
 			statusVersion: 0,
 			restoreError,
+			dormant: true,
 			createdAt: ps.createdAt,
 			lastActivity: ps.lastActivity,
 			clients: new Set(),
@@ -3421,23 +3519,10 @@ export class SessionManager {
 			parentSessionId: ps.parentSessionId,
 			childKind: ps.childKind,
 			readOnly: ps.readOnly,
-			walkthroughJobId: ps.walkthroughJobId,
-			walkthroughChangesetId: ps.walkthroughChangesetId,
-			walkthroughTargetKey: ps.walkthroughTargetKey,
 			allowedTools: ps.allowedTools,
 			projectId: ps.projectId,
 			promptQueue: new PromptQueue(ps.messageQueue),
 		});
-	}
-
-	private restoreWalkthroughSubmitEnv(ps: PersistedSession, env: Record<string, string>): void {
-		if (ps.childKind !== "pr-walkthrough" || !ps.walkthroughJobId) return;
-		try {
-			const scopedEnv = rotateSubmissionProofForRestoredJob(bobbitStateDir(), ps.id, ps.walkthroughJobId);
-			if (scopedEnv) Object.assign(env, scopedEnv);
-		} catch (err) {
-			console.warn(`[session-manager] Failed to rotate PR walkthrough submit proof for ${ps.id}:`, err);
-		}
 	}
 
 	private async restoreSession(ps: PersistedSession): Promise<void> {
@@ -3452,7 +3537,6 @@ export class SessionManager {
 			BOBBIT_SESSION_ID: ps.id,
 			BOBBIT_SESSION_SECRET: this.sessionSecretStore.getOrCreateSecret(ps.id),
 		};
-		this.restoreWalkthroughSubmitEnv(ps, bridgeOptions.env);
 		if (ps.goalId) {
 			bridgeOptions.env.BOBBIT_GOAL_ID = ps.goalId;
 		}
@@ -3548,7 +3632,7 @@ export class SessionManager {
 		// role so Bobbit extension tools and group policies are restored.
 		const overrideAllowedTools: string[] | undefined = (ps as any)._overrideAllowedTools;
 		const persistedAllowedTools = Array.isArray(ps.allowedTools) && ps.allowedTools.length > 0 ? ps.allowedTools : undefined;
-		const restoredRole = this.resolveSessionRole(ps.role, ps.assistantType);
+		const restoredRole = this.resolveSessionRole(ps.role, ps.assistantType, ps.projectId);
 		const effectiveAllowed: EffectiveTool[] = overrideAllowedTools
 			? overrideAllowedTools.map(n => tagAllowedTool(n, this.toolManager))
 			: persistedAllowedTools
@@ -3590,6 +3674,32 @@ export class SessionManager {
 				cwd: ps.cwd,
 				goalSpec: assistantGoalSpec,
 				goalTitle: assistantDef.promptTitle,
+				goalState: "active",
+				allowedTools: restoredAllowedNames,
+				projectConfigStore: this.projectConfigStore,
+			});
+			if (promptPath) bridgeOptions.systemPromptPath = promptPath;
+		} else if (ps.delegateOf && !ps.goalId) {
+			// Delegate restore: rebuild the system prompt from the durable task fields
+			// (instructions + context) — the delegate's equivalent of a worker's goal
+			// spec. Mirrors session-setup.ts::_resolvePrompt mode === "delegate" so a
+			// revived delegate carries its original task, not an empty goal/role prompt.
+			let taskSpec = ps.instructions || "";
+			if (ps.context && Object.keys(ps.context).length > 0) {
+				taskSpec += "\n\n## Context";
+				for (const [key, value] of Object.entries(ps.context)) {
+					taskSpec += `\n- **${key}**: ${value}`;
+				}
+			}
+			const promptPath = this.assemblePrompt(ps.id, {
+				baseSystemPromptPath: this.systemPromptPath,
+				cwd: ps.cwd,
+				// Mirror the spawn path (session-setup.ts::_resolvePrompt mode ===
+				// "delegate") so AGENTS.md / project config dirs are readable for
+				// sandbox or multi-repo delegates whose cwd is container-internal.
+				projectRoot: ps.repoPath,
+				goalSpec: taskSpec,
+				goalTitle: "Delegate Task",
 				goalState: "active",
 				allowedTools: restoredAllowedNames,
 				projectConfigStore: this.projectConfigStore,
@@ -3676,9 +3786,6 @@ export class SessionManager {
 			parentSessionId: ps.parentSessionId,
 			childKind: ps.childKind,
 			readOnly: ps.readOnly,
-			walkthroughJobId: ps.walkthroughJobId,
-			walkthroughChangesetId: ps.walkthroughChangesetId,
-			walkthroughTargetKey: ps.walkthroughTargetKey,
 			role: ps.role,
 			teamGoalId: ps.teamGoalId,
 			teamLeadSessionId: ps.teamLeadSessionId,
@@ -3774,8 +3881,26 @@ export class SessionManager {
 
 		this.sessions.set(ps.id, session);
 
-		// If the agent was mid-turn when the server died, re-prompt it to continue
-		if (ps.wasStreaming) {
+		// Restore + re-attach this session's persisted background processes. The
+		// session now exists and (for sandboxed sessions) containerId has been
+		// re-resolved, so liveness/re-attach can target the live process.
+		const bgMgr = (this as any).bgProcessManager;
+		if (bgMgr?.restoreSession) {
+			try { await bgMgr.restoreSession(ps.id); }
+			catch (err) { console.warn(`[session-manager] bg-process restore failed for ${ps.id}:`, err); }
+		}
+
+		// If the agent was mid-turn when the server died, re-prompt it to continue.
+		// EXCEPTION: verification reviewer / agent-qa sessions are nonInteractive
+		// and are re-driven EXCLUSIVELY by the verification harness
+		// (`resumeInterruptedVerifications()` -> `_tryResumeFromSession`, which
+		// waits for readiness and sends its own reminder prompt). Firing the boot
+		// nudge here too would race two prompts on the same cold reviewer agent.
+		// We still clear `wasStreaming` so the flag doesn't leak across restarts.
+		if (ps.wasStreaming && ps.nonInteractive) {
+			console.log(`[session-manager] Session "${ps.title}" (${ps.id}) was interrupted mid-turn but is nonInteractive — leaving re-drive to the verification harness`);
+			restoreStore.update(ps.id, { wasStreaming: false });
+		} else if (ps.wasStreaming) {
 			console.log(`[session-manager] Session "${ps.title}" (${ps.id}) was interrupted mid-turn — re-prompting to continue`);
 			restoreStore.update(ps.id, { wasStreaming: false });
 			rpcClient.prompt(
@@ -3788,7 +3913,7 @@ export class SessionManager {
 		}
 	}
 
-	async createSession(cwd: string, agentArgs?: string[], goalId?: string, assistantType?: string, opts?: { rolePrompt?: string; roleName?: string; role?: string; accessory?: string; env?: Record<string, string>; taskId?: string; staffId?: string; allowedTools?: string[]; workflowContext?: string; worktreeOpts?: { repoPath: string }; reattemptGoalId?: string; sandboxed?: boolean; projectId?: string; sessionId?: string; sandboxBranch?: string; sandboxBaseBranch?: string; sandboxCwdOffset?: string; skipAutoModel?: boolean; skipAutoThinking?: boolean; initialModel?: string; initialThinkingLevel?: string; preExistingAgentSessionFile?: string; parentSessionId?: string; childKind?: string; readOnly?: boolean; walkthroughJobId?: string; walkthroughChangesetId?: string; walkthroughTargetKey?: string }): Promise<SessionInfo> {
+	async createSession(cwd: string, agentArgs?: string[], goalId?: string, assistantType?: string, opts?: { rolePrompt?: string; roleName?: string; role?: string; accessory?: string; env?: Record<string, string>; taskId?: string; staffId?: string; allowedTools?: string[]; workflowContext?: string; worktreeOpts?: { repoPath: string }; reattemptGoalId?: string; sandboxed?: boolean; projectId?: string; sessionId?: string; sandboxBranch?: string; sandboxBaseBranch?: string; sandboxCwdOffset?: string; skipAutoModel?: boolean; skipAutoThinking?: boolean; initialModel?: string; initialThinkingLevel?: string; preExistingAgentSessionFile?: string; parentSessionId?: string; childKind?: string; readOnly?: boolean }): Promise<SessionInfo> {
 		const id = opts?.sessionId || randomUUID();
 		const optsAllowedTagged: EffectiveTool[] | undefined = opts?.allowedTools
 			? opts.allowedTools.map(n => tagAllowedTool(n, this.toolManager))
@@ -3799,6 +3924,28 @@ export class SessionManager {
 		// Resolve projectId from opts or from the goal's project
 		const projectId = opts?.projectId ?? (goalId ? this.resolveGoal(goalId)?.projectId : undefined);
 		const ctx = this.buildPipelineContext(projectId);
+
+		// Spawn-path rolePrompt resolution. The orchestration spawn path
+		// (`host.agents.spawn` → OrchestrationCore.spawn → createSession) threads only
+		// `roleName` (no `rolePrompt`), so a pack-shipped role's promptTemplate — e.g.
+		// the pr-reviewer YAML schema — would otherwise NEVER reach the child's system
+		// prompt (assembleSystemPrompt only consumes `parts.rolePrompt`, never a
+		// roleName→template lookup). Resolve it cascade-first here (mirrors the restore
+		// path's buildRestoreRolePrompt) so a project-scoped reviewer child carries its
+		// role prompt. A caller that passes an explicit `rolePrompt` (team/staff) is
+		// untouched.
+		let resolvedRolePrompt = opts?.rolePrompt;
+		if (!resolvedRolePrompt && opts?.roleName) {
+			const template = this.resolveRolePromptTemplate(opts.roleName, projectId);
+			if (template) {
+				resolvedRolePrompt = resolveRolePrompt({ promptTemplate: template }, {
+					branch: goalId ? this.resolveGoal(goalId)?.branch : undefined,
+					agentId: `${opts.roleName}-${(goalId || id).slice(0, 8)}`,
+					roleManager: this.roleManager ?? undefined,
+					subGoalsEnabled: this.isSubgoalsEnabled,
+				});
+			}
+		}
 		const sandboxCwdOffset = opts?.sandboxed
 			? await this.resolveSandboxCwdOffset(cwd, projectId, goalId, opts?.sandboxCwdOffset)
 			: undefined;
@@ -3848,9 +3995,6 @@ export class SessionManager {
 				parentSessionId: opts?.parentSessionId,
 				childKind: opts?.childKind,
 				readOnly: opts?.readOnly,
-				walkthroughJobId: opts?.walkthroughJobId,
-				walkthroughChangesetId: opts?.walkthroughChangesetId,
-				walkthroughTargetKey: opts?.walkthroughTargetKey,
 				allowedTools: opts?.allowedTools,
 				// Mirror session-setup's effectiveRoleId fallback: when callers
 				// (team-manager, staff-manager) pass only `roleName`, use that as
@@ -3893,9 +4037,6 @@ export class SessionManager {
 				parentSessionId: opts?.parentSessionId,
 				childKind: opts?.childKind,
 				readOnly: opts?.readOnly,
-				walkthroughJobId: opts?.walkthroughJobId,
-				walkthroughChangesetId: opts?.walkthroughChangesetId,
-				walkthroughTargetKey: opts?.walkthroughTargetKey,
 				sessionScopedAllowedTools,
 				worktreePath,
 				repoPath,
@@ -3905,7 +4046,7 @@ export class SessionManager {
 				accessory: opts?.accessory,
 				agentArgs,
 				env: opts?.env,
-				rolePrompt: opts?.rolePrompt,
+				rolePrompt: resolvedRolePrompt,
 				roleName: opts?.roleName,
 				workflowContext: opts?.workflowContext,
 				effectiveAllowedTools: optsAllowedTagged,
@@ -3958,9 +4099,6 @@ export class SessionManager {
 			parentSessionId: opts?.parentSessionId,
 			childKind: opts?.childKind,
 			readOnly: opts?.readOnly,
-			walkthroughJobId: opts?.walkthroughJobId,
-			walkthroughChangesetId: opts?.walkthroughChangesetId,
-			walkthroughTargetKey: opts?.walkthroughTargetKey,
 			sessionScopedAllowedTools,
 			// Load-bearing wire: same contract as the worktree branch above.
 			// Pinned by `tests/staff-session-staffid-persistence.test.ts`.
@@ -3970,7 +4108,7 @@ export class SessionManager {
 			accessory: opts?.accessory,
 			agentArgs,
 			env: opts?.env,
-			rolePrompt: opts?.rolePrompt,
+			rolePrompt: resolvedRolePrompt,
 			roleName: opts?.roleName,
 			workflowContext: opts?.workflowContext,
 			reattemptGoalId: opts?.reattemptGoalId,
@@ -4009,6 +4147,41 @@ export class SessionManager {
 		cwd: string;
 		title?: string;
 		context?: Record<string, string>;
+		/**
+		 * Explicit allowedTools override (OrchestrationCore recursion guard, §7):
+		 * the core passes the owner's allowedTools MINUS every spawn verb. When
+		 * omitted, the child inherits the parent's full allowedTools (legacy).
+		 */
+		allowedTools?: string[];
+		/**
+		 * Model / thinking-level inheritance (fixes the delegate model-default
+		 * drop, §2.2). The core resolves the owner's CURRENT model and forwards
+		 * it here. When omitted, the agent CLI falls back to its own default.
+		 */
+		initialModel?: string;
+		initialThinkingLevel?: string;
+		/**
+		 * Source discriminator persisted alongside `delegateOf` so it survives a
+		 * restart (orchestration-core §3). Without it, a `host-agents` (or other)
+		 * delegate-style child is rebuilt as `childKind:"delegate"` and the
+		 * source-filtered `host.agents.*` verbs stop seeing it. Default "delegate".
+		 */
+		childKind?: string;
+		/**
+		 * Persisted read-only marker (orchestration-core §2.2). The actual tool
+		 * gating is performed by the caller via the `allowedTools` allow-list
+		 * (mutating tools stripped, mirroring pr-walkthrough); this flag persists
+		 * the intent for restart-rebuild, UI, and cascade parity.
+		 */
+		readOnly?: boolean;
+		/**
+		 * NON-SECRET tool-scoping env vars merged into the child process env
+		 * (additive, alongside the gateway-set BOBBIT_SESSION_ID/SECRET). Used by
+		 * tool policies that read process env (e.g. the pr-walkthrough reviewer's
+		 * launched-PR `gh` scoping via `BOBBIT_WALKTHROUGH_TARGET_*`). Plain metadata
+		 * ONLY — it never widens the child's sandbox or project (credential) scope.
+		 */
+		env?: Record<string, string>;
 	}): Promise<SessionInfo> {
 		const id = randomUUID();
 		// Resolve projectId from parent session
@@ -4032,10 +4205,22 @@ export class SessionManager {
 
 		const titleSummary = opts.title || opts.instructions.split("\n")[0].slice(0, 60) || "Delegate";
 
-		// Inherit tool access from parent session
+		// Inherit tool access from parent session, unless the caller passes an
+		// explicit allowedTools override (OrchestrationCore strips spawn verbs).
 		const parentSession = this.sessions.get(parentSessionId);
-		const parentAllowedTools: EffectiveTool[] | undefined = parentSession?.allowedTools
-			? parentSession.allowedTools.map(n => tagAllowedTool(n, this.toolManager))
+		const sourceAllowedTools = opts.allowedTools ?? parentSession?.allowedTools;
+		const parentAllowedTools: EffectiveTool[] | undefined = sourceAllowedTools
+			? sourceAllowedTools.map(n => tagAllowedTool(n, this.toolManager))
+			: undefined;
+		// H2 — PERSIST the (already-stripped) allow-list so restart/revive preserves
+		// the recursion guard (spawn verbs removed) AND read-only restrictions
+		// (mutating tools removed). persistOnce persists `allowedTools` ONLY from
+		// `plan.sessionScopedAllowedTools`; without this the child's persisted
+		// allowedTools is undefined and a restored child falls back to role defaults
+		// — silently re-enabling team_delegate/team_spawn (grandchildren) and the
+		// mutating tools a read-only child must never carry.
+		const sessionScopedAllowedTools = sourceAllowedTools && sourceAllowedTools.length > 0
+			? [...sourceAllowedTools]
 			: undefined;
 
 		const plan: SessionSetupPlan = {
@@ -4044,11 +4229,27 @@ export class SessionManager {
 			title: titleSummary,
 			cwd: opts.cwd,
 			delegateOf: parentSessionId,
+			// Persist the source discriminator + read-only marker (orchestration-core
+			// §3/§2.2) so a delegate-style child (e.g. host-agents) is rebuilt with
+			// the correct kind on restart and is enumerable by source-filtered verbs.
+			childKind: opts.childKind,
+			readOnly: opts.readOnly,
 			sandboxed: delegateSandboxed || undefined,
 			instructions: opts.instructions,
 			context: opts.context,
 			effectiveAllowedTools: parentAllowedTools,
+			// Persist the stripped allow-list (H2) so restart preserves the
+			// recursion + read-only restrictions instead of reverting to role defaults.
+			sessionScopedAllowedTools,
 			projectId: parentProjectId,
+			// Model inheritance (§2.2): forward the resolved owner model/thinking
+			// level so a delegate no longer silently drops to the system default.
+			initialModel: opts.initialModel,
+			initialThinkingLevel: opts.initialThinkingLevel,
+			// NON-SECRET tool-scoping env (orchestration-core toolEnv). resolveBridgeOptions
+			// spreads plan.env AFTER BOBBIT_SESSION_ID/SECRET, so it is purely additive and
+			// can never widen the inherited sandbox/project scope.
+			env: opts.env,
 			bridgeOptions: { cwd: opts.cwd },
 		};
 
@@ -4136,33 +4337,85 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get the final assistant output from a session's messages.
+	 * Whether the session has a LIVE (running) agent process. False for a dormant
+	 * restored child (placeholder RpcBridge) or a session no longer tracked. Used
+	 * by OrchestrationCore.wait (H1) to avoid blocking `waitForIdle` on a dead
+	 * client and instead resolve from persisted output.
 	 */
-	async getSessionOutput(sessionId: string): Promise<string> {
+	isSessionLive(sessionId: string): boolean {
 		const session = this.sessions.get(sessionId);
-		if (!session) return "";
+		return !!session && session.dormant !== true;
+	}
 
-		const msgsResp = await session.rpcClient.getMessages();
-		if (!msgsResp.success) return "";
+	/** Pending prompt-queue length — drives OrchestrationCore's `queued` mapping (M3). */
+	getQueuedPromptCount(sessionId: string): number {
+		return this.sessions.get(sessionId)?.promptQueue.length ?? 0;
+	}
 
-		const messages = msgsResp.data?.messages || msgsResp.data;
-		if (!Array.isArray(messages)) return "";
-
-		// Collect text from all assistant messages
+	/**
+	 * Extract concatenated assistant text from a parsed message list (shared by
+	 * the live and persisted-transcript output paths).
+	 */
+	private extractAssistantText(messages: unknown[]): string {
 		const texts: string[] = [];
-		for (const msg of messages) {
-			if (msg.role === "assistant") {
-				const content = msg.content;
-				if (typeof content === "string") {
-					texts.push(content);
-				} else if (Array.isArray(content)) {
-					for (const block of content) {
-						if (block.type === "text" && block.text) texts.push(block.text);
-					}
+		for (const msg of messages as Array<{ role?: string; content?: unknown }>) {
+			if (msg?.role !== "assistant") continue;
+			const content = msg.content;
+			if (typeof content === "string") {
+				texts.push(content);
+			} else if (Array.isArray(content)) {
+				for (const block of content) {
+					if (block?.type === "text" && block.text) texts.push(block.text);
 				}
 			}
 		}
 		return texts.join("\n\n");
+	}
+
+	/**
+	 * Read a (dormant/non-live) session's final assistant output from its PERSISTED
+	 * transcript file. Used as the H1 fallback so a child that completed before a
+	 * restart can still be collected via team_wait without a live process.
+	 */
+	private async getPersistedSessionOutput(sessionId: string): Promise<string> {
+		const ps = this.resolveStoreForId(sessionId)?.get(sessionId);
+		if (!ps?.agentSessionFile) return "";
+		try {
+			const ctx: SessionFsContext = { sandboxed: ps.sandboxed, projectId: ps.projectId };
+			const content = await sessionFileRead(ctx, ps.agentSessionFile, this.sandboxManager);
+			if (!content) return "";
+			const messages: unknown[] = [];
+			for (const line of content.split(/\r?\n/)) {
+				if (!line.trim()) continue;
+				try {
+					const entry = JSON.parse(line);
+					if (entry.type === "message" && entry.message) messages.push(entry.message);
+				} catch { /* skip malformed line */ }
+			}
+			return this.extractAssistantText(messages);
+		} catch {
+			return "";
+		}
+	}
+
+	/**
+	 * Get the final assistant output from a session's messages. For a dormant /
+	 * non-live session (no running agent process) this reads the PERSISTED
+	 * transcript instead of querying the placeholder RpcBridge (H1).
+	 */
+	async getSessionOutput(sessionId: string): Promise<string> {
+		const session = this.sessions.get(sessionId);
+		if (!session || session.dormant === true) {
+			return this.getPersistedSessionOutput(sessionId);
+		}
+
+		const msgsResp = await session.rpcClient.getMessages();
+		if (!msgsResp.success) return this.getPersistedSessionOutput(sessionId);
+
+		const messages = msgsResp.data?.messages || msgsResp.data;
+		if (!Array.isArray(messages)) return "";
+
+		return this.extractAssistantText(messages);
 	}
 
 	/** Query the agent for its session file and save metadata to disk */
@@ -4260,6 +4513,15 @@ export class SessionManager {
 				if (t) return t;
 			} catch { /* fall through */ }
 		}
+		// The field-level cascade (resolveRolePromptTemplate → resolveRoleField) walks
+		// only project/server/builtin role STORES — it does NOT include pack-shipped
+		// roles (e.g. `pr-reviewer`, which lives in the marketplace pack resolver and
+		// is only surfaced by `resolveRoles`). Fall back to the full cascade-resolved
+		// role so a pack role's promptTemplate (carrying its required YAML schema)
+		// reaches the system prompt on BOTH spawn and restore. Without this a reviewer
+		// child has no schema and "learns it from validation feedback".
+		const packTemplate = this.resolveSessionRole(roleName, undefined, projectId)?.promptTemplate;
+		if (packTemplate) return packTemplate;
 		return this.roleManager?.getRole(roleName)?.promptTemplate;
 	}
 
@@ -4407,7 +4669,7 @@ export class SessionManager {
 					});
 					this._writeModelNameFile(session.id, sessionModelPref);
 					this.resolveStoreForSession(session.id).update(session.id, { modelProvider: provider, modelId });
-					console.log(`[session-manager] Set preferred model "${sessionModelPref}" for session ${session.id}${preSpawnPinned ? " (spawn-pinned)" : ""}`);
+					if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Set preferred model "${sessionModelPref}" for session ${session.id}${preSpawnPinned ? " (spawn-pinned)" : ""}`);
 					broadcast(session.clients, {
 						type: "state",
 						data: { model: { provider, id: modelId, reasoning: inferMeta(modelId).reasoning } },
@@ -4499,7 +4761,7 @@ export class SessionManager {
 		const roleThinking = this.resolveRoleThinkingLevel(session);
 		if (roleThinking) {
 			if (spawnPinnedThinking === roleThinking) {
-				console.log(`[session-manager] Role thinking level "${roleThinking}" already pinned at spawn for ${session.id}`);
+				if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Role thinking level "${roleThinking}" already pinned at spawn for ${session.id}`);
 				return;
 			}
 			try {
@@ -4539,7 +4801,7 @@ export class SessionManager {
 			}
 		} catch { /* best-effort */ }
 		if (spawnPinnedThinking === level) {
-			console.log(`[session-manager] Default thinking level "${level}" already pinned at spawn for ${session.id}`);
+			if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Default thinking level "${level}" already pinned at spawn for ${session.id}`);
 			return;
 		}
 		try {
@@ -4774,9 +5036,6 @@ export class SessionManager {
 		parentSessionId?: string;
 		childKind?: string;
 		readOnly?: boolean;
-		walkthroughJobId?: string;
-		walkthroughChangesetId?: string;
-		walkthroughTargetKey?: string;
 		role?: string;
 		teamGoalId?: string;
 		teamLeadSessionId?: string;
@@ -4817,9 +5076,6 @@ export class SessionManager {
 				parentSessionId: ps?.parentSessionId ?? s.parentSessionId,
 				childKind: ps?.childKind ?? s.childKind,
 				readOnly: ps?.readOnly ?? s.readOnly,
-				walkthroughJobId: ps?.walkthroughJobId ?? s.walkthroughJobId,
-				walkthroughChangesetId: ps?.walkthroughChangesetId ?? s.walkthroughChangesetId,
-				walkthroughTargetKey: ps?.walkthroughTargetKey ?? s.walkthroughTargetKey,
 				role: s.role,
 				teamGoalId: s.teamGoalId,
 				teamLeadSessionId: s.teamLeadSessionId,
@@ -4896,7 +5152,7 @@ export class SessionManager {
 	}
 
 	/** Update session metadata fields and persist. */
-	updateSessionMeta(id: string, updates: { role?: string; teamGoalId?: string; worktreePath?: string; repoPath?: string; branch?: string; repoWorktrees?: Record<string, string>; accessory?: string; nonInteractive?: boolean; teamLeadSessionId?: string; delegateOf?: string; parentSessionId?: string; childKind?: string; readOnly?: boolean; walkthroughJobId?: string; walkthroughChangesetId?: string; walkthroughTargetKey?: string }): boolean {
+	updateSessionMeta(id: string, updates: { role?: string; teamGoalId?: string; worktreePath?: string; repoPath?: string; branch?: string; repoWorktrees?: Record<string, string>; accessory?: string; nonInteractive?: boolean; teamLeadSessionId?: string; delegateOf?: string; parentSessionId?: string; childKind?: string; readOnly?: boolean; childTerminal?: boolean; terminalAt?: number }): boolean {
 		const session = this.sessions.get(id);
 		if (!session) {
 			// Store-only session (dormant/delegate) — update store directly
@@ -4926,11 +5182,34 @@ export class SessionManager {
 		if (updates.parentSessionId !== undefined) session.parentSessionId = updates.parentSessionId;
 		if (updates.childKind !== undefined) session.childKind = updates.childKind;
 		if (updates.readOnly !== undefined) session.readOnly = updates.readOnly;
-		if (updates.walkthroughJobId !== undefined) session.walkthroughJobId = updates.walkthroughJobId;
-		if (updates.walkthroughChangesetId !== undefined) session.walkthroughChangesetId = updates.walkthroughChangesetId;
-		if (updates.walkthroughTargetKey !== undefined) session.walkthroughTargetKey = updates.walkthroughTargetKey;
+		if (updates.childTerminal !== undefined) session.childTerminal = updates.childTerminal;
+		if (updates.terminalAt !== undefined) session.terminalAt = updates.terminalAt;
 		this.resolveStoreForSession(id).update(id, updates);
 		return true;
+	}
+
+	/**
+	 * Stamp the GENERIC persisted terminal marker on a child session
+	 * (`childTerminal:true` + `terminalAt`), so the generic boot-reap
+	 * (`shouldReapChildOnBoot` reading `PersistedSessionLike.childTerminal`)
+	 * removes it after a restart even if a dismiss never ran (orchestration-core
+	 * Decision E / Findings 3–4). Idempotent; carries NO pack/kind knowledge.
+	 * Implements `OrchestrationSessionView.markChildTerminal` and is also called
+	 * by the pr-walkthrough submit-yaml route before its terminal-synchronous
+	 * dismiss. Routes through `updateSessionMeta` for a live/dormant session and
+	 * `updateArchivedMeta` for an archived one.
+	 */
+	markChildTerminal(childSessionId: string): void {
+		const updates = { childTerminal: true, terminalAt: Date.now() };
+		if (this.sessions.has(childSessionId)) {
+			this.updateSessionMeta(childSessionId, updates);
+			return;
+		}
+		// Not live: try the archived path; if it is not archived (dormant store-only),
+		// fall back to updateSessionMeta's store-only branch.
+		if (!this.updateArchivedMeta(childSessionId, updates)) {
+			this.updateSessionMeta(childSessionId, updates);
+		}
 	}
 
 	// ── Draft storage ──────────────────────────────────────────────
@@ -4958,9 +5237,6 @@ export class SessionManager {
 				parentSessionId: session.parentSessionId,
 				childKind: session.childKind,
 				readOnly: session.readOnly,
-				walkthroughJobId: session.walkthroughJobId,
-				walkthroughChangesetId: session.walkthroughChangesetId,
-				walkthroughTargetKey: session.walkthroughTargetKey,
 				sandboxed: session.sandboxed,
 				projectId: session.projectId,
 			});
@@ -5342,29 +5618,70 @@ export class SessionManager {
 		return parseImageModelPref(pref);
 	}
 
-	async terminateSession(id: string): Promise<boolean> {
-		const session = this.sessions.get(id);
-		if (!session) return false;
-
-		// Cascade: terminate all delegate (child) sessions first. PR-walkthrough
-		// children are linked via parentSessionId/childKind (not delegateOf), so they
-		// must be cascaded too — otherwise the read-only child process leaks when its
-		// parent is terminated or archived (archival flows through terminateSession).
-		const children = [...this.sessions.values()].filter(s => s.delegateOf === id || (s.childKind === "pr-walkthrough" && s.parentSessionId === id));
+	/**
+	 * Cascade-reap an owner's child agents (OrchestrationCore §6).
+	 *
+	 * Generalized over EVERY child kind (not just pr-walkthrough): a child is any
+	 * session with `delegateOf === id`, OR (`childKind` set AND
+	 * `parentSessionId === id`). Live children are terminate+archived; dormant
+	 * (persisted-but-not-in-memory) children are archived directly. This is the
+	 * single hook that guarantees a live child never outlives its parent's
+	 * archival — it runs from `terminateSession` AND from the runtime archive
+	 * seam `archiveWithCascade`, so the cascade fires even when the parent is
+	 * dormant/not-live or was archived while the server was down. The boot-reap
+	 * (`shouldReapChildOnBoot`) remains as defense-in-depth.
+	 */
+	private async cascadeReapOwner(id: string): Promise<void> {
+		// Cascade: terminate all live child sessions first. Children are linked via
+		// `delegateOf` (delegate kind) OR `parentSessionId`+`childKind` (team /
+		// pr-walkthrough / host-agents / any future kind) — otherwise a child
+		// process leaks when its parent is terminated or archived.
+		const children = [...this.sessions.values()].filter(s => s.delegateOf === id || (!!s.childKind && s.parentSessionId === id));
 		for (const child of children) {
 			console.log(`[session ${id}] Cascading terminate to child ${child.id}`);
 			await this.terminateSession(child.id);
 		}
-		// Also archive persisted-but-not-in-memory delegate / pr-walkthrough children
+		// Also archive persisted-but-not-in-memory children of any kind.
 		const allLiveForTerminate = this.projectContextManager
 			? [...this.projectContextManager.getAllLiveSessions()]
 			: (this._testStore?.getLive() ?? []);
 		for (const ps of allLiveForTerminate) {
-			const isChild = ps.delegateOf === id || (ps.childKind === "pr-walkthrough" && ps.parentSessionId === id);
+			const isChild = ps.delegateOf === id || (!!ps.childKind && ps.parentSessionId === id);
 			if (isChild && !this.sessions.has(ps.id)) {
 				try { this.getSessionStore(ps.projectId).archive(ps.id); } catch { /* project gone */ }
 			}
 		}
+		// Keep the OrchestrationCore in-memory index consistent.
+		try { this.orchestrationCore?.forgetOwner(id); } catch { /* best-effort */ }
+	}
+
+	/**
+	 * The single runtime archive seam (OrchestrationCore §6). EVERY runtime
+	 * archive entry point that can archive a PARENT session routes through here
+	 * so a live child never outlives its parent's archival — even when the parent
+	 * is dormant/not-live, or was archived while the server was down. It cascade-
+	 * reaps the owner's children FIRST (generalized to all child kinds via
+	 * `cascadeReapOwner`), then archives the owner in its store. Reaped children
+	 * archive IDENTICALLY to today's team-shutdown child archival (same status,
+	 * same "show archived" surface, no new badge). `terminateSession` already
+	 * cascades at its top, so its own internal archive does NOT route through
+	 * here (avoids a redundant second cascade). The boot-restore reap
+	 * (`shouldReapChildOnBoot`) stays as defense-in-depth for the server-was-down
+	 * case.
+	 */
+	private async archiveWithCascade(id: string, store?: SessionStore): Promise<boolean> {
+		await this.cascadeReapOwner(id);
+		const target = store ?? this.resolveStoreForId(id);
+		if (!target) return false;
+		try { return target.archive(id); } catch { return false; }
+	}
+
+	async terminateSession(id: string): Promise<boolean> {
+		const session = this.sessions.get(id);
+		if (!session) return false;
+
+		// Cascade-reap this owner's child agents (extracted seam — §6).
+		await this.cascadeReapOwner(id);
 
 		// Resolve any pending grant request so the guard's long-poll returns immediately
 		if (session.pendingGrantRequest) {
@@ -5415,11 +5732,14 @@ export class SessionManager {
 		this.sessionSecretStore.remove(id);
 
 		// Clean up sandbox worktree inside the container.
-		// Skip for delegate sessions AND pr-walkthrough children — both share the
-		// parent's worktree and must never remove it. Only the owning session should
-		// clean up (cascade-terminating a prw child must not delete the launching
-		// session's still-active /workspace-wt/<name>).
-		if (session.sandboxed && !session.delegateOf && session.childKind !== "pr-walkthrough" && session.cwd?.startsWith("/workspace-wt/") && this.sandboxManager && session.projectId) {
+		// Skip for sessions that SHARE the parent's worktree and must never remove it:
+		// delegate children (`delegateOf`) AND read-only child principals
+		// (`readOnly` + `parentSessionId`, e.g. the host-agents PR-walkthrough reviewer).
+		// A read-only child cannot write, so it never owns its own worktree — it shares
+		// the launching session's still-active /workspace-wt/<name>. Only the owning
+		// session should clean up. (Team children own a SEPARATE worktree and are not
+		// read-only, so they are not skipped here.)
+		if (session.sandboxed && !session.delegateOf && !(session.readOnly && session.parentSessionId) && session.cwd?.startsWith("/workspace-wt/") && this.sandboxManager && session.projectId) {
 			try {
 				const sandbox = this.sandboxManager.get(session.projectId);
 				if (sandbox) {
@@ -5518,15 +5838,17 @@ export class SessionManager {
 		return ps?.archived ? ps : undefined;
 	}
 
-	/** Archive a session directly in the store (for dormant/store-only sessions). */
-	storeArchive(id: string): boolean {
-		const store = this.resolveStoreForId(id);
-		if (!store) return false;
-		return store.archive(id);
+	/**
+	 * Archive a session directly in the store (for dormant/store-only sessions).
+	 * Routes through the runtime archive seam (§6) so a dormant parent's live
+	 * children are cascade-reaped before it is archived.
+	 */
+	async storeArchive(id: string): Promise<boolean> {
+		return this.archiveWithCascade(id);
 	}
 
 	/** Update metadata on an archived session (stored in the session store). */
-	updateArchivedMeta(id: string, updates: { teamLeadSessionId?: string; parentSessionId?: string; childKind?: string; readOnly?: boolean; walkthroughJobId?: string; walkthroughChangesetId?: string; walkthroughTargetKey?: string }): boolean {
+	updateArchivedMeta(id: string, updates: { teamLeadSessionId?: string; parentSessionId?: string; childKind?: string; readOnly?: boolean; childTerminal?: boolean; terminalAt?: number }): boolean {
 		const store = this.resolveStoreForId(id);
 		if (!store) return false;
 		const ps = store.get(id);
@@ -5579,9 +5901,6 @@ export class SessionManager {
 		parentSessionId?: string;
 		childKind?: string;
 		readOnly?: boolean;
-		walkthroughJobId?: string;
-		walkthroughChangesetId?: string;
-		walkthroughTargetKey?: string;
 		role?: string;
 		teamGoalId?: string;
 		teamLeadSessionId?: string;
@@ -5614,9 +5933,6 @@ export class SessionManager {
 			parentSessionId: ps.parentSessionId,
 			childKind: ps.childKind,
 			readOnly: ps.readOnly,
-			walkthroughJobId: ps.walkthroughJobId,
-			walkthroughChangesetId: ps.walkthroughChangesetId,
-			walkthroughTargetKey: ps.walkthroughTargetKey,
 			role: ps.role,
 			teamGoalId: ps.teamGoalId,
 			teamLeadSessionId: ps.teamLeadSessionId,
@@ -5700,6 +6016,12 @@ export class SessionManager {
 				// check error — best-effort, the rest of the cleanup logs.
 			}
 		}
+
+		// Cascade-reap any child agents before destroying the parent's data (§6).
+		// A parent normally cascades at archive time, but purge is a terminal data
+		// destruction — reap here as a final safety net so a child never outlives
+		// the purge of its parent.
+		try { await this.cascadeReapOwner(ps.id); } catch { /* best-effort */ }
 
 		// Remove from search index
 		this.cleanupSearchForSession(ps.id, ps.projectId);
@@ -6006,22 +6328,22 @@ export class SessionManager {
 				if (didTerminate) {
 					terminated++;
 				} else {
-					// Session not in memory — try direct archive
+					// Session not in memory — try direct archive (cascade-reap children first)
 					try {
 						const ps = this.resolveStoreForId(id)?.get(id);
 						if (ps) {
-							this.getSessionStore(ps.projectId).archive(id);
+							await this.archiveWithCascade(id, this.getSessionStore(ps.projectId));
 							terminated++;
 						}
 					} catch { /* project gone */ }
 				}
 			} catch (err) {
 				console.warn(`[session-manager] Failed to terminate orphan ${id}:`, err);
-				// Try direct archive as fallback
+				// Try direct archive as fallback (cascade-reap children first)
 				try {
 					const ps = this.resolveStoreForId(id)?.get(id);
 					if (ps) {
-						this.getSessionStore(ps.projectId).archive(id);
+						await this.archiveWithCascade(id, this.getSessionStore(ps.projectId));
 						terminated++;
 					}
 				} catch { /* project gone */ }
@@ -6254,7 +6576,7 @@ export class SessionManager {
 			}
 
 			// Restore tool activation, including Bobbit extension tools and MCP policy filtering.
-			const role = this.resolveSessionRole(session.role, session.assistantType);
+			const role = this.resolveSessionRole(session.role, session.assistantType, session.projectId);
 			const effective = this.resolveEffectiveAllowedTools(role);
 			const forceActivation = this.buildToolActivationArgs(id, effective.length > 0 ? effective : undefined, role, session.cwd);
 			bridgeOptions.args = [...forceActivation.args, ...(bridgeOptions.args || [])];
@@ -6387,6 +6709,10 @@ export class SessionManager {
 		} else if (this._testStore) {
 			this._testStore.flush();
 		}
+		// Flush pending bg-process projection writes + store epoch before exit so
+		// re-attach exit codes and dismiss removals survive a restart (the bg
+		// store mirrors sessionStore's stale-snapshot guard).
+		try { (this as any).bgProcessManager?.flush(); } catch { /* best-effort */ }
 
 		// Close search index
 		try {

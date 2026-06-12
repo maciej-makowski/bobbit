@@ -16,7 +16,8 @@ export default function (pi: ExtensionAPI) {
 	const sessionId = process.env.BOBBIT_SESSION_ID;
 	const goalId = process.env.BOBBIT_GOAL_ID;
 	if (!sessionId || !goalId) {
-		console.error("[team-lead-tools] BOBBIT_GOAL_ID / BOBBIT_SESSION_ID missing — tools not registered");
+		// Expected for every non-team session — only surface under BOBBIT_DEBUG.
+		if (process.env.BOBBIT_DEBUG) console.log("[team-lead-tools] BOBBIT_GOAL_ID / BOBBIT_SESSION_ID missing — tools not registered");
 		return;
 	}
 
@@ -27,9 +28,19 @@ export default function (pi: ExtensionAPI) {
 	}
 	const creds = credsResult;
 
+	// The unforgeable per-session secret. The own-child fallback in the goal
+	// `/team/{dismiss,steer,abort,prompt}` routes (H3) requires the AUTHENTIC
+	// caller — resolved from this secret — to BE the team-lead owner before it
+	// will orchestrate a team-lead's PRIVATE team_delegate child. Sending it on
+	// every team call is harmless for the normal goal-member path (which does
+	// not check it) and necessary for the fallback. See src/server/auth/session-secret.ts.
+	const sessionSecret = process.env.BOBBIT_SESSION_SECRET;
+
 	// ── HTTP helper ───────────────────────────────────────────────────
 	async function api(method: string, urlPath: string, body?: unknown): Promise<unknown> {
-		return apiCall(creds, method, urlPath, body);
+		const extraHeaders: Record<string, string> = {};
+		if (sessionSecret) extraHeaders["X-Bobbit-Session-Secret"] = sessionSecret;
+		return apiCall(creds, method, urlPath, body, { extraHeaders });
 	}
 
 	function ok(data: unknown) {
@@ -156,5 +167,5 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	console.log(`[team-lead-tools] Registered 7 team tools for session ${sessionId}, goal ${goalId}`);
+	if (process.env.BOBBIT_DEBUG) console.log(`[team-lead-tools] Registered 7 team tools for session ${sessionId}, goal ${goalId}`);
 }

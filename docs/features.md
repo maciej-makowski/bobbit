@@ -28,6 +28,15 @@ A team is a group of agent sessions working together on a goal, coordinated by a
 - **Role agents**: Spawned by the team lead with a specific role (coder, reviewer, tester, or custom). Each gets its own git worktree and role-specific system prompt with restricted tool access.
 - **Lifecycle**: Start → spawn role agents → agents work on tasks → complete (dismiss agents, keep lead) or teardown (dismiss all).
 
+### Child agents (`team_delegate`)
+
+Any session — goal or not — can launch a **child agent** with `team_delegate` (the rename of the
+old `delegate` tool). The child runs in the parent's worktree with no conversation context, either
+blocking one-shot or detached and orchestrated via `team_wait` / `team_prompt` / `team_steer` /
+`team_dismiss`. Children inherit the parent's current model, survive gateway restarts, and are
+cascade-archived with their parent. Packs reach the same machinery via the ambient `host.agents`
+capability. See [orchestration.md](orchestration.md) for the full surface and guarantees.
+
 ## Tasks
 
 Tasks are work items within a goal, managed via REST API or WebSocket commands.
@@ -94,7 +103,7 @@ Workflows define the gates a goal must pass, their dependency relationships (a D
 
 ## PR Walkthrough Panel
 
-The PR walkthrough panel is a guided pull-request or changeset review surface. It ships as a **built-in first-party pack** (`market-packs/pr-walkthrough/`) that is auto-resolved active-by-default — there is no manual install. A pack entrypoint (git-widget button / composer-slash / command palette) opens the pack panel at the generic extension route `#/ext/pr-walkthrough`; the panel's "Run PR walkthrough" action uses `host.session.postMessage` to drive the **current** session's agent. The agent publishes cards only through validated `submit_pr_walkthrough_yaml`. Disabling the pack from the Market built-in section makes the feature unavailable (the deep-link degrades to an empty state). See [pr-walkthrough-panel.md](pr-walkthrough-panel.md) for the full behaviour and testing contract, and [built-in-first-party-packs.md](design/built-in-first-party-packs.md) for the pack model.
+The PR walkthrough panel is a guided pull-request or changeset review surface. It ships as a **built-in first-party pack** (`market-packs/pr-walkthrough/`) that is auto-resolved active-by-default — there is no manual install. A pack entrypoint (git-widget button / composer-slash / command palette) opens the pack panel at the generic extension route `#/ext/pr-walkthrough`; the panel's "Run PR walkthrough" action mints a **separate, isolated, read-only reviewer child** (`host.agents.spawn`, role `pr-reviewer`) — it never drives the user's current agent. The reviewer publishes cards only through validated `submit_pr_walkthrough_yaml`. The run path is GitHub-PR-only. Disabling the pack from the Market built-in section makes the feature unavailable (the deep-link degrades to an empty state). See [pr-walkthrough-panel.md](pr-walkthrough-panel.md) for the full behaviour and testing contract, and [built-in-first-party-packs.md](design/built-in-first-party-packs.md) for the pack model.
 
 ## Assistant Registry
 

@@ -56,6 +56,9 @@ These endpoints expose restart support only for gateways launched through `npm r
 | `POST` | `/api/sessions/:id/bg-processes` | Start a background process and return its `BgProcessInfo` snapshot |
 | `GET` | `/api/sessions/:id/bg-processes` | List active/exited background process snapshots for REST hydration |
 | `GET` | `/api/sessions/:id/bg-processes/:pid/wait` | Long-poll until a background process exits, times out, or is interrupted |
+| `DELETE` | `/api/sessions/:id/bg-processes/:pid?action=kill` | Terminate a running process (whole tree / group); keep the now-terminal record until dismissed. `{ ok, killed }`; 404 if not found/not running |
+| `DELETE` | `/api/sessions/:id/bg-processes/:pid?action=dismiss` | Remove the record **and** delete its persisted log/status/spool files; broadcasts `bg_process_dismissed`. `{ ok }`; 409 if still running |
+| `DELETE` | `/api/sessions/:id/bg-processes/:pid` | Legacy: kill-if-running, else dismiss |
 | `GET` | `/api/sessions/:id/cost` | Persisted cumulative token usage and cost for a single session. Returns 404 when no cost record exists. Response includes `cacheHitRate: number \| null`. See [session-cost.md](session-cost.md) and [Cache-hit rate](cache-hit-rate.md). |
 | `GET` | `/api/sessions/:id/cost/breakdown` | Session cost plus delegate-session breakdown, used by the session cost popover; cost objects include `cacheHitRate: number \| null`. |
 | `GET` | `/api/sessions/:id/tool-content/:messageIndex/:blockIndex` | Lazy-load full tool input content for a truncated block (see [Large content truncation](#large-content-truncation)) |
@@ -106,8 +109,13 @@ type BgProcessInfo = {
   name: string;
   command: string;
   pid: number;
-  status: "running" | "exited";
+  // "unrecoverable" = the live outcome was lost across a gateway restart (output is still retained).
+  status: "running" | "exited" | "unrecoverable";
   exitCode: number | null;
+  // Why the process reached a terminal state; null while running. Authoritative for UI rendering.
+  // "normal" → real exitCode; "killed" → user kill (exitCode usually null); "unrecoverable" → lost
+  // across a restart (exitCode null, never fabricated). Optional/undefined for legacy snapshots.
+  terminalReason?: "normal" | "killed" | "unrecoverable" | null;
   startTime: number;
   endTime: number | null;
 };
@@ -116,10 +124,12 @@ type BgProcessInfo = {
 `endTime` is `null` while `status === "running"`. On child exit the server sets `endTime` once, and list / wait snapshots preserve that final value so reloads and reconnects keep showing the fixed `endTime - startTime` runtime.
 
 - `POST /api/sessions/:id/bg-processes` returns `201 BgProcessInfo` for the created process.
-- `GET /api/sessions/:id/bg-processes` returns `{ processes: BgProcessInfo[] }` for UI hydration.
+- `GET /api/sessions/:id/bg-processes` returns `{ processes: BgProcessInfo[] }` for UI hydration. Background processes survive a gateway restart — this list is rehydrated from the on-disk store and re-attached processes keep streaming. See [docs/bg-process-persistence.md](bg-process-persistence.md).
 - `GET /api/sessions/:id/bg-processes/:pid/wait` returns `{ info: BgProcessInfo, timedOut: boolean, aborted: boolean }`; `info.endTime` is numeric after exit and remains `null` for running timeout/abort snapshots.
 
 Older exited snapshots may omit `endTime` or set it to `null`. Clients must render those runtimes as unknown/non-growing instead of substituting `Date.now()` for an exit timestamp.
+
+**WS events.** `bg_process_created` / `bg_process_output` carry the running snapshot and streamed output; `bg_process_exited` carries `processId`, `exitCode`, `endTime`, and `terminalReason` (the authoritative terminal field — `exitCode` is `null` for `killed`/`unrecoverable`); `bg_process_dismissed` carries `{ processId }` so all clients drop the pill when a process is dismissed.
 
 ### Proposal drafts
 
@@ -265,6 +275,26 @@ Routes accept both `/team/` and legacy `/swarm/` paths.
 | `GET` | `/api/goals/:id/team/agents` | List agents for a team goal. `?include=archived` also returns archived agents with `teamLeadSessionId`, `teamGoalId`, and `delegateOf` fields |
 | `POST` | `/api/goals/:id/team/complete` | Complete a team (dismiss agents, keep team lead). Body `{ confirmBypassedGates?: boolean }` — the agent/MCP path is refused while any gate is `bypassed`; a human confirms with `confirmBypassedGates: true` (403 for sandbox tokens). See [Gate bypass endpoint](#gate-bypass-endpoint). |
 | `POST` | `/api/goals/:id/team/teardown` | Fully tear down a team (dismiss all + terminate team lead) |
+
+### Orchestration routes (child agents)
+
+These back the `team_delegate` / `team_wait` / own-children `team_*` agent tools. `:id` is the
+**owner** session; the route resolves the authenticated caller as that owner and enforces that a
+target `childSessionId` belongs to the owner (own-children scoping is server-enforced, not
+client-trusted). All call the shared `OrchestrationCore` in-process. See
+[orchestration.md](orchestration.md).
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/sessions/:id/orchestrate/children` | List the owner's tracked child agents |
+| `POST` | `/api/sessions/:id/orchestrate/spawn` | Non-blocking spawn (single or `parallel`); child inherits the owner's current model unless overridden |
+| `POST` | `/api/sessions/:id/orchestrate/delegate` | Blocking one-shot: spawn → wait for **all** → auto-dismiss; drop-in `delegate` parity. Always 2xx; per-child `status` carries success/timeout/failure |
+| `POST` | `/api/sessions/:id/orchestrate/prompt` | Run-if-idle / queue a prompt to an owned child (`{ childSessionId, message }`) |
+| `POST` | `/api/sessions/:id/orchestrate/steer` | Mid-turn steer an owned child (`409` if the child is not streaming) |
+| `POST` | `/api/sessions/:id/orchestrate/abort` | Force-abort an owned child |
+| `POST` | `/api/sessions/:id/orchestrate/wait` | Wait for the **first** awaited child to settle (chunked heartbeat, like `/wait`) |
+| `POST` | `/api/sessions/:id/orchestrate/dismiss` | Terminate + archive an owned child |
+| `GET` | `/api/sessions/:id/children-count` | Count + list (`{ count, children: [{ id, title }] }`) the session's live **and dormant/persisted** child agents, using the same predicate as the archive cascade. Backs the non-goal archive confirmation modal's child-agent enumeration |
 
 ### Tasks
 

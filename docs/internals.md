@@ -202,6 +202,22 @@ The live llm-review path is not actually affected by the bug (the kickoff prompt
 
 Key files: `src/server/agent/session-manager.ts` (`waitForStreaming`), `src/server/agent/verification-harness.ts`. Tests: `tests/verification-reminder-race.test.ts` (unit), `tests/e2e/gate-verification-resume.spec.ts` (API E2E that drives a full restart cycle).
 
+#### Cold-reviewer resume: readiness wait + restart-interrupt routing
+
+The reminder-race fix above assumed the revived reviewer could *answer* the reminder promptly. It often can't: a freshly-revived reviewer is **cold** (model init + MCP extension load), and parallel session restore boots several agent processes at once, so first response routinely takes 30–90 s. Pre-fix `_tryResumeFromSession` re-prompted with `rpcClient.prompt()` on the `sendCommand` **30 s** default and *without* a readiness wait. The cold agent blew past 30 s, `prompt()` rejected with `Command timed out: prompt`, and — because that rejection had no local catch — it escaped past `_resumeOneVerification` (skipping both the `_rerunLlmReviewStep` fallback and `shouldSuppressRestartInterrupt`) into the outer catch in `resumeInterruptedVerifications`, which marked the gate **`failed`** with a `Resume Error` step. A pure restart interrupt thus masqueraded as a real review failure. Symptom→fix lookup: [debugging.md — Gate marked `failed` after gateway restart with a "Resume Error" step](debugging.md#gate-marked-failed-after-gateway-restart-with-a-resume-error-step).
+
+The fix has three layers, each a defence the previous one falls through to:
+
+1. **Wait for readiness, then prompt with a generous timeout.** `_tryResumeFromSession` now calls `RpcBridge.waitForReady(90_000)` before sending the reminder, and sends it with `prompt(reminderPrompt, undefined, 120_000)` — `RpcBridge.prompt()` gained an optional `timeoutMs` third arg that overrides the 30 s `sendCommand` default. A reviewer that needs up to ~90 s to wake no longer times out.
+2. **Never throw out of the resume-prompt path.** The `waitForReady` + `prompt` pair is wrapped in try/catch. If the agent still can't be reached (process gone, RPC timeout), the catch *returns a step result* instead of throwing — and that result is deliberately crafted to be **both** transient (so `_resumeOneVerification` routes it into `_rerunLlmReviewStep` for a from-scratch rerun) **and** a restart-interrupt marker (output contains `"timed out while resuming after server restart"`, a new `RESTART_INTERRUPT_MARKERS` entry, so `shouldSuppressRestartInterrupt` leaves the gate `pending` if the rerun context is unavailable).
+3. **Classify any escaped error as a restart-interrupt, not a failure.** The outer catch in `resumeInterruptedVerifications` now calls `isRestartInterruptError(message)` (`verification-logic.ts`). It matches RPC-timeout / not-ready signatures (`Command timed out`, `timed out`, `not ready`, `did not become ready`, `Agent process exited` / `not running`, `process exited`); on a match the gate is set **`pending`** (persisting an honest `Resume Interrupted` audit step) with a benign "interrupted by restart, please re-signal — no real failure was observed" team-lead nudge, rather than `failed` with a `Resume Error`. Only a genuinely non-restart error still takes the hard-failure branch.
+
+**De-conflicting the double prompt.** `restoreSession` (`session-manager.ts`) re-prompts mid-turn-interrupted sessions with its own boot-resume nudge. For verification reviewer / QA sessions that would race the harness's resume reminder on the same cold agent, so `restoreSession` now *skips* the nudge for `nonInteractive` sessions (still clearing `wasStreaming` so the flag doesn't leak across restarts) and leaves re-drive exclusively to `resumeInterruptedVerifications` → `_tryResumeFromSession`.
+
+Why `pending` rather than `failed`: a restart is environmental, not a review verdict. Marking the gate `failed` burns the team-lead's trust in the verdict and (pre-fix) forced repeated manual re-signals; leaving it `pending` with a one-line re-signal nudge recovers cleanly with no false negative. Future resume / reminder sites that talk to a possibly-cold revived agent must follow the same shape: `waitForReady` first, a non-default prompt timeout, and route failures through `isRestartInterruptError` / the transient + restart-interrupt step result — never let an RPC timeout escape as a gate failure.
+
+Tests: `tests/verification-resume-restart-prompt.test.ts` (resume-prompt timeout leaves the gate `pending`, never `failed`), `tests/verification-resume-restart-recovery.test.ts` (cold reviewer waits for readiness then passes; rerun-from-scratch fallback reachable when re-attach fails), `tests/verification-logic.test.ts` (`isRestartInterruptError` classification). Key files: `src/server/agent/verification-harness.ts`, `src/server/agent/verification-logic.ts`, `src/server/agent/rpc-bridge.ts` (`prompt` timeout arg), `src/server/agent/session-manager.ts` (`restoreSession` nonInteractive nudge-skip).
+
 #### Atomic step enumeration on `gate_signal`
 
 The `gate_signal` REST handler enumerates the verification step list **synchronously** before recording the signal, so the persisted `signal.verification.steps[]` and the in-memory `activeVerifications` entry agree from the very first state any consumer can observe. Pre-fix the gate-store wrote `steps: []` and the harness populated the entry several `await`s later — a 15-30 s race window on multi-step gates during which the dashboard rendered no progress. Split via `VerificationHarness.beginVerification(signal, gate)` (synchronous enumeration + active-map seed, no WS broadcast) and `getActiveVerification(signalId)` (lookup for ordered broadcast). The handler order is `cancelStaleVerifications` → `beginVerification` → `recordSignal` → `gate_signal_received` → `gate_verification_started` → fire-and-forget `verifyGateSignal`. Full design and the symbol-level map are in [docs/gate-signal-step-enumeration.md](gate-signal-step-enumeration.md); symptom→fix lookup in [debugging.md — Empty `verification.steps[]` after `gate_signal`](debugging.md#empty-verificationsteps-after-gate_signal). Pinned by `tests/gate-signal-step-enumeration.test.ts`, `tests/e2e/gate-signal-progress.spec.ts`, and `tests/e2e/ui/verification-progress-indicator.spec.ts`.
@@ -655,7 +671,7 @@ This means crash recovery doesn't require the user to manually clean up pool det
 |---|---|---|---|
 | Normal (assistant) | `POST /api/sessions` for assistant types (goal/project/tool) | No | No |
 | Worktree | `POST /api/sessions` for non-goal, non-assistant sessions in a git repo | Yes (auto) | No |
-| Delegate | Parent session spawns a child via the `delegate` tool | Inherits parent cwd | No |
+| Delegate | Parent session spawns a child via the `team_delegate` tool (or the `host.agents` pack capability) — both go through `OrchestrationCore`; see [orchestration.md](orchestration.md) | Inherits parent cwd | No |
 | Continue-Archived | `POST /api/sessions/:archivedId/continue` | Yes (fresh) if source had one | No - agent CLI rehydrates from a clone of the source `.jsonl` (no system-prompt injection) |
 
 Continue-Archived sessions are covered in detail under [Continue-Archived sessions](#continue-archived-sessions) below.
@@ -2520,7 +2536,7 @@ For the parallel pattern on the agent stream (different event family, same shape
 
 Background process pills render live state from `BgProcessManager` snapshots, not from browser-local assumptions. This matters because an exited process may remain visible for hours, survive reconnects, or be rehydrated through REST; using `Date.now() - startTime` after exit makes old processes look like they ran until the current page render.
 
-**Contract.** `BgProcessInfo` includes `startTime: number` and `endTime: number | null` as epoch-millisecond timestamps.
+**Contract.** `BgProcessInfo` includes `startTime: number` and `endTime: number | null` as epoch-millisecond timestamps, plus `status: "running" | "exited" | "unrecoverable"`, `exitCode: number | null`, and `terminalReason: "normal" | "killed" | "unrecoverable" | null` (null while running).
 
 - While `status === "running"`, `endTime` is `null` and the UI may render a live elapsed timer from `startTime`.
 - On child `exit`, the server updates `status`, `exitCode`, and `endTime` once before resolving waiters or broadcasting the exit event.
@@ -2532,9 +2548,45 @@ Background process pills render live state from `BgProcessManager` snapshots, no
 - `GET /api/sessions/:id/bg-processes` returns `{ processes: BgProcessInfo[] }` for initial hydration and reconnect refresh.
 - `GET /api/sessions/:id/bg-processes/:pid/wait` returns `{ info, timedOut, aborted }`; `info.endTime` is numeric only when the snapshot is exited. This is a long-poll — it streams chunked with a periodic heartbeat to survive undici's ~300 s `headersTimeout` (see [Long-poll heartbeat (chunked keep-alive)](#long-poll-heartbeat-chunked-keep-alive)).
 - `bg_process_created` carries the full running `process` snapshot with `endTime: null`.
-- `bg_process_exited` carries `processId`, `exitCode`, and `endTime` so the client can freeze an existing pill immediately.
+- `bg_process_exited` carries `processId`, `exitCode`, `endTime`, and `terminalReason` so the client can freeze an existing pill immediately. `terminalReason` is `"normal"` (clean exit), `"killed"` (user-requested kill), or `"unrecoverable"` (real exit code could not be recovered after a restart); `exitCode` is `null` for the latter two and clients must not fabricate one.
+- `bg_process_dismissed` carries `processId` and tells the client to remove the pill; it fires on explicit dismiss (and the legacy kill-then-dismiss path) after the persisted log/status files are purged.
 
-The REST and WS contracts are additive for older clients, but new clients must treat missing `endTime` as unknown rather than deriving a misleading final duration from the current clock.
+The REST and WS contracts are additive for older clients, but new clients must treat missing `endTime` as unknown rather than deriving a misleading final duration from the current clock. See [websocket-protocol.md](websocket-protocol.md#background-process-events) and [rest-api.md](rest-api.md) for the full event/route shapes.
+
+---
+
+## Background process persistence (bash_bg)
+
+`bash_bg` background processes survive a gateway restart and **re-attach** to
+still-running processes: live output keeps streaming and the real exit code is
+captured, as if the server never restarted. This is needed because the old
+`BgProcessManager` was in-memory only — a restart lost every record, all output,
+and the live handle, and you cannot re-attach to a dead parent's stdout/stderr
+pipes.
+
+The fix moves output and exit status onto disk, independent of the gateway
+lifetime: each process redirects stdout/stderr to transient per-stream **spools**
+that the detached child keeps appending to; the gateway tails them into a single
+durable **combined projection** (`<bgId>.log`, a host file it owns and rewrites
+atomically, always within the 512KB/5000-line cap) and captures the real exit
+code from a per-process **status file** written by a POSIX shell wrapper (or the
+Node `bg-runner` helper on Windows without Git Bash; docker spawns run under
+`setsid` and mirror into host files). Metadata persists to
+`<stateDir>/bg-processes.json` via `BgProcessStore` (mirrors `SessionStore`:
+atomic write, 5 backups, epoch guard); per-process files live under
+`<stateDir>/bg-processes/<sessionId>/`. Restore is hooked into
+`restoreSessions()` and reconciles each `running` record as alive (re-attach +
+tail + capture eventual code), completed-during-downtime (read the status file),
+or unrecoverable (labelled terminal state, **never** a fabricated exit code).
+Kill and dismiss are distinct (`?action=kill` keeps the terminal record;
+`?action=dismiss` purges record + files); on-disk logs stay bounded at all times.
+
+Full behaviour, reconciliation cases, kill-vs-dismiss, and bounded-growth
+mechanics: [docs/bg-process-persistence.md](bg-process-persistence.md). Design
+record: [docs/design/persistent-bg-processes.md](design/persistent-bg-processes.md).
+Implementation: `src/server/agent/bg-process-manager.ts`, `bg-process-store.ts`,
+`bg-runner.ts`; client/UI in `src/app/session-manager.ts` and
+`src/ui/components/BgProcessPill.ts`.
 
 ---
 

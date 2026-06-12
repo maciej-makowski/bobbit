@@ -48,16 +48,30 @@ export interface PersistedSession {
 	streamingStartedAt?: number;
 	/** If this session is a delegate, the parent session ID */
 	delegateOf?: string;
+	/**
+	 * Delegate task instructions — the durable equivalent of a worker's goal
+	 * spec. Written once at spawn and rebuilt into the system prompt on restore
+	 * so a delegate survives a gateway restart with its task intact.
+	 */
+	instructions?: string;
+	/** Delegate task context key/value pairs, layered into the prompt on restore. */
+	context?: Record<string, string>;
 	/** First-class parent session ID for visible child sessions (not delegate lifecycle). */
 	parentSessionId?: string;
 	/** Kind discriminator for first-class child sessions, e.g. "pr-walkthrough". */
 	childKind?: string;
 	/** Whether the session should be treated as read-only by clients/tools. */
 	readOnly?: boolean;
-	/** PR walkthrough job metadata for session-hosted walkthrough children. */
-	walkthroughJobId?: string;
-	walkthroughChangesetId?: string;
-	walkthroughTargetKey?: string;
+	/**
+	 * Generic persisted terminal marker for a child session (orchestration-core
+	 * Decision E / Findings 3–4). Set server-side when a child's work is done
+	 * (e.g. a host-agents reviewer submitted, or was dismissed) so the generic
+	 * boot-reap (`shouldReapChildOnBoot` reading this field) removes it after a
+	 * restart even if a dismiss never ran. Carries NO pack/kind knowledge.
+	 */
+	childTerminal?: boolean;
+	/** Epoch ms when `childTerminal` was stamped. */
+	terminalAt?: number;
 	/** Explicit session-scoped tool allowlist captured at creation. Undefined means derive from role/default policy. */
 	allowedTools?: string[];
 	/** Which project this session belongs to */
@@ -135,9 +149,8 @@ export type UpdatableSessionFields = Pick<
 	| "parentSessionId"
 	| "childKind"
 	| "readOnly"
-	| "walkthroughJobId"
-	| "walkthroughChangesetId"
-	| "walkthroughTargetKey"
+	| "childTerminal"
+	| "terminalAt"
 	| "role"
 	| "teamGoalId"
 	| "teamLeadSessionId"
@@ -514,8 +527,7 @@ export class SessionStore {
 		"agentSessionFile", "branch", "worktreePath", "cwd", "repoPath",
 		"repoWorktrees", "archived", "archivedAt",
 		"sandboxed", "projectId", "goalId", "delegateOf",
-		"parentSessionId", "childKind", "readOnly", "walkthroughJobId",
-		"walkthroughChangesetId", "walkthroughTargetKey",
+		"parentSessionId", "childKind", "readOnly", "childTerminal", "terminalAt",
 		"role", "assistantType", "taskId", "staffId",
 		"teamGoalId", "teamLeadSessionId",
 		"modelProvider", "modelId",

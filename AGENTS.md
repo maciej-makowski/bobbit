@@ -9,8 +9,7 @@ npm run restart-server # Rebuild & restart after server changes
 npm run check          # Type-check server + web (no emit)
 npm run test:unit      # Unit phase — node:test logic + file:// browser fixtures, run concurrently (~90s)
 npm run test:e2e       # E2E phase — API (in-process) + browser (spawned gateway)
-npm run test:manual    # Manual integration — real agents/LLM + Docker (~5 min); ONLY gate-exempt path
-SCREENSHOTS=1 npm run test:manual  # + browser screenshots + HTML report
+npm run test:manual    # Manual integration — real agents/LLM + Docker (~5 min); ONLY gate-exempt path (SCREENSHOTS=1 adds screenshots + HTML report)
 ```
 
 UI changes (`src/ui/`, `src/app/`) hot-reload under `npm run dev:harness`. Server changes (`src/server/`) require `npm run restart-server`. Always `npm run check` before restarting. Sessions survive restarts via `.bobbit/state/sessions.json`.
@@ -20,10 +19,10 @@ UI changes (`src/ui/`, `src/app/`) hot-reload under `npm run dev:harness`. Serve
 Where things live. Use this to orient, then `rg` for the symbol.
 
 - **Server REST/WS**: `src/server/` — REST in `server.ts::handleApiRoute()`, WebSocket in `src/server/ws/`.
-- **Agent runtime**: `src/server/agent/` — sessions, manager, status, steer, respawn, store, project context.
+- **Agent runtime**: `src/server/agent/` — sessions, manager, status, steer, respawn, store, project context. `bash_bg` processes persist + re-attach across restart via `bg-process-{manager,store,runner}.ts`; state under `<stateDir>/bg-processes/`. See [docs/bg-process-persistence.md](docs/bg-process-persistence.md).
 - **MCP / tools**: `src/server/mcp/`, `defaults/tools/<group>/` (project overrides under `.bobbit/config/tools/<group>/`). Tool descriptions are budget-pinned by `tests/tool-description-budget.test.ts`.
 - **Skills**: `.claude/skills/<name>/SKILL.md`.
-- **Roles/tools/skills resolution**: `PackResolver` over one pack list (`src/server/agent/pack-*.ts`); `config-cascade.ts`/`slash-skills.ts` adapt it; built-in packs in `market-packs/` (`builtin-packs.ts`). See [docs/marketplace.md](docs/marketplace.md).
+- **Roles/tools/skills resolution**: unified `PackResolver` over one ordered pack list in `src/server/agent/pack-*.ts`; built-in packs in `market-packs/`. See [docs/marketplace.md](docs/marketplace.md).
 - **UI shell**: `src/app/` — state, render, message-reducer, dialogs, follow-tail.
 - **UI components**: `src/ui/` — components, `tools/renderers/`, `lazy/`.
 - **Tests**: `tests/` (unit), `tests/e2e/` (API), `tests/e2e/ui/` (browser), `tests/manual-integration/` (real agents + Docker).
@@ -39,13 +38,13 @@ Where things live. Use this to orient, then `rg` for the symbol.
 ## Testing
 
 - **UI-only changes** → `test:unit`. **Server changes** → `test:unit` + `test:e2e`. **Session lifecycle / sandbox / worktree / restart** → also `test:manual`.
-- **Test types**: unit·node (`tests/*.test.ts` via node:test), unit·browser (`tests/*.spec.ts`, file:// fixtures), API E2E (`tests/e2e/*.spec.ts`, in-process gateway), browser E2E (`tests/e2e/ui/*.spec.ts`, spawned gateway). **Phase invariant**: every test except `tests/manual-integration/**` runs in exactly one of unit/e2e, pinned by `tests/test-phase-invariant.test.ts`. See [docs/testing-strategy.md](docs/testing-strategy.md).
+- **Test types**: unit·node (`*.test.ts`), unit·browser (`*.spec.ts`, file://), API E2E (`tests/e2e/*.spec.ts`), browser E2E (`tests/e2e/ui/*.spec.ts`). Each test runs in exactly one phase, pinned by `tests/test-phase-invariant.test.ts`. See [docs/testing-strategy.md](docs/testing-strategy.md).
 - Tests run in isolation — never read/write `.bobbit/` directly; use the isolated dir from `e2e-setup.ts`.
 - **Never start background servers from bash** (`node server.js &`) — pipes hang the agent. Use `bash_bg`.
 - Prefer `file://` fixtures for new tests; use E2E only when you need a real server.
 - **Every user-facing feature MUST have a browser E2E** covering navigation, happy path, persistence across reload, cleanup/undo. Pattern: `tests/e2e/ui/settings.spec.ts`.
 - **Run tests before committing.** **No flaky tests** — every failure is a real bug.
-- See [docs/testing-strategy.md](docs/testing-strategy.md), [docs/testing-coverage.md](docs/testing-coverage.md).
+- See [docs/testing-coverage.md](docs/testing-coverage.md).
 
 ## Git conventions
 
@@ -69,4 +68,4 @@ AGENTS.md is loaded into **every** agent turn. Keep it small and general.
 
 ## Reference docs
 
-[docs/internals.md](docs/internals.md) · [docs/debugging.md](docs/debugging.md) · [docs/dev-workflow.md](docs/dev-workflow.md) · [docs/testing-strategy.md](docs/testing-strategy.md) · [docs/architecture.md](docs/architecture.md) · [docs/goals-workflows-tasks.md](docs/goals-workflows-tasks.md) · [docs/nested-goals.md](docs/nested-goals.md) · [docs/rest-api.md](docs/rest-api.md) · [docs/preview-architecture.md](docs/preview-architecture.md) · [docs/mcp-meta-tools.md](docs/mcp-meta-tools.md) · [docs/qa-testing.md](docs/qa-testing.md) · [docs/extension-host-authoring.md](docs/extension-host-authoring.md)
+[docs/internals.md](docs/internals.md) · [docs/debugging.md](docs/debugging.md) · [docs/logging.md](docs/logging.md) · [docs/dev-workflow.md](docs/dev-workflow.md) · [docs/testing-strategy.md](docs/testing-strategy.md) · [docs/architecture.md](docs/architecture.md) · [docs/goals-workflows-tasks.md](docs/goals-workflows-tasks.md) · [docs/nested-goals.md](docs/nested-goals.md) · [docs/rest-api.md](docs/rest-api.md) · [docs/preview-architecture.md](docs/preview-architecture.md) · [docs/mcp-meta-tools.md](docs/mcp-meta-tools.md) · [docs/qa-testing.md](docs/qa-testing.md) · [docs/extension-host-authoring.md](docs/extension-host-authoring.md)

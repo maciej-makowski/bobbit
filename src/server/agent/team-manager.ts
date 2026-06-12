@@ -85,6 +85,7 @@ export function formatElapsed(sinceMs: number): string {
 
 // Team lead extension path is resolved lazily via ToolManager.getExtensionPath().
 import { TaskManager } from "./task-manager.js";
+import type { OrchestrationCore } from "./orchestration-core.js";
 
 
 export interface TeamAgent {
@@ -154,6 +155,16 @@ export interface TeamManagerConfig {
 	projectContextManager?: ProjectContextManager;
 	/** Tool manager for resolving extension paths via the cascade */
 	toolManager?: ToolManager;
+	/**
+	 * OrchestrationCore — the goal-agnostic child-agent lifecycle core
+	 * (docs/design/orchestration-core.md). The team-manager is the GOAL ADAPTER:
+	 * it keeps all goal-specific logic (worktree-on-sub-branch, role injection,
+	 * gate checks, idle-nudge/stuck-watchdog, team_complete, maxConcurrent) but
+	 * routes the generic spawn/dismiss bookkeeping through the core so team
+	 * children are visible to the shared orchestration index. Behaviour-preserving
+	 * and additive — optional so the test path can omit it.
+	 */
+	orchestrationCore?: OrchestrationCore;
 }
 
 export class TeamManager {
@@ -833,9 +844,12 @@ export class TeamManager {
 				this.sessionToGoal.set(agent.sessionId, p.goalId);
 			}
 
-			console.log(
-				`[team-manager] Restored team for goal ${p.goalId} — team lead: ${p.teamLeadSessionId}, agents: ${entry.agents.length}`,
-			);
+			// Per-team restore detail is debug-only; the `Re-subscribed to events for
+			// N team(s)` summary covers the routine boot case.
+			if (process.env.BOBBIT_DEBUG)
+				console.log(
+					`[team-manager] Restored team for goal ${p.goalId} — team lead: ${p.teamLeadSessionId}, agents: ${entry.agents.length}`,
+				);
 		}
 	}
 
@@ -1814,6 +1828,41 @@ export class TeamManager {
 			this.sessionToGoal.set(session.id, goalId);
 			this.persistEntry(goalId);
 
+			// Goal adapter ↔ OrchestrationCore (M2). The team worker's CREATE call
+			// stays here (not routed through OrchestrationCore.spawn) on purpose —
+			// after an honest attempt, routing it through the core would REGRESS goal
+			// semantics that the goal-agnostic core deliberately does not model:
+			//   • Tool set: core.spawn computes the child's allowedTools as the OWNER's
+			//     effective set minus the spawn verbs. A team worker must instead get
+			//     ITS ROLE's default tools (reviewer ≠ team-lead-minus-spawn) — which
+			//     createSession derives from `roleName`. Routing through the core would
+			//     silently hand workers the lead's tool set.
+			//   • Worktree: team-manager PRE-CREATES the sub-branch worktree (with
+			//     subdir-offset / sandbox-container handling) and passes the resolved
+			//     cwd; core.spawn's sub-branch mode instead asks createSession to create
+			//     the worktree (worktreeOpts) — a different, double-creating strategy.
+			//   • Dropped fields: rolePrompt (resolved template text), workflowContext,
+			//     sandboxBaseBranch and `sandboxed` are goal-specific and absent from
+			//     SpawnOpts; the live `session` object (rpcClient.prompt + event
+			//     subscription below) is needed back, not just a ChildHandle.
+			// The core still OWNS tracking/lifecycle/reap for this child via
+			// registerChild: it is keyed on the team-lead in the shared index, so the
+			// unified orchestration verbs, archive cascade-reap and restart rebuild all
+			// cover it. Team children are nudged on restart by team-manager (the core's
+			// reminder filters childKind!=="team").
+			if (entry.teamLeadSessionId) {
+				try {
+					this.config.orchestrationCore?.registerChild({
+						sessionId: session.id,
+						ownerSessionId: entry.teamLeadSessionId,
+						childKind: "team",
+						title: this.sessionManager.getSession(session.id)?.title,
+					});
+				} catch (err) {
+					console.warn(`[team-manager] OrchestrationCore.registerChild failed for ${session.id}:`, err);
+				}
+			}
+
 			// Enrich task prompt with upstream dependency context if available
 			const enrichedTask = workflowContext ? task + workflowContext : task;
 
@@ -1909,7 +1958,9 @@ export class TeamManager {
 				// Idle: enqueue as a steered prompt so it drains immediately
 				this.sessionManager.enqueuePrompt(entry.teamLeadSessionId, message, { isSteered: true, source: "auto-nudge" });
 			}
-			console.log(`[team-manager] Notified team lead for goal ${goalId} (status=${teamLeadSession.status}): ${message}`);
+			// The full message body (agent completion summary) is already visible in
+			// the UI transcript — log only a concise reference here.
+			console.log(`[team-manager] Notified team lead for goal ${goalId} (status=${teamLeadSession.status}, ${message.length} chars)`);
 		} catch (err) {
 			console.error(`[team-manager] Failed to notify team lead for goal ${goalId}:`, err);
 		}
@@ -1955,7 +2006,7 @@ export class TeamManager {
 		} else {
 			this.sessionManager.enqueuePrompt(entry.teamLeadSessionId, message, { isSteered: true });
 		}
-		console.log(`[team-manager] Notified team lead of spec change for goal ${goalId} (${prevLen} → ${newLen} chars)`);
+		if (process.env.BOBBIT_DEBUG) console.log(`[team-manager] Notified team lead of spec change for goal ${goalId} (${prevLen} → ${newLen} chars)`);
 	}
 
 	notifyTeamLeadOfTaskCompletion(goalId: string, taskTitle: string, taskState: string): void {
@@ -1974,7 +2025,7 @@ export class TeamManager {
 		} else {
 			this.sessionManager.enqueuePrompt(entry.teamLeadSessionId, message, { isSteered: true, source: "task-notification" });
 		}
-		console.log(`[team-manager] Notified team lead of task completion for goal ${goalId}: ${taskTitle} → ${taskState}`);
+		if (process.env.BOBBIT_DEBUG) console.log(`[team-manager] Notified team lead of task completion for goal ${goalId}: ${taskTitle} → ${taskState}`);
 	}
 
 	/**
@@ -2002,6 +2053,9 @@ export class TeamManager {
 		}
 
 		const agent = entry.agents[agentIndex];
+
+		// Forget the worker from the OrchestrationCore runtime index (goal adapter).
+		try { this.config.orchestrationCore?.forgetChild(sessionId); } catch { /* best-effort */ }
 
 		// Unsubscribe from agent_end events before terminating
 		if (agent.unsubscribeEvent) {

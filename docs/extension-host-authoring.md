@@ -43,8 +43,9 @@ The renderer+action working example lives at `tests/fixtures/market-sources/retr
 | **Entrypoints** | `entrypoints/<ep>.yaml` (listed in `contents`) | Browser (launchers + deep-link routes) | `host.ui.navigate` / `openPanel` |
 | **Pack store** | *implicit* — no declaration | Gateway | `host.store.{get,put,list}` (pack-namespaced) |
 
-Plus the cross-cutting `host.session.*` (transcript reads, agent-driving posts, live events),
-available to any surface that holds a `host`.
+Plus the cross-cutting `host.session.*` (transcript reads, agent-driving posts, live events)
+and the server-side `host.agents.*` (launch + orchestrate child agents), available to surfaces
+that hold a `host`.
 
 **Why this layout.** Several of these contributions are already **pack-scoped** at runtime:
 a `panelId` is opened through the Host API by any surface in the pack, routes resolve through
@@ -332,6 +333,8 @@ The server-side `ctx.host` carries:
 - `ctx.host.store.{get,put,list}` — pack-namespaced persistence, scoped to the
   **server-derived** `packId` (you never pass an id).
 - `ctx.host.session.{readTranscript,readToolCall}` — own-session reads through the adapter.
+- `ctx.host.agents.{spawn,prompt,dismiss,list,read,status}` — launch + orchestrate child
+  agents owned by the bound session (poll-based, ambient). See [`host.agents`](#hostagents--launch-and-orchestrate-child-agents).
 
 There is deliberately **no** `ctx.host.callRoute` or `ctx.host.ui` server-side: a server
 handler reaches its own pack's route by calling the function directly, and a server module has
@@ -421,7 +424,8 @@ if (host.capabilities.has("callRoute")) { /* true on a current host */ }
 ```
 
 A current host reports all client flags `true` — `{ invokeAction, requestRender, callRoute,
-session, ui, store }`. `host.version` (`HOST_API_VERSION`, `1`) and `host.contractVersion`
+session, ui, store }`. The **server-side** capabilities are `{ session, store, agents }` (a
+current host reports all three `true`). `host.version` (`HOST_API_VERSION`, `1`) and `host.contractVersion`
 (`HOST_CONTRACT_VERSION`) identify the contract revision. All capabilities are purely additive
 (no signature churn), so code written against `capabilities` stays forward/backward-compatible.
 
@@ -525,6 +529,45 @@ by the **pack-addressed** `GET /api/ext/packs/:packId/panels/:panelId`. The clie
 panels from `GET /api/ext/contributions` (pack-scoped), not `/api/tools`.
 `host.ui.openPanel({ panelId })` stays **pack-relative** — the caller surface's bound `packId`
 resolves `panelId` → `{packId, panelId}` before fetching bytes.
+
+**Open a panel in a chosen session's view (`PanelTarget.sessionId`, contract v2).** By default
+`openPanel` mounts/focuses the tab in the **currently-active** session. A pack that has just
+created another session (e.g. a spawned child agent) can open the panel **in that session's
+view** by passing its id:
+
+```js
+// CONTRACT v2: open the pane in a chosen session, selecting it so the sidebar +
+// main view follow. Feature-detect; fall back to the active view on a v1 host.
+const target = { panelId: "pr-walkthrough.panel", params: {} };
+if (host.contractVersion >= 2) target.sessionId = childSessionId;
+host.ui.openPanel(target);
+```
+
+When `sessionId` is present the platform performs a **real session switch** to that session and
+mounts the tab **under it** instead of the active one. The switch is the *canonical*
+`connectToSession(sessionId, false)` path — the exact same full switch the sidebar drives (cache
+the outgoing panel, disconnect, set the hash route, update accessory/hue + localStorage, render,
+async-hydrate) — so the sidebar highlight, hash route, and main view all follow the pane. This is
+**not** a bare `selectedSessionId` assignment: a bare assignment skips the hash route and
+hydration, so the main view never actually follows. The platform reaches `connectToSession`
+through an **injected switcher hook** (`setSessionSwitcher` in `src/app/pack-panels.ts`, which
+`session-manager.ts` self-registers at bootstrap) rather than a static import, so the navigation
+logic lives entirely in the platform and the pack never touches navigation/router state —
+preserving pack purity. When the switcher is unset (unit fixtures that never load
+`session-manager`) it falls back to the v1 bare `selectedSessionId` assignment so the tab still
+keys under the target session. The field is **purely additive**: omitting it is the v1 behaviour,
+and packs that never set it are unaffected.
+
+This addition bumped **`HOST_CONTRACT_VERSION` 1 → 2** (the data/addressing-contract version;
+`HOST_API_VERSION` stays `1` because no method signature changed). Adding an optional field is
+additive, but the version bump lets a pack **feature-detect field support** via
+`host.contractVersion >= 2` and degrade gracefully (open in the active view) on an older host.
+No new capability flag is added — `openPanel` already lives under the `ui` capability.
+This capability was added so the PR-walkthrough pack could move its pane into a freshly
+spawned reviewer-child session; see
+[docs/design/pr-walkthrough-restore-ux.md](design/pr-walkthrough-restore-ux.md) for the
+motivating design and [docs/pr-walkthrough-panel.md](pr-walkthrough-panel.md#the-pane-lives-with-the-reviewer-child)
+for how the pack consumes it.
 
 **Panel conventions (enforced — identical to renderer rules):** theme tokens only; preserve any
 embedded iframe `sandbox` attribute (untrusted/LLM content goes in a `sandbox`ed iframe);
@@ -676,6 +719,134 @@ await host.session.postMessage({ role: "user", text: "re-run the tests", resumeT
   content-bound, server-minted permit — captured/replayed/forged/tampered frames are rejected.
 - **Cross-session posting is impossible** — the target is the WS connection's own session.
 
+### `host.agents` — launch and orchestrate child agents
+
+`host.agents` lets a **server-side** pack handler launch and orchestrate **child agents** —
+new, properly-scoped principals owned by the bound session — through the sanctioned
+in-process path. It is the pack-facing entry point to the shared `OrchestrationCore` that
+also backs the agent-facing `team_*` tools (see [docs/orchestration.md](orchestration.md)).
+
+It is **ambient**, like `host.session` / `host.store`: there is no manifest declaration and
+no consent line. Feature-detect with `ctx.host.capabilities.agents` (or
+`ctx.host.capabilities.has("agents")`), never member presence.
+
+```js
+// actions.mjs / routes.mjs — server-side handler
+export const actions = {
+  review: async (ctx, args) => {
+    const { childSessionId } = await ctx.host.agents.spawn({
+      instructions: "Review the diff in the current worktree and report risks.",
+      readOnly: true,                 // read-only child; always bare context
+      // model/thinkingLevel default to the bound session's current values
+    });
+
+    // POLL — there is NO blocking wait (see below).
+    let s = await ctx.host.agents.status(childSessionId);
+    while (s.status !== "idle" && s.status !== "terminated") {
+      await new Promise((r) => setTimeout(r, 1000));
+      s = await ctx.host.agents.status(childSessionId);
+    }
+
+    const transcript = await ctx.host.agents.read(childSessionId);
+    await ctx.host.agents.dismiss(childSessionId);   // terminate + archive
+    return { transcript };
+  },
+};
+```
+
+The six verbs:
+
+| Verb | What it does |
+|---|---|
+| `spawn(opts)` | Launch a child owned by the bound session. `opts`: `instructions` (required), `role?`, `model?`, `thinkingLevel?`, `readOnly?`, `context?`, `lifecycle?` (`"bare"` default / `"full"`), `deferInitialPrompt?`, `toolEnv?`. Returns `{ childSessionId }`. |
+| `prompt(childSessionId, message)` | Run-if-idle / queue a follow-up prompt. |
+| `status(childSessionId)` | Poll the child's live status (`idle` / `streaming` / `queued` / `preparing` / `terminated`). |
+| `list()` | List the bound session's `host.agents` children. |
+| `read(childSessionId, opts?)` | Read the child's transcript / output. |
+| `dismiss(childSessionId)` | Terminate + archive the child. |
+
+#### Poll-based — there is no blocking `wait`
+
+The worker tier terminates a handler call on timeout, so a handler **cannot** long-block
+waiting for a child. Instead it `spawn`s, then **polls** `status` / `list` / `read` — across
+multiple worker calls if the work outlives one call's timeout budget. (This is the one place
+the pack surface deliberately differs from the agent-tool `team_wait`, which *can* block.)
+
+#### Scoping — own children only, by source discriminator
+
+Every `host.agents` child is minted with `childKind === "host-agents"`, and **every verb
+filters to the bound session's children with that kind**. So a pack handler sees **only the
+children it spawned through `host.agents`** — never the session's `delegate` (agent-tool) or
+`team` children, and never any foreign session. There is **no parameter** to target the user
+or another session; the method simply does not exist (mirroring how `host.session` is
+own-session-only and has no foreign `postMessage`). Because the discriminator lives in the
+already-persisted `childKind`, scoping survives a restart with no new registry.
+
+> **Known simplification:** two packs sharing one bound session both see all `host-agents`
+> children of that session (the filter is per-session, not per-pack). This may be refined
+> later; it is not addressed now.
+
+#### Spawning a role-carrying, scoped child (the isolated-reviewer pattern)
+
+A pack can mint a child with a **precise, narrow toolset** and its own scoping, without any
+secret. This is exactly how the PR-walkthrough pack spawns its read-only reviewer; copy the
+pattern when you need an isolated principal that is *more* restricted than the owner.
+
+- **Ship a role and spawn with `role`.** A pack ships roles under `roles/*.yaml` (listed in
+  `pack.yaml` `contents.roles`). When `spawn({ role })` carries a role, the child is granted
+  **the role's** resolved tools — never the owner's. This **fails closed**: if the role's
+  grants cannot be resolved the spawn throws `ROLE_TOOLS_UNRESOLVED` rather than inheriting
+  the owner's broader tools, so a misconfigured role can never produce an over-privileged
+  child.
+- **The tool-granting boundary pattern (deny the group, allow it in the role).** To make a
+  tool reachable **only** from your role, set the tool's group to a default-**deny** and have
+  the role's `toolPolicies` re-`allow` it. A static role denies every *other* fixed group it
+  must not hold, plus the `mcp__` wildcard to deny all MCP servers at once. The PR-walkthrough
+  `pr-reviewer` role does exactly this: the `PR Walkthrough` group is default-deny, the role
+  allows it and denies everything else, so `submit_pr_walkthrough_yaml` is callable **only**
+  by the reviewer — a real authorization boundary that falls out of tool-granting, with **no
+  secret**.
+- **`deferInitialPrompt: true`** creates the **visible** child without auto-running
+  `instructions`. Start it later via `prompt`. Use this when you must persist routing state
+  (e.g. a pack-store `{ childSessionId → jobId }` binding) **before** the child's first tool
+  call, to close a spawn/binding race.
+- **`toolEnv`** sets **non-secret** environment variables on the child for tool-scoping
+  (read by tool policies, e.g. to scope a reviewer's `gh` reads to one PR). It is additive and
+  **cannot widen** the child's owner-inherited sandbox/credential scope — the gateway-owned
+  identity keys (`BOBBIT_SESSION_ID` / `BOBBIT_SESSION_SECRET`) are applied after it and
+  always win. Never put a secret in `toolEnv`.
+
+> **Authorizing a child's calls back to your server routes — use the verified caller session
+> id, not a secret.** A child's tools call the gateway over HTTP, carrying their
+> `X-Bobbit-Session-Secret`; the server resolves the **authentic caller session id** and you
+> route by a pack-store binding keyed on it. In Bobbit's single-user trust domain this is
+> *routing/correctness*, not a security boundary, so a per-job submit secret is unnecessary
+> (the PR-walkthrough migration deleted its old one). See
+> [docs/pr-walkthrough-panel.md § Launch model](pr-walkthrough-panel.md#launch-model-the-isolated-reviewer-child).
+
+> **⚠️ `host.callRoute` runs in a FRESH worker per call — module singletons do not persist.**
+> `ModuleHost.invoke` spins up a new worker for each route call, so a module-scoped variable
+> (a `Map`, a counter, a cache) is **not** reliable cross-call state. Persist anything that
+> must survive between calls in the **pack store** (`ctx.host.store`). A module-scoped value
+> only serializes calls that happen to share a worker — useful as a best-effort same-worker
+> guard, but never as a correctness guarantee. (Strict cross-call atomicity, e.g. an
+> exactly-one concurrent-launch claim, would need a store compare-and-set the pack store does
+> not expose; design for last-write-wins + a reconcile instead.)
+
+#### Invariants
+
+- **No grandchildren.** `host.agents.spawn` is **denied for a bound child session** (it calls
+  the same core recursion guard the agent tools use) — a child cannot spawn its own children.
+- **Sandbox/credential inheritance — the one hard invariant.** The child inherits the bound
+  session's sandbox and credential scope and **cannot exceed it**. The pack receives
+  orchestration **verbs**, not transport: no token, no raw `fetch`, no privilege escalation.
+
+`host.agents` is exercised by a deterministic, **no-LLM fixture pack** (its child runs a
+canned scripted transcript), so the spawn→prompt→poll→read→dismiss test is non-flaky and
+stays in the e2e phase. Its first production consumer is the **PR-walkthrough pack**, which
+spawns its isolated read-only `pr-reviewer` child this way — the migration that added
+`deferInitialPrompt`, `toolEnv`, and fail-closed role-tool resolution.
+
 ## Activation controls (Market UI)
 
 On the Market installed-pack surface you can toggle a pack's **user-facing entities** per
@@ -774,7 +945,8 @@ below and [docs/marketplace.md](marketplace.md#built-in-first-party-packs)).
 
 ```
 pr-walkthrough/
-  pack.yaml                              # contents.tools: []  +  contents.entrypoints: [4 files]  +  routes: { module: lib/routes.mjs, names: [bundle, publish] }
+  pack.yaml                              # contents.tools: []  +  contents.roles: [pr-reviewer]  +  contents.entrypoints: [4 files]  +  routes: { module: lib/routes.mjs, names: [bundle, publish, run, status, recover] }
+  roles/pr-reviewer.yaml                 # read-only reviewer role; allows the "PR Walkthrough" group, denies all else
   panels/pr-walkthrough-panel.yaml       # id: pr-walkthrough.panel, entry: ../lib/panel.js
   entrypoints/
     pr-walkthrough-open.yaml             # composer-slash launcher
@@ -783,16 +955,17 @@ pr-walkthrough/
     pr-walkthrough-route.yaml            # kind: route, routeId: pr-walkthrough
   lib/
     panel.js                             # built viewer panel
-    routes.mjs                           # hand-authored pack-level routes (bundle, publish)
+    routes.mjs                           # hand-authored pack-level routes (bundle, publish, run, status, recover)
 ```
 
 | Built-in piece | Pack contribution |
 |---|---|
-| `PrWalkthroughPanel` viewer | `panels/pr-walkthrough-panel.yaml` (`pr-walkthrough.panel` → `../lib/panel.js`), opened via `host.ui.openPanel({ panelId })` — entrypoints carry **no** hard-coded `jobId`; the panel derives the real job + base/head SHAs from the **current session's** submitted YAML |
-| `handlePrWalkthroughApiRoute` endpoints | `pack.yaml` `routes:` (`lib/routes.mjs`, names `bundle`/`publish`), reached via `host.callRoute("bundle", …)` (the route resolves the session's own job; the caller does not pass a `jobId`) — **never** a raw fetch |
-| `walkthrough-store.ts` state | **implicit store** → `host.store.*`, pack-scoped |
+| `PrWalkthroughPanel` viewer | `panels/pr-walkthrough-panel.yaml` (`pr-walkthrough.panel` → `../lib/panel.js`). Entrypoints carry **no** hard-coded `jobId`; the panel launches via the `run` route and polls `status` (see below). After `run` returns the child id it opens the pane **in the reviewer child's session view** via the contract-v2 `host.ui.openPanel({ panelId, sessionId: childSessionId })` (a real session switch — see [`PanelTarget.sessionId`](#panels--persistent-side-panels-hostuiopenpanel)), feature-detected with `host.contractVersion >= 2` and falling back to the active view on a v1 host |
+| Launch — a real isolated reviewer | the `run` route calls **`host.agents.spawn({ role: "pr-reviewer", readOnly: true, lifecycle: "full", deferInitialPrompt: true, toolEnv })`** to mint a visible read-only child — NOT `host.session.postMessage`; the user's own agent is never driven |
+| `handlePrWalkthroughApiRoute` endpoints | `pack.yaml` `routes:` (`lib/routes.mjs`, names `bundle`/`publish`/`run`/`status`/`recover`), reached via `host.callRoute(…)` (the route resolves the session's own job/binding; the caller does not pass a `jobId`) — **never** a raw fetch |
+| `walkthrough-store.ts` state + reviewer routing | **implicit store** → `host.store.*`, pack-scoped — also holds the `binding/`, `reviewer/`, `submitted/`, and `last/` routing keys for the reviewer child |
 | Deep-link + launchers | four `entrypoints/*.yaml` — three launchers (composer-slash, git-widget-button, command-palette) **and** a `kind:"route"` deep-link (`routeId:"pr-walkthrough"`) |
-| Bespoke transcript access | `host.session.readToolCall(toolUseId)` (own-session, via the adapter) |
+| Reload recovery | the `recover` route returns the persisted YAML so the **Load walkthrough** gesture re-renders cards (the reviewer's submit call lives in the dismissed child, not the owner transcript). It authorizes from **either bound principal**: it checks a **child self-recover** branch **first** — when the caller is the reviewer child it resolves from its own `binding/<childSessionId>` — and otherwise falls back to the owner-scoped `last/<sessionId>` pointer; `host.session.readToolCall` remains a legacy fallback |
 | Live `git diff` recompute | ambient `child_process`/`fs` → the `bundle` route runs **real `git`** live in the confined worker (`process.cwd()` = session worktree) |
 
 Two non-obvious decisions worth copying:
@@ -826,18 +999,21 @@ Why do this? It makes the pack contract **load-bearing for production code**, no
 if the Host API can't express a real shipped feature, the gap shows up in the app, not in a litmus.
 Two pieces of the migration are worth understanding when authoring your own ambitious pack:
 
-- **Launch re-expression — drive the current agent, don't mint a new principal.** The deleted
+- **Launch re-expression — mint a real isolated reviewer child via `host.agents`.** The deleted
   built-in git-widget button launched a *new dedicated child walkthrough agent* (a fresh session
-  with its own `allowedTools`). Spawning a new principal is **not pack-expressible by design** — a
-  pack acts within the calling session's authority. So the pack re-expresses launch differently:
-  the entrypoints just open the panel (`host.ui.navigate` to `#/ext/pr-walkthrough`), and the panel
-  offers a gesture-gated **"Run PR walkthrough"** button that calls `host.session.postMessage` to
-  direct the **current** session's agent to run the walkthrough using the retained agent tools
-  (`readonly_bash` / `read_pr_walkthrough_bundle` / `submit_pr_walkthrough_yaml`). The agent emits
-  its YAML; the panel reads that tool call (`host.session.readToolCall`) → `host.callRoute("publish")`
-  → renders. This preserves the "click → walkthrough happens" UX without any privilege-minting
-  escape hatch. The panel implements a small state machine (`no-submission` → `posting` → `waiting`
-  → `publishing` → `rendered`, with timeout/refusal/missing-tool error states) so the launch flow is
+  with its own `allowedTools`). When the pack was first written, spawning a new principal was **not
+  pack-expressible** — a pack acted only within the calling session's authority — so an interim
+  revision re-expressed launch by driving the *current* session's agent via
+  `host.session.postMessage`. That interim model is now superseded: with the ambient
+  [`host.agents`](#hostagents--launch-and-orchestrate-child-agents) capability, the pack's `run`
+  route **mints a real, isolated, read-only `pr-reviewer` child** (`host.agents.spawn` with
+  `deferInitialPrompt` + `toolEnv` + the pack-shipped role) and polls it via the `status` route —
+  the user's own agent is never driven. This is the canonical isolated-reviewer pattern; copy it
+  for any pack that needs a scoped child principal (see
+  [Spawning a role-carrying, scoped child](#spawning-a-role-carrying-scoped-child-the-isolated-reviewer-pattern)
+  and [docs/pr-walkthrough-panel.md § Launch model](pr-walkthrough-panel.md#launch-model-the-isolated-reviewer-child)).
+  The panel implements a small state machine (`running` → `submitted` → `publishing` → `rendered`,
+  with timeout/error states + a `recover`-backed Load gesture for reloads) so the launch flow is
   resilient, not just the happy path — see `market-packs/pr-walkthrough/src/panel.js`.
 - **Shared synthesis, one source of truth, bundled into the pack.** The viewer must turn the
   submitted production YAML into the same cards the deleted built-in produced. That synthesis
@@ -850,12 +1026,14 @@ Two pieces of the migration are worth understanding when authoring your own ambi
   duplicated logic to drift.
 
 What stays agent-tool-side is the explicit carve-out: the `submit_pr_walkthrough_yaml` /
-`read_pr_walkthrough_bundle` / `readonly_bash` tools, `WalkthroughAgentManager` and its
-`/launch` + `/resolve` + `/export/*` lifecycle, and GitHub network/auth. Those are genuine *agent*
-capabilities (model-backed synthesis, credentialed network), not contribution surfaces. Only the
-viewer / route / store / deep-link / user-facing launch-gesture surfaces moved to the pack. Full
-keep-vs-delete detail is in [docs/design/pr-walkthrough-pack-deletion.md](design/pr-walkthrough-pack-deletion.md)
-and [docs/design/built-in-first-party-packs.md §8](design/built-in-first-party-packs.md).
+`read_pr_walkthrough_bundle` / `readonly_bash` tools, the `/resolve` + `/export/*` lifecycle, and
+GitHub network/auth. Those are genuine *agent* capabilities (model-backed synthesis, credentialed
+network), not contribution surfaces. The reviewer toolset is granted by the pack-shipped
+`pr-reviewer` role, and the legacy `WalkthroughAgentManager` launcher, `/launch` route, and
+submit-proof secret were **deleted** by the `host.agents` migration. Full keep-vs-delete detail is
+in [docs/design/pr-walkthrough-pack-deletion.md](design/pr-walkthrough-pack-deletion.md),
+[docs/design/built-in-first-party-packs.md §8](design/built-in-first-party-packs.md), and
+[docs/design/pr-walkthrough-host-agents-migration.md](design/pr-walkthrough-host-agents-migration.md).
 
 ## Security checklist
 

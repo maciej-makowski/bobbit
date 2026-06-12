@@ -25,6 +25,7 @@ import { paceAndSend, PACE_TIMEOUT_MS } from "./replay-pacing.js";
 import { discoverSlashSkills, discoverSlashSkillsResolved, getSkillDirectories, getSlashSkill, buildSlashSkillPrompt, invalidateSlashSkillsCache, type SkillMarketContext } from "./skills/slash-skills.js";
 import { enumerateFiles } from "./skills/file-enumeration.js";
 import { TeamManager, GateDependencyError } from "./agent/team-manager.js";
+import { OrchestrationCore, OrchestrationCoreError, isSettledStatus, type WaitResult } from "./agent/orchestration-core.js";
 import { tryHandleNestedGoalRoute, listDescendants } from "./agent/nested-goal-routes.js";
 import { walkGoalSubtree, cascadeSubtree as cascadeGoalSubtree } from "./agent/goal-subtree.js";
 import type { Workflow } from "./agent/workflow-store.js";
@@ -64,7 +65,7 @@ import {
 import { getPromptSections, initPromptDirs, loadPersistedPromptSections } from "./agent/system-prompt.js";
 import { recordElapsed } from "./agent/profiling.js";
 import { cpuDiagnosticsEnabled, getCpuDiagnostics } from "./agent/cpu-diagnostics.js";
-import { resolveGrantPolicy } from "./agent/tool-activation.js";
+import { resolveGrantPolicy, computeEffectiveAllowedTools } from "./agent/tool-activation.js";
 import { parseMcpToolName } from "./mcp/mcp-meta.js";
 import { initSkillSidecarDir } from "./skills/skill-sidecar.js";
 import {
@@ -82,6 +83,42 @@ import { sessionFileRead, type SessionFsContext } from "./agent/session-fs.js";
 import { readTranscript, TranscriptReaderError } from "./agent/transcript-reader.js";
 
 import { isGitRepo, getRepoRoot, resolveSandboxMountRoot, shouldSkipRemotePush, stripTokenFromGitUrl, detectPrimaryBranch, parseBaseRef, detectBaseRefFromRemote, resolveBaseRef, refExistsInRepo } from "./skills/git.js";
+
+/**
+ * Render the `team_wait` result text (orchestration-core design §9). Returns on
+ * the first SETTLED child (idle or terminal); enumerates every awaited child's
+ * status and instructs the agent to call `team_wait` again for the remainder.
+ */
+function formatWaitText(result: WaitResult): string {
+	const lines: string[] = [];
+	const first = result.firstIdle;
+	if (first) {
+		const fh = result.statuses.find(s => s.sessionId === first);
+		const header = result.firstIsTerminal ? "First settled child" : "First idle child";
+		lines.push(`${header}: ${first}${fh?.title ? ` ("${fh.title}")` : ""}`);
+		if (result.outputTail) {
+			lines.push("--- output tail ---");
+			lines.push(result.outputTail);
+		}
+		lines.push("");
+	}
+	lines.push(`Awaited children (${result.statuses.length}):`);
+	for (const s of result.statuses) {
+		lines.push(`  • ${s.sessionId}${s.title ? ` "${s.title}"` : ""} — ${s.status}`);
+	}
+	if (result.remaining === 0) {
+		lines.push("All awaited children are settled.");
+	} else {
+		// Enumerate the REMAINING (non-settled) child ids so a literal re-call of
+		// team_wait awaits ONLY them — otherwise an omitted child_session_ids
+		// defaults to ALL tracked children and re-returns the same already-idle
+		// child. The agent should pass exactly these ids on the next call.
+		const remainingIds = result.statuses.filter(s => !isSettledStatus(s.status)).map(s => s.sessionId);
+		lines.push(`Remaining: ${result.remaining} child(ren) not yet settled.`);
+		lines.push(`➜ Process this result now, then call team_wait again to await the remaining children — pass child_session_ids: [${remainingIds.join(", ")}].`);
+	}
+	return lines.join("\n");
+}
 // Helper used by PUT /api/projects/:id/config to validate `base_ref` branch grammar.
 // Mirrors git's `check-ref-format` predicate in pure JS so the API can respond
 // without an exec round-trip. See docs/design/base-ref.md.
@@ -203,7 +240,6 @@ import { CookieStore, issueIfMissing as issueCookieIfMissing, tryAuth as cookieT
 import { authorizeChildrenMutation } from "./auth/children-mutation-authz.js";
 import { handlePreviewRequest } from "./preview/content-route.js";
 import { handlePrWalkthroughApiRoute } from "./pr-walkthrough/routes.js";
-import { WalkthroughAgentManager } from "./pr-walkthrough/walkthrough-agent-manager.js";
 import { normalizeTrustedHosts } from "../shared/pr-walkthrough/url-safety.js";
 import { progressBus as searchProgressBus } from "./search/progress-bus.js";
 import { isSandboxAllowed } from "./auth/sandbox-guard.js";
@@ -1159,17 +1195,77 @@ export function createGateway(config: GatewayConfig) {
 	// scoped store is instantiated solely so construction doesn't require a project.
 	const firstCtxForInit = projectContextManager.all().next().value as import("./agent/project-context.js").ProjectContext | undefined;
 	const taskStore = firstCtxForInit ? firstCtxForInit.taskStore : new TaskStore(stateDir);
+	// OrchestrationCore (docs/design/orchestration-core.md) — the ONE goal-agnostic
+	// child-agent lifecycle implementation. Constructed near teamManager and wired
+	// back into sessionManager (boot index rebuild + restart reminder) and into
+	// teamManager (goal adapter routes spawn/dismiss through it). The
+	// `/api/sessions/:id/orchestrate/*` routes call it in-process; sub-goal C's
+	// `host.agents` capability will call the SAME core.
+	const orchestrationCore = new OrchestrationCore({
+		sessionManager,
+		// Inherit the owner's CURRENT model (same shape as the pr-walkthrough
+		// resolveParentInitialModel resolver) so a child no longer drops to the
+		// system default.
+		resolveSessionModel: (sessionId: string) => {
+			const persisted = sessionManager.getPersistedSession(sessionId);
+			return persisted?.modelProvider && persisted.modelId ? `${persisted.modelProvider}/${persisted.modelId}` : undefined;
+		},
+		resolveSessionThinking: (sessionId: string) => sessionManager.getSession(sessionId)?.spawnPinnedThinkingLevel,
+		// Resolve the owner's FULL effective tool catalogue so the core can
+		// synthesize an explicit "all-except-spawn-verbs" allow-list when the owner
+		// is unrestricted (orchestration-core §7 — a child must never have a spawn
+		// verb registered). Mirrors SessionManager.resolveEffectiveAllowedTools.
+		resolveEffectiveTools: (sessionId: string) => {
+			const session = sessionManager.getSession(sessionId);
+			if (session?.allowedTools && session.allowedTools.length > 0) return session.allowedTools;
+			const ps = sessionManager.getPersistedSession(sessionId);
+			const roleName = session?.role ?? ps?.role
+				?? ((session?.assistantType ?? ps?.assistantType) ? "assistant" : "general");
+			const role = roleManager.getRole(roleName);
+			if (!role) return undefined;
+			return computeEffectiveAllowedTools(toolManager, role, groupPolicyStore, sessionManager.getMcpManager() ?? undefined).map(e => e.name);
+		},
+		// Resolve a ROLE's effective tool grants for role-carrying spawns
+		// (orchestration-core Decision A.2 — FAIL CLOSED). Resolves pack-contributed
+		// roles (e.g. the pr-walkthrough pack's `pr-reviewer`) via the config cascade
+		// FIRST — the same source session-setup uses (session-setup.ts:441) — then
+		// falls back to roleManager so EVERY built-in role still resolves (backward
+		// compat: a role-carrying team_delegate spawn must not fail closed). Mirrors
+		// the resolveEffectiveTools grant pipeline above.
+		resolveRoleAllowedTools: (roleName: string, projectId?: string) => {
+			const cascadeRole = configCascade.resolveRoles(projectId).find(r => r.item.name === roleName)?.item;
+			const role = cascadeRole ?? roleManager.getRole(roleName);
+			if (!role) return undefined;
+			return computeEffectiveAllowedTools(toolManager, role, groupPolicyStore, sessionManager.getMcpManager() ?? undefined).map(e => e.name);
+		},
+	});
+	sessionManager.setOrchestrationCore(orchestrationCore);
+
 	const teamManager = new TeamManager(sessionManager, {
 		colorStore,
 		taskManager: new TaskManager(taskStore),
 		roleStore,
 		projectContextManager,
 		toolManager,
+		orchestrationCore,
 	});
-	const bgProcessManager = new BgProcessManager((sessionId: string) => {
-		const session = sessionManager.getSession(sessionId);
-		return session?.clients;
-	});
+	const bgProcessManager = new BgProcessManager(
+		(sessionId: string) => {
+			const session = sessionManager.getSession(sessionId);
+			return session?.clients;
+		},
+		undefined,
+		(sessionId: string) => {
+			// Resolve the per-project bg-process store for this session.
+			try {
+				const projectId = sessionManager.getSession(sessionId)?.projectId
+					?? (sessionManager as any).getPersistedSession?.(sessionId)?.projectId;
+				return sessionManager.getBgProcessStore(projectId);
+			} catch {
+				return undefined;
+			}
+		},
+	);
 	// Expose bg process manager for API routes and session cleanup
 	(sessionManager as any).bgProcessManager = bgProcessManager;
 	const rateLimiter = new RateLimiter();
@@ -1301,7 +1397,7 @@ export function createGateway(config: GatewayConfig) {
 			// Enable via BOBBIT_TIMING_LOG=1 to print "[timing] METHOD path ms" for each API call.
 			const _timingEnabled = process.env.BOBBIT_TIMING_LOG === "1";
 			const _timingStart = _timingEnabled ? performance.now() : 0;
-			await handleApiRoute(url, req, res, sessionManager, config, colorStore, prStatusStore, teamManager, roleManager, toolManager, projectContextManager, bgProcessManager, staffManager, verificationHarness, preferencesStore, projectConfigStore, groupPolicyStore, broadcastToGoal, broadcastToAll, sandboxManager, projectRegistry, configCascade, sandboxScope, sandboxTokenStore, reviewAnnotationStore, broadcastToSession, roleStore, inboxManager, prWalkthroughAgentManager, marketplaceSourceStore, marketplaceInstaller, cookieStore, actionDispatcher, routeDispatcher, routeRegistry, packContributionRegistry);
+			await handleApiRoute(url, req, res, sessionManager, config, colorStore, prStatusStore, teamManager, orchestrationCore, roleManager, toolManager, projectContextManager, bgProcessManager, staffManager, verificationHarness, preferencesStore, projectConfigStore, groupPolicyStore, broadcastToGoal, broadcastToAll, sandboxManager, projectRegistry, configCascade, sandboxScope, sandboxTokenStore, reviewAnnotationStore, broadcastToSession, roleStore, inboxManager, marketplaceSourceStore, marketplaceInstaller, cookieStore, actionDispatcher, routeDispatcher, routeRegistry, packContributionRegistry);
 			if (_timingEnabled) {
 				const dur = performance.now() - _timingStart;
 				if (dur >= 100) console.log(`[timing] ${req.method} ${url.pathname}${url.search} ${dur.toFixed(1)}ms`);
@@ -1551,23 +1647,6 @@ export function createGateway(config: GatewayConfig) {
 		});
 	}
 
-	const prWalkthroughAgentManager = new WalkthroughAgentManager({
-		defaultCwd: config.defaultCwd,
-		stateDir,
-		sessionManager,
-		preferencesStore,
-		broadcast: broadcastToAll,
-		preflightGithubLaunch: true,
-		resolveSessionCwd: (sessionId: string) => {
-			const live = sessionManager.getSession(sessionId);
-			const persisted = sessionManager.getPersistedSession(sessionId);
-			return live?.worktreePath || persisted?.worktreePath || live?.cwd || persisted?.cwd;
-		},
-		resolveSessionModel: (sessionId: string) => {
-			const persisted = sessionManager.getPersistedSession(sessionId);
-			return persisted?.modelProvider && persisted.modelId ? `${persisted.modelProvider}/${persisted.modelId}` : undefined;
-		},
-	});
 
 	// Bridge search index progress bus → WS. Progress events are debounced
 	// to 500ms per-project (design §9). Complete + error events pass through.
@@ -1724,6 +1803,8 @@ export function createGateway(config: GatewayConfig) {
 		sessionManager,
 		/** @internal Exposed for in-process E2E tests to drive supervisor-respawn directly. */
 		teamManager,
+		/** @internal Exposed for in-process E2E tests to drive restart-survival (rebuildIndexFromPersisted + remindOwnersWithLiveChildren) directly. */
+		orchestrationCore,
 		bgProcessManager,
 		projectContextManager,
 		async start(): Promise<number> {
@@ -1893,7 +1974,6 @@ export function createGateway(config: GatewayConfig) {
 
 			// Restore persisted sessions before accepting connections
 			await sessionManager.restoreSessions();
-			prWalkthroughAgentManager.restore();
 
 			// One-shot legacy cost backfill: stamp `goalId` on cost entries
 			// that pre-date the forward-stamp fix (commit a4050f59). Runs
@@ -2326,6 +2406,7 @@ async function handleApiRoute(
 	colorStore: ColorStore,
 	prStatusStore: PrStatusStore,
 	teamManager: TeamManager,
+	orchestrationCore: OrchestrationCore,
 	roleManager: RoleManager,
 	toolManager: ToolManager,
 	projectContextManager: ProjectContextManager,
@@ -2346,7 +2427,6 @@ async function handleApiRoute(
 	_broadcastToSession?: (sessionId: string, event: any) => void,
 	roleStore?: RoleStore,
 	inboxManager?: InboxManager,
-	prWalkthroughAgentManager?: WalkthroughAgentManager,
 	marketplaceSourceStore?: MarketplaceSourceStore,
 	marketplaceInstaller?: MarketplaceInstaller,
 	cookieStore?: CookieStore,
@@ -2424,7 +2504,6 @@ async function handleApiRoute(
 		readBody,
 		sessionManager,
 		broadcast: broadcastToAll,
-		walkthroughAgentManager: prWalkthroughAgentManager,
 		resolveSessionCwd: (sessionId: string) => {
 			const live = sessionManager.getSession(sessionId);
 			const persisted = sessionManager.getPersistedSession(sessionId);
@@ -2436,6 +2515,13 @@ async function handleApiRoute(
 		},
 		preferencesStore,
 		sandboxScope,
+		// host.agents reviewer migration (design Decisions C/D/E): the binding-routed
+		// submit-yaml/bundle paths resolve the jobId from the pack-store binding keyed
+		// by the verified caller session id, and submit-yaml server-dismisses the
+		// reviewer child on terminal (terminal-synchronous reap).
+		orchestrationCore,
+		packStore: getPackStore(),
+		sessionSecretStore: sessionManager.sessionSecretStore,
 	})) return;
 
 	// ── Cross-project helper functions ─────────────────────────────
@@ -4086,9 +4172,6 @@ async function handleApiRoute(
 					parentSessionId: archived.parentSessionId,
 					childKind: archived.childKind,
 					readOnly: archived.readOnly,
-					walkthroughJobId: archived.walkthroughJobId,
-					walkthroughChangesetId: archived.walkthroughChangesetId,
-					walkthroughTargetKey: archived.walkthroughTargetKey,
 					role: archived.role,
 					accessory: archived.accessory,
 					teamGoalId: archived.teamGoalId,
@@ -4129,9 +4212,6 @@ async function handleApiRoute(
 			parentSessionId: sessionPs?.parentSessionId ?? session.parentSessionId,
 			childKind: sessionPs?.childKind ?? session.childKind,
 			readOnly: sessionPs?.readOnly ?? session.readOnly,
-			walkthroughJobId: sessionPs?.walkthroughJobId ?? session.walkthroughJobId,
-			walkthroughChangesetId: sessionPs?.walkthroughChangesetId ?? session.walkthroughChangesetId,
-			walkthroughTargetKey: sessionPs?.walkthroughTargetKey ?? session.walkthroughTargetKey,
 			role: session.role,
 			accessory: session.accessory,
 			teamGoalId: session.teamGoalId,
@@ -4401,9 +4481,6 @@ async function handleApiRoute(
 				parentSessionId: typeof body?.parentSessionId === "string" ? body.parentSessionId : undefined,
 				childKind: typeof body?.childKind === "string" ? body.childKind : undefined,
 				readOnly: typeof body?.readOnly === "boolean" ? body.readOnly : undefined,
-				walkthroughJobId: typeof body?.walkthroughJobId === "string" ? body.walkthroughJobId : undefined,
-				walkthroughChangesetId: typeof body?.walkthroughChangesetId === "string" ? body.walkthroughChangesetId : undefined,
-				walkthroughTargetKey: typeof body?.walkthroughTargetKey === "string" ? body.walkthroughTargetKey : undefined,
 			});
 
 			// Set assistant role metadata if no explicit role was provided
@@ -4440,9 +4517,6 @@ async function handleApiRoute(
 				parentSessionId: session.parentSessionId,
 				childKind: session.childKind,
 				readOnly: session.readOnly,
-				walkthroughJobId: session.walkthroughJobId,
-				walkthroughChangesetId: session.walkthroughChangesetId,
-				walkthroughTargetKey: session.walkthroughTargetKey,
 				reattemptGoalId,
 				...(provisionalProjectId ? { provisionalProjectId } : {}),
 			}, 201);
@@ -5558,6 +5632,11 @@ async function handleApiRoute(
 			contributionId: ident.contributionId,
 			packStore: getPackStore(),
 			readOwnTranscript,
+			// Sub-goal A seam — sub-goal C consumes this to back `host.agents`.
+			orchestrationCore,
+			// Sub-goal C: live status reader for host.agents.status/list (the core has
+			// no public status accessor).
+			readChildStatus: (id: string) => sessionManager.getSession(id)?.status,
 		});
 		// The session working dir the confined worker uses as its process.cwd() (tool
 		// parity — prefer the worktree path; fall back to the recorded cwd).
@@ -5926,6 +6005,11 @@ async function handleApiRoute(
 			contributionId: ident.contributionId,
 			packStore: getPackStore(),
 			readOwnTranscript,
+			// Sub-goal A seam — sub-goal C consumes this to back `host.agents`.
+			orchestrationCore,
+			// Sub-goal C: live status reader for host.agents.status/list (the core has
+			// no public status accessor).
+			readChildStatus: (id: string) => sessionManager.getSession(id)?.status,
 		});
 		const start = Date.now();
 		try {
@@ -8485,12 +8569,69 @@ async function handleApiRoute(
 		return;
 	}
 
+	// Finding #6 fallback: a team-lead's `team_delegate(non_blocking)` child is NOT a
+	// goal team member, so the goal /team/* routes would reject it — yet the team-lead
+	// holds team_prompt/dismiss/steer/abort (registered goal-scoped via team/extension.ts,
+	// NOT the own-child variants in agent/extension.ts, to avoid double-registration).
+	// When the target is an own child of THIS goal's team-lead (tracked by the shared
+	// OrchestrationCore), route the verb through the core so the documented verbs work
+	// on the lead's own delegate helpers. Goal-member behaviour is unchanged.
+	const teamLeadOwnChildOwner = (goalId: string, targetId: string): string | undefined => {
+		const lead = teamManager.getTeamState(goalId)?.teamLeadSessionId;
+		if (!lead) return undefined;
+		return orchestrationCore.list(lead).some(h => h.sessionId === targetId) ? lead : undefined;
+	};
+	// H3 authz — the own-child fallback MUST enforce owner→caller authz, exactly
+	// like /orchestrate/* (server.ts ~9310). The goal /team/* routes accept a
+	// sandbox-scoped token, so without this a same-goal agent that learns a
+	// helper child's session id could prompt/steer/abort/dismiss the team-lead's
+	// PRIVATE team_delegate child. Bind to the unforgeable per-session secret and
+	// require the AUTHENTIC caller to BE the team-lead owner. Goal-MEMBER
+	// operations (the normal /team/* path) are unaffected — this guards the
+	// own-child fallback ONLY. Returns the owner id when authorized, a `denied`
+	// sentinel when the target IS an own child but the caller is not its owner,
+	// or `undefined` when the target is not an own child (normal path continues).
+	const resolveOwnChildOwner = (goalId: string, targetId: string): { owner: string } | { denied: true } | undefined => {
+		const owner = teamLeadOwnChildOwner(goalId, targetId);
+		if (!owner) return undefined;
+		const h = req.headers as Record<string, string | string[] | undefined>;
+		const secretHeader = h["x-bobbit-session-secret"];
+		const secret = Array.isArray(secretHeader) ? secretHeader[0] : secretHeader;
+		const authenticCaller = sessionManager.sessionSecretStore.resolveSessionIdBySecret(
+			typeof secret === "string" && secret.trim() ? secret.trim() : undefined,
+		);
+		if (!authenticCaller || authenticCaller !== owner) return { denied: true };
+		return { owner };
+	};
+	const denyOwnChild = () => json({ error: "Caller session is not the owner of this child agent", code: "NOT_OWNER" }, 403);
+	const ocStatusForTeamFallback = (err: unknown): number => {
+		if (err instanceof OrchestrationCoreError) {
+			if (err.code === "NOT_STREAMING") return 409;
+			if (err.code === "NOT_OWN_CHILD" || err.code === "NO_GRANDCHILDREN") return 403;
+			return 400;
+		}
+		return 500;
+	};
+
 	// POST /api/goals/:id/team/dismiss — dismiss a role agent
 	const teamDismissMatch = url.pathname.match(/^\/api\/goals\/([^/]+)\/(?:team|swarm)\/dismiss$/);
 	if (teamDismissMatch && req.method === "POST") {
 		const body = await readBody(req);
 		if (!body?.sessionId) {
 			json({ error: "Missing sessionId" }, 400);
+			return;
+		}
+		// Own-child fallback: dismissRole only knows goal team members; a team-lead's
+		// own team_delegate child is tracked by OrchestrationCore, not the team entry.
+		const ownerResult = resolveOwnChildOwner(teamDismissMatch[1], body.sessionId);
+		if (ownerResult) {
+			if ("denied" in ownerResult) { denyOwnChild(); return; }
+			try {
+				const ok = await orchestrationCore.dismiss(ownerResult.owner, body.sessionId);
+				json({ ok });
+			} catch (err) {
+				json({ error: String(err instanceof Error ? err.message : err), code: err instanceof OrchestrationCoreError ? err.code : undefined }, ocStatusForTeamFallback(err));
+			}
 			return;
 		}
 		try {
@@ -8772,6 +8913,17 @@ async function handleApiRoute(
 		// Validate target is a team agent
 		const agents = teamManager.listAgents(goalId);
 		if (!agents.find(a => a.sessionId === body.sessionId)) {
+			const ownerResult = resolveOwnChildOwner(goalId, body.sessionId);
+			if (ownerResult) {
+				if ("denied" in ownerResult) { denyOwnChild(); return; }
+				try {
+					await orchestrationCore.steer(ownerResult.owner, body.sessionId, body.message);
+					json({ ok: true, dispatched: true });
+				} catch (err) {
+					json({ error: String(err instanceof Error ? err.message : err), code: err instanceof OrchestrationCoreError ? err.code : undefined }, ocStatusForTeamFallback(err));
+				}
+				return;
+			}
 			json({ error: "Session is not a member of this team" }, 403);
 			return;
 		}
@@ -8807,6 +8959,18 @@ async function handleApiRoute(
 		// Validate target is a team agent
 		const agents = teamManager.listAgents(goalId);
 		if (!agents.find(a => a.sessionId === body.sessionId)) {
+			const ownerResult = resolveOwnChildOwner(goalId, body.sessionId);
+			if (ownerResult) {
+				if ("denied" in ownerResult) { denyOwnChild(); return; }
+				try {
+					await orchestrationCore.abort(ownerResult.owner, body.sessionId);
+					const afterSession = sessionManager.getSession(body.sessionId);
+					json({ ok: true, status: afterSession?.status || "idle" });
+				} catch (err) {
+					json({ error: String(err instanceof Error ? err.message : err), code: err instanceof OrchestrationCoreError ? err.code : undefined }, ocStatusForTeamFallback(err));
+				}
+				return;
+			}
 			json({ error: "Session is not a member of this team" }, 403);
 			return;
 		}
@@ -8847,6 +9011,17 @@ async function handleApiRoute(
 			}
 		}
 		if (!allowed) {
+			const ownerResult = resolveOwnChildOwner(goalId, body.sessionId);
+			if (ownerResult) {
+				if ("denied" in ownerResult) { denyOwnChild(); return; }
+				try {
+					const result = await orchestrationCore.prompt(ownerResult.owner, body.sessionId, body.message as string);
+					json({ ok: true, status: result.status });
+				} catch (err) {
+					json({ error: String(err instanceof Error ? err.message : err), code: err instanceof OrchestrationCoreError ? err.code : undefined }, ocStatusForTeamFallback(err));
+				}
+				return;
+			}
 			json({
 				error: "Session is not a member of this team and is not a direct-child team-lead",
 				code: "NOT_TEAM_MEMBER_OR_DIRECT_CHILD",
@@ -9063,17 +9238,25 @@ async function handleApiRoute(
 			}
 			const terminated = await sessionManager.terminateSession(id);
 			if (!terminated) {
-				// Session not in memory — check if it's a dormant store entry (e.g. completed delegate)
-				if (purge) {
-					// Archive it first so purge can find it, then purge
-					sessionManager.storeArchive(id);
-					const purged = await sessionManager.purgeArchivedSession(id);
-					if (purged) {
-						json({ ok: true });
-						return;
-					}
+				// Session not live. It may still exist as a dormant / store-only entry
+				// (e.g. a completed delegate parent, or a parent that went dormant after
+				// a restart). Archiving such a parent MUST still cascade-reap its children
+				// (design §6 — the "parent dormant/not-live" path), so route it through the
+				// cascade-archive seam regardless of `purge` rather than 404-ing without
+				// archiving. `terminateSession` already cascades for the live case.
+				const persisted = sessionManager.getPersistedSession(id);
+				if (!persisted) {
+					// Truly unknown — not live, not in any store.
+					json({ error: "Session not found" }, 404);
+					return;
 				}
-				json({ error: "Session not found" }, 404);
+				// storeArchive → archiveWithCascade → cascadeReapOwner(children) then archive,
+				// so the dormant parent's live children are reaped before it is archived.
+				await sessionManager.storeArchive(id);
+				if (purge) {
+					await sessionManager.purgeArchivedSession(id);
+				}
+				json({ ok: true });
 				return;
 			}
 			// If purge requested, also purge the now-archived session immediately
@@ -9290,6 +9473,280 @@ async function handleApiRoute(
 		}
 		return;
 	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// OrchestrationCore agent-tool routes (docs/design/orchestration-core.md §8.2).
+	//
+	// `:id` is the OWNER session. The unified `team_*` agent tools call these via
+	// _shared/gateway.ts; the server invokes `orchestrationCore.*` IN-PROCESS with
+	// server-enforced own-children scoping (a verb only touches a child returned by
+	// orchestrationCore.list(ownerId)). The pack-side `host.agents` capability
+	// (sub-goal C) calls the SAME core through a different in-process path.
+	// ──────────────────────────────────────────────────────────────────────────
+	const orchestrateMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/orchestrate\/([a-z]+)$/);
+	if (orchestrateMatch && (req.method === "POST" || req.method === "GET")) {
+		const ownerId = orchestrateMatch[1];
+		const verb = orchestrateMatch[2];
+
+		// ── Caller→owner authorization (S1) ─────────────────────────────────────
+		// The shared gateway bearer only proves "some token-holder"; it does NOT
+		// prove the caller IS `ownerId`. Without this, any agent could enumerate /
+		// prompt / steer / abort / dismiss a FOREIGN owner's children (including
+		// team workers, which team-manager registers under the team-lead session
+		// id) — bypassing the authz `/api/goals/:id/team/*` enforces and violating
+		// the goal's "no method drives a foreign session" constraint. Bind the
+		// request to the unforgeable per-session secret and require the AUTHENTIC
+		// caller to BE the owner. Mirrors the children-mutation authz pattern
+		// (see session-secret.ts + the spawn-child / archive-child routes).
+		{
+			const h = req.headers as Record<string, string | string[] | undefined>;
+			const secretHeader = h["x-bobbit-session-secret"];
+			const secret = Array.isArray(secretHeader) ? secretHeader[0] : secretHeader;
+			const authenticCaller = sessionManager.sessionSecretStore.resolveSessionIdBySecret(
+				typeof secret === "string" && secret.trim() ? secret.trim() : undefined,
+			);
+			if (!authenticCaller || authenticCaller !== ownerId) {
+				json({ error: "Caller session is not the owner of these child agents", code: "NOT_OWNER" }, 403);
+				return;
+			}
+		}
+
+		// Map OrchestrationCore error codes → HTTP status.
+		const ocStatus = (err: unknown): number => {
+			if (err instanceof OrchestrationCoreError) {
+				if (err.code === "NOT_STREAMING") return 409;
+				if (err.code === "NOT_OWN_CHILD" || err.code === "NO_GRANDCHILDREN") return 403;
+				return 400;
+			}
+			return 500;
+		};
+
+		// GET /api/sessions/:id/orchestrate/children — list owner's tracked children.
+		if (verb === "children" && req.method === "GET") {
+			json({ children: orchestrationCore.list(ownerId) });
+			return;
+		}
+
+		if (req.method !== "POST") { json({ error: "Method not allowed" }, 405); return; }
+		const body = await readBody(req).catch(() => ({}));
+
+		try {
+			// POST /orchestrate/spawn — non-blocking spawn (single or parallel).
+			if (verb === "spawn") {
+				const lifecycle: "full" | undefined = body?.lifecycle === "full" ? "full" : undefined;
+				const baseOpts = {
+					ownerSessionId: ownerId,
+					role: typeof body?.role === "string" ? body.role : undefined,
+					model: typeof body?.model === "string" ? body.model : undefined,
+					thinkingLevel: typeof body?.thinking_level === "string" ? body.thinking_level : undefined,
+					readOnly: body?.read_only === true,
+					lifecycle,
+				};
+				const spawnSet: Array<{ instructions: string; context?: Record<string, string> }> =
+					Array.isArray(body?.parallel) && body.parallel.length > 0
+						? body.parallel.map((p: any) => ({ instructions: String(p.instructions ?? ""), context: p.context }))
+						: [{ instructions: String(body?.instructions ?? ""), context: body?.context }];
+				const children = [];
+				for (const item of spawnSet) {
+					const handle = await orchestrationCore.spawn({
+						...baseOpts,
+						instructions: item.instructions,
+						context: { ...(body?.context ?? {}), ...(item.context ?? {}) },
+					});
+					children.push({ childSessionId: handle.sessionId, childKind: handle.childKind, title: handle.title });
+				}
+				json({ children, childSessionId: children[0]?.childSessionId }, 201);
+				return;
+			}
+
+			// POST /orchestrate/prompt — run-if-idle / queue.
+			if (verb === "prompt") {
+				if (!body?.childSessionId || typeof body?.message !== "string") { json({ error: "Missing childSessionId or message" }, 400); return; }
+				const result = await orchestrationCore.prompt(ownerId, body.childSessionId, body.message);
+				json({ ok: true, status: result.status });
+				return;
+			}
+
+			// POST /orchestrate/steer — mid-turn steer (409 if child not streaming).
+			if (verb === "steer") {
+				if (!body?.childSessionId || typeof body?.message !== "string") { json({ error: "Missing childSessionId or message" }, 400); return; }
+				await orchestrationCore.steer(ownerId, body.childSessionId, body.message);
+				json({ ok: true, dispatched: true });
+				return;
+			}
+
+			// POST /orchestrate/abort — force-abort own child.
+			if (verb === "abort") {
+				if (!body?.childSessionId) { json({ error: "Missing childSessionId" }, 400); return; }
+				await orchestrationCore.abort(ownerId, body.childSessionId);
+				const after = sessionManager.getSession(body.childSessionId);
+				json({ ok: true, status: after?.status || "idle" });
+				return;
+			}
+
+			// POST /orchestrate/dismiss — terminate + archive own child.
+			if (verb === "dismiss") {
+				if (!body?.childSessionId) { json({ error: "Missing childSessionId" }, 400); return; }
+				const ok = await orchestrationCore.dismiss(ownerId, body.childSessionId);
+				json({ ok });
+				return;
+			}
+
+			// POST /orchestrate/wait — policy:"first"; chunked heartbeat like /wait.
+			if (verb === "wait") {
+				const timeoutMs = body?.timeout_ms ?? 600_000;
+				// Default (no explicit ids) excludes `childKind:"team"` workers: a team
+				// lead's goal members are NOT waited on via team_wait — they are
+				// notify-managed by the team-manager (worker-idle nudge), and the lead is
+				// meant to spawn-then-go-idle, not block. Mirrors the restart reminder's
+				// `childKind!=="team"` filter (orchestration-core remindOwnersWithLiveChildren).
+				// An EXPLICIT childSessionIds list is still honored verbatim (own-child
+				// scoping is enforced by orchestrationCore.wait → requireOwnChild). Without
+				// this, a lead that called team_wait after team_spawn blocked for the whole
+				// worker lifetime and never went idle.
+				const childIds: string[] = Array.isArray(body?.childSessionIds) && body.childSessionIds.length > 0
+					? body.childSessionIds.map((s: any) => String(s))
+					: orchestrationCore.list(ownerId).filter(h => h.childKind !== "team").map(h => h.sessionId);
+				if (childIds.length === 0) { json({ error: "No children to await" }, 400); return; }
+				res.writeHead(200, { "Content-Type": "application/json", "Transfer-Encoding": "chunked", "Cache-Control": "no-cache" });
+				const heartbeat = setInterval(() => { try { res.write("\n"); } catch { /* ignore */ } }, 60_000);
+				try {
+					const result = await orchestrationCore.wait(ownerId, childIds, { policy: "first", timeoutMs });
+					res.end(JSON.stringify({ ...result, text: formatWaitText(result) }));
+				} catch (err) {
+					res.end(JSON.stringify({ error: String(err instanceof Error ? err.message : err) }));
+				} finally {
+					clearInterval(heartbeat);
+				}
+				return;
+			}
+
+			// POST /orchestrate/delegate — the pinned BLOCKING contract (§8.2.1).
+			// spawn (single or parallel) → wait(policy:"all") with terminal mapping
+			// → auto-dismiss EVERY child in finally → aggregate. Always 2xx once
+			// children settle; server owns the chunked heartbeat (undici parity).
+			if (verb === "delegate") {
+				const timeoutMs = body?.timeout_ms ?? 600_000;
+				// Reject empty/missing instructions (and empty `parallel`) up front for
+				// direct callers — matches the team_delegate tool wrapper's guard.
+				const hasParallel = Array.isArray(body?.parallel) && body.parallel.length > 0;
+				if (!hasParallel && (typeof body?.instructions !== "string" || !body.instructions.trim())) {
+					json({ error: "Missing 'instructions' (or provide a non-empty 'parallel' array)" }, 400);
+					return;
+				}
+				if (hasParallel && body.parallel.some((p: any) => typeof p?.instructions !== "string" || !p.instructions.trim())) {
+					json({ error: "Each 'parallel' entry requires non-empty 'instructions'" }, 400);
+					return;
+				}
+				const spawnSet: Array<{ instructions: string; context?: Record<string, string> }> =
+					hasParallel
+						? body.parallel.map((p: any) => ({ instructions: String(p.instructions ?? ""), context: p.context }))
+						: [{ instructions: String(body?.instructions ?? ""), context: body?.context }];
+				const lifecycle: "full" | undefined = body?.lifecycle === "full" ? "full" : undefined;
+
+				res.writeHead(200, { "Content-Type": "application/json", "Transfer-Encoding": "chunked", "Cache-Control": "no-cache" });
+				const heartbeat = setInterval(() => { try { res.write("\n"); } catch { /* ignore */ } }, 60_000);
+				const startTime = Date.now();
+				const handles: Array<{ sessionId: string } | null> = [];
+				try {
+					// Spawn the full set. assertCanSpawn / spawn failures become a
+					// failed delegate entry rather than aborting the others.
+					const spawnErrors: Array<string | undefined> = [];
+					for (const item of spawnSet) {
+						try {
+							const handle = await orchestrationCore.spawn({
+								ownerSessionId: ownerId,
+								instructions: item.instructions,
+								role: typeof body?.role === "string" ? body.role : undefined,
+								model: typeof body?.model === "string" ? body.model : undefined,
+								thinkingLevel: typeof body?.thinking_level === "string" ? body.thinking_level : undefined,
+								readOnly: body?.read_only === true,
+								lifecycle,
+								context: { ...(body?.context ?? {}), ...(item.context ?? {}) },
+							});
+							handles.push({ sessionId: handle.sessionId });
+							spawnErrors.push(undefined);
+						} catch (err) {
+							handles.push(null);
+							spawnErrors.push(err instanceof Error ? err.message : String(err));
+						}
+					}
+					const liveIds = handles.filter((h): h is { sessionId: string } => !!h).map(h => h.sessionId);
+					const waitResult = liveIds.length > 0
+						? await orchestrationCore.wait(ownerId, liveIds, { policy: "all", timeoutMs })
+						: { statuses: [], remaining: 0 } as Awaited<ReturnType<typeof orchestrationCore.wait>>;
+					const statusById = new Map(waitResult.statuses.map(s => [s.sessionId, s.status]));
+
+					const delegates = [];
+					for (let i = 0; i < handles.length; i++) {
+						const h = handles[i];
+						if (!h) {
+							delegates.push({ id: "error", sessionId: "", status: "failed", output: "", durationMs: Date.now() - startTime, error: spawnErrors[i] });
+							continue;
+						}
+						const childStatus = statusById.get(h.sessionId);
+						const status = childStatus === "idle" ? "completed"
+							: childStatus === "timeout" ? "timeout"
+							: childStatus === "terminated" ? "terminated"
+							: "failed";
+						const output = await sessionManager.getSessionOutput(h.sessionId).catch(() => "");
+						delegates.push({ id: h.sessionId.slice(0, 12), sessionId: h.sessionId, status, output, durationMs: Date.now() - startTime });
+					}
+					const completed = delegates.filter(d => d.status === "completed").length;
+					const summary = `${completed}/${delegates.length} delegates completed.`;
+					res.end(JSON.stringify({ delegates, summary }));
+				} catch (err) {
+					res.end(JSON.stringify({ delegates: [], summary: "", error: String(err instanceof Error ? err.message : err) }));
+				} finally {
+					// Guaranteed cleanup — dismiss EVERY spawned child regardless of outcome.
+					for (const h of handles) {
+						if (h) { try { await orchestrationCore.dismiss(ownerId, h.sessionId); } catch { /* already gone */ } }
+					}
+					clearInterval(heartbeat);
+				}
+				return;
+			}
+
+			json({ error: `Unknown orchestrate verb: ${verb}` }, 404);
+		} catch (err) {
+			const status = ocStatus(err);
+			json({ error: String(err instanceof Error ? err.message : err), code: err instanceof OrchestrationCoreError ? err.code : undefined }, status);
+		}
+		return;
+	}
+
+	// ── SUB-GOAL B SEAM (orchestration-core §6.1) ──────────────────────────────
+	// GET /api/sessions/:id/children-count — child agents that would be
+	// cascade-archived if this (non-goal) session is archived. Enumerated with
+	// the SAME predicate AND the SAME source set `cascadeReapOwner` uses: ALL
+	// live persisted sessions across projects (`getAllLiveSessions()`), NOT just
+	// in-memory ones — so DORMANT persisted children (e.g. delegate children
+	// deferred on boot, archived by the cascade only at runtime) are included in
+	// the count and the listed names. The modal lists these before the user
+	// confirms. The goal-archival path enumerates affected sessions separately
+	// and is untouched.
+	const childrenCountMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/children-count$/);
+	if (childrenCountMatch && req.method === "GET") {
+		const id = decodeURIComponent(childrenCountMatch[1]);
+		// Prefer the cross-project persisted source (mirrors cascadeReapOwner's
+		// `getAllLiveSessions()` enumeration, which includes dormant children);
+		// fall back to in-memory sessions when no project context is available.
+		const source = projectContextManager
+			? projectContextManager.getAllLiveSessions()
+			: sessionManager.listSessions();
+		const seen = new Set<string>();
+		const children: Array<{ id: string; title: string; childKind?: string }> = [];
+		for (const s of source) {
+			if (s.id === id || seen.has(s.id)) continue;
+			if (s.delegateOf === id || (!!s.childKind && s.parentSessionId === id)) {
+				seen.add(s.id);
+				children.push({ id: s.id, title: s.title, childKind: s.childKind });
+			}
+		}
+		json({ count: children.length, children });
+		return;
+	}
+	// ───────────────────────────────────────────────────────────────────────────
 
 	// POST /api/sessions/:archivedId/continue — Continue-Archived (lossless)
 	//
@@ -9596,7 +10053,7 @@ async function handleApiRoute(
 				try { await sessionManager.terminateSession(id); } catch {}
 			} else {
 				// Dormant/store-only session — archive directly in the store
-				sessionManager.storeArchive(id);
+				await sessionManager.storeArchive(id);
 			}
 		}
 
@@ -11374,7 +11831,10 @@ async function handleApiRoute(
 		const body = await readBody(req);
 		if (!body?.command) { json({ error: "command is required" }, 400); return; }
 		try {
-			const info = bgProcessManager.create(id, body.command, session.cwd, session.containerId, session.sandboxed, body.name, runtimeForContainerId(session.containerId));
+			// The container runtime (docker/podman) is resolved inside the manager via
+			// the per-container runtime registry (runtimeForContainerIdOrDocker), so no
+			// runtime arg is threaded here.
+			const info = bgProcessManager.create(id, body.command, session.cwd, session.containerId, session.sandboxed, body.name);
 			json(info, 201);
 		} catch (err: any) {
 			if (err?.message?.includes("Sandboxed session without containerId")) {
@@ -11461,15 +11921,31 @@ async function handleApiRoute(
 		return;
 	}
 
-	// DELETE /api/sessions/:id/bg-processes/:pid — kill or remove a background process
+	// DELETE /api/sessions/:id/bg-processes/:pid — kill or dismiss a background process
+	//   ?action=kill    → terminate a running process; KEEP the exited record until dismissed
+	//   ?action=dismiss → remove the record + delete persisted log/status/spool files
+	//   (no action)     → legacy: kill-if-running else dismiss
 	const bgKillMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/bg-processes\/([^/]+)$/);
 	if (bgKillMatch && req.method === "DELETE") {
 		const [, sessionId, processId] = bgKillMatch;
-		// Try kill first (running), then remove (exited)
+		const action = url.searchParams.get("action");
+		if (action === "kill") {
+			const killed = bgProcessManager.kill(sessionId, processId);
+			if (!killed) { json({ error: "Process not found or not running" }, 404); return; }
+			json({ ok: true, killed: true });
+			return;
+		}
+		if (action === "dismiss") {
+			const dismissed = bgProcessManager.dismiss(sessionId, processId);
+			if (!dismissed) { json({ error: "Process not found or still running" }, 409); return; }
+			json({ ok: true });
+			return;
+		}
+		// Legacy: kill-if-running else dismiss.
 		const killed = bgProcessManager.kill(sessionId, processId);
 		if (!killed) {
-			const removed = bgProcessManager.remove(sessionId, processId);
-			if (!removed) { json({ error: "Process not found" }, 404); return; }
+			const dismissed = bgProcessManager.dismiss(sessionId, processId);
+			if (!dismissed) { json({ error: "Process not found" }, 404); return; }
 		}
 		json({ ok: true });
 		return;
