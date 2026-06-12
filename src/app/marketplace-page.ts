@@ -72,9 +72,10 @@ let conflicts: ConflictWire[] = [];
 
 /** Per-installed-pack activation catalogue + disabled overrides, keyed by
  *  `${scope}:${packName}` (pack schema V1 §6.7/§9). This is the UNFILTERED
- *  authoritative source for the activation toggles — read from the installed
- *  pack manifest's `contents`, NOT from the runtime-filtered /api/tools or
- *  /api/ext/contributions — so a DISABLED entity stays visible + re-enableable. */
+ *  authoritative source for the activation toggles — server-expanded from pack
+ *  declarations (tool groups become concrete tool names), NOT from the runtime-
+ *  filtered /api/tools or /api/ext/contributions — so a DISABLED entity stays
+ *  visible + re-enableable. */
 const activationByPack = new Map<string, PackActivationResponse>();
 
 let newSourceUrl = "";
@@ -288,8 +289,28 @@ async function handleToggleActivation(
 	const set = new Set(current?.disabled?.[kindKey] ?? []);
 	if (enable) set.delete(name); else set.add(name);
 	const disabled: DisabledRefs = { ...(current?.disabled ?? {}), [kindKey]: [...set] };
+	await savePackActivation(pack, disabled, `activation:${cacheKey}:${kind}:${name}`);
+}
+
+async function handleToggleAllActivation(pack: InstalledPackWire, enable: boolean): Promise<void> {
+	const cacheKey = `${pack.scope}:${pack.packName}`;
+	const current = activationByPack.get(cacheKey);
+	if (!current) return;
+	const cat = current.catalogue;
+	const disabled: DisabledRefs = enable
+		? { roles: [], tools: [], skills: [], entrypoints: [] }
+		: {
+			roles: [...cat.roles],
+			tools: [...cat.tools],
+			skills: [...cat.skills],
+			entrypoints: cat.entrypoints.map((e) => e.listName),
+		};
+	await savePackActivation(pack, disabled, `activation:${cacheKey}:all`);
+}
+
+async function savePackActivation(pack: InstalledPackWire, disabled: DisabledRefs, busyKey: string): Promise<void> {
+	const cacheKey = `${pack.scope}:${pack.packName}`;
 	const projectId = pack.scope === "project" ? currentProjectId() : undefined;
-	const busyKey = `activation:${cacheKey}:${kind}:${name}`;
 	busy.add(busyKey);
 	renderApp();
 	const res = await setPackActivation({ scope: pack.scope, projectId, packName: pack.packName, disabled });
@@ -617,7 +638,8 @@ interface EntityNameLists {
  *  entity that HAS a one-line description, across roles/tools/skills/entry
  *  points. Used by BOTH the Installed activation list and the Browse pack card.
  *  Rows with no description are omitted; the disclosure is omitted entirely when
- *  no row would render. Tools are keyed by GROUP name; entrypoints by `listName`
+ *  no row would render. Tool keys follow the provided entity list (manifest groups
+ *  for browse chips, concrete tool names for activation); entrypoints use `listName`
  *  (kind `entrypoint`). */
 function renderEntityDetails(packName: string, descriptions: PackEntityDescriptions | undefined, entities: EntityNameLists): TemplateResult {
 	if (!descriptions) return html``;
@@ -887,9 +909,9 @@ function conflictsForPack(pack: InstalledPackWire): ConflictWire[] {
  *  ALWAYS wins over the built-in, regardless of which entity kinds it ships. We
  *  therefore detect the shadow by the presence of a non-corrupt same-name install,
  *  NOT via `/api/packs/conflicts`: that endpoint only reports role/tool/skill
- *  conflicts, so an ENTRYPOINT/panel/route-only pack (e.g. `pr-walkthrough`, whose
- *  `contents.roles/tools/skills` are all empty) would never appear there and the
- *  built-in row would wrongly stay live (the winner-owns-the-toggle rule broken).
+ *  conflicts, so an ENTRYPOINT/panel/route-only pack with empty role/tool/skill
+ *  declarations would never appear there and the built-in row would wrongly stay
+ *  live (the winner-owns-the-toggle rule broken).
  *  A `corrupt` install is excluded from resolution, so it never wins and never
  *  suppresses the built-in toggle. With no non-corrupt same-name install, the
  *  built-in row owns the live (server, packName) toggle. */
@@ -947,7 +969,7 @@ function renderBuiltinPackCard(pack: InstalledPackWire): TemplateResult {
 			data-scope=${pack.scope}
 			data-builtin="true"
 		>
-			<div class="flex items-start gap-2">
+			<div class="flex items-start justify-between gap-3">
 				<div class="flex-1 min-w-0">
 					<div class="flex items-center gap-2 flex-wrap">
 						<span class="text-sm font-semibold">${pack.packName}</span>
@@ -956,11 +978,12 @@ function renderBuiltinPackCard(pack: InstalledPackWire): TemplateResult {
 						${isCorrupt ? html`<span class="market-corrupt" data-testid="market-pack-corrupt">${icon(AlertTriangle, "xs")} corrupt</span>` : ""}
 					</div>
 					${pack.manifest?.description ? html`<div class="text-xs text-muted-foreground mt-0.5">${pack.manifest.description}</div>` : ""}
-					${shadowed
-						? html`<div class="market-activation-help text-[11px] text-muted-foreground/70 italic mt-2" data-testid="market-builtin-shadowed">Shadowed by an installed pack — manage activation on the installed copy.</div>`
-						: renderActivationControls(pack)}
 				</div>
+				${shadowed ? "" : renderPackActivationSummary(pack)}
 			</div>
+			${shadowed
+				? html`<div class="market-activation-help text-[11px] text-muted-foreground/70 italic mt-2" data-testid="market-builtin-shadowed">Shadowed by an installed pack — manage activation on the installed copy.</div>`
+				: html`${renderActivationControls(pack)}${renderActivationEntityDetails(pack)}`}
 		</div>
 	`;
 }
@@ -1010,6 +1033,7 @@ function renderInstalledPackCard(pack: InstalledPackWire, scope: MarketScope, in
 					${renderProvenance(pack)}
 					${expanded && hasConflict ? renderConflictDetails(packConflicts) : ""}
 					${renderActivationControls(pack)}
+					${renderActivationEntityDetails(pack)}
 				</div>
 				<div class="flex flex-col items-end gap-1 shrink-0">
 					<div class="flex items-center gap-1">
@@ -1052,6 +1076,73 @@ function renderProvenance(pack: InstalledPackWire): TemplateResult {
  *  `GET /api/marketplace/pack-activation` (never from /api/tools or
  *  /api/ext/contributions), so a disabled entity stays visible + re-enableable;
  *  each toggle's checked state = `name ∉ disabled[kind]`. */
+function renderPackActivationSummary(pack: InstalledPackWire): TemplateResult {
+	const activation = activationByPack.get(`${pack.scope}:${pack.packName}`);
+	if (!activation || activationEntityTotal(activation) === 0) return html``;
+	const total = activationEntityTotal(activation);
+	const enabled = activationEntityEnabledCount(activation);
+	const label = enabled === total ? "Enabled" : enabled === 0 ? "Disabled" : "Partially enabled";
+	const cacheKey = `${pack.scope}:${pack.packName}`;
+	const busyKey = `activation:${cacheKey}:all`;
+	return html`
+		<label class="market-pack-activation-toggle" title="Enable or disable all pack entries">
+			<span>${label}</span>
+			<span class="market-toggle-switch market-toggle-switch--master">
+				<input
+					type="checkbox"
+					data-testid="market-toggle-pack-${pack.packName}"
+					.checked=${enabled > 0}
+					?disabled=${busy.has(busyKey)}
+					@change=${(e: Event) => handleToggleAllActivation(pack, (e.target as HTMLInputElement).checked)}
+				/>
+				<span class="market-toggle-slider"></span>
+			</span>
+		</label>
+	`;
+}
+
+function activationEntityTotal(activation: PackActivationResponse): number {
+	const cat = activation.catalogue;
+	return cat.roles.length + cat.tools.length + cat.skills.length + cat.entrypoints.length;
+}
+
+function activationEntityEnabledCount(activation: PackActivationResponse): number {
+	const disabled = activation.disabled || {};
+	const disabledCount =
+		(disabled.roles ?? []).length +
+		(disabled.tools ?? []).length +
+		(disabled.skills ?? []).length +
+		(disabled.entrypoints ?? []).length;
+	return Math.max(0, activationEntityTotal(activation) - disabledCount);
+}
+
+function entrypointKindLabel(kind: PackActivationResponse["catalogue"]["entrypoints"][number]["kind"]): string {
+	switch (kind) {
+		case "composer-slash": return "Slash";
+		case "git-widget-button": return "Git widget";
+		case "command-palette": return "Command palette";
+		case "route": return "Route";
+		default: return "Entry point";
+	}
+}
+
+function entrypointDisplayLabel(entrypoint: PackActivationResponse["catalogue"]["entrypoints"][number]): string {
+	if (entrypoint.kind === "route" && entrypoint.routeId) return `#/ext/${entrypoint.routeId}`;
+	return entrypoint.label || entrypoint.listName;
+}
+
+function renderActivationEntityDetails(pack: InstalledPackWire): TemplateResult {
+	const activation = activationByPack.get(`${pack.scope}:${pack.packName}`);
+	if (!activation) return html``;
+	const cat = activation.catalogue;
+	return renderEntityDetails(pack.packName, cat.descriptions, {
+		roles: cat.roles,
+		tools: cat.tools,
+		skills: cat.skills,
+		entrypoints: cat.entrypoints.map((e) => ({ listName: e.listName, label: entrypointDisplayLabel(e) })),
+	});
+}
+
 function renderActivationControls(pack: InstalledPackWire): TemplateResult {
 	const activation = activationByPack.get(`${pack.scope}:${pack.packName}`);
 	if (!activation) return html``;
@@ -1059,20 +1150,29 @@ function renderActivationControls(pack: InstalledPackWire): TemplateResult {
 	const disabled = activation.disabled || {};
 	const isEnabled = (kindKey: keyof DisabledRefs, name: string) => !(disabled[kindKey] ?? []).includes(name);
 
-	const toggle = (kind: "role" | "tool" | "skill" | "entrypoint", name: string, label: string): TemplateResult => {
+	const toggle = (
+		kind: "role" | "tool" | "skill" | "entrypoint",
+		name: string,
+		label: string,
+		kindLabel?: string,
+	): TemplateResult => {
 		const kindKey = ACTIVATION_KIND_KEY[kind];
 		const checked = isEnabled(kindKey, name);
 		const busyKey = `activation:${pack.scope}:${pack.packName}:${kind}:${name}`;
 		return html`
-			<label class="market-activation-toggle ${checked ? "" : "market-activation-toggle--off"}" title=${`${kind}: ${name}`}>
-				<input
-					type="checkbox"
-					data-testid="market-toggle-${kind}-${name}"
-					.checked=${checked}
-					?disabled=${busy.has(busyKey)}
-					@change=${(e: Event) => handleToggleActivation(pack, kind, name, (e.target as HTMLInputElement).checked)}
-				/>
-				<span>${label}</span>
+			<label class="market-activation-toggle ${checked ? "" : "market-activation-toggle--off"}" title=${kindLabel ? `${kindLabel}: ${name}` : `${kind}: ${name}`}>
+				<span class="market-toggle-switch">
+					<input
+						type="checkbox"
+						data-testid="market-toggle-${kind}-${name}"
+						.checked=${checked}
+						?disabled=${busy.has(busyKey)}
+						@change=${(e: Event) => handleToggleActivation(pack, kind, name, (e.target as HTMLInputElement).checked)}
+					/>
+					<span class="market-toggle-slider"></span>
+				</span>
+				${kindLabel ? html`<span class="market-entrypoint-kind">${kindLabel}</span>` : ""}
+				<span class="market-activation-label">${label}</span>
 			</label>
 		`;
 	};
@@ -1089,20 +1189,13 @@ function renderActivationControls(pack: InstalledPackWire): TemplateResult {
 	if (cat.tools.length) groups.push(group("Tools", cat.tools.map((n) => toggle("tool", n, n))));
 	if (cat.skills.length) groups.push(group("Skills", cat.skills.map((n) => toggle("skill", n, n))));
 	if (cat.entrypoints.length) {
-		groups.push(group("Entry points", cat.entrypoints.map((e) => toggle("entrypoint", e.listName, e.label || e.listName))));
+		groups.push(group("Entry points", cat.entrypoints.map((e) => toggle("entrypoint", e.listName, entrypointDisplayLabel(e), entrypointKindLabel(e.kind)))));
 	}
 	if (groups.length === 0) return html``;
 
 	return html`
 		<div class="market-activation" data-testid="market-activation-${pack.packName}">
-			<div class="text-[11px] font-medium text-muted-foreground uppercase tracking-wide mt-2">Activation</div>
 			${groups}
-			${renderEntityDetails(pack.packName, cat.descriptions, {
-				roles: cat.roles,
-				tools: cat.tools,
-				skills: cat.skills,
-				entrypoints: cat.entrypoints,
-			})}
 		</div>
 	`;
 }
