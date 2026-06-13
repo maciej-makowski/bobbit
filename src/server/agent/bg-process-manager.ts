@@ -22,7 +22,6 @@ import type { ServerMessage } from "../ws/protocol.js";
 import { getShellConfig, GIT_BASH } from "./shell-util.js";
 import type { BgProcessStore, PersistedBgProcess } from "./bg-process-store.js";
 import { bgRunnerHelperPath } from "./bg-runner.js";
-import { runtimeForContainerId, runtimeForContainerIdOrDocker } from "./container-runtime/registry.js";
 
 const MAX_LOG_LINES = 5000;
 const MAX_LOG_BYTES = 512 * 1024; // 512KB per process (COMBINED across stdout+stderr)
@@ -57,23 +56,6 @@ export interface BgEnv {
 	dockerCli(argv: string[]): { code: number; stdout: string };
 }
 
-/**
- * Resolve the container CLI binary for a `dockerCli(argv)` call. Podman's CLI
- * mirrors docker's exec/inspect surface, so only the binary name differs; the
- * fork's per-container runtime registry (populated by project-sandbox at
- * container start) supplies it. Scans argv for the registered container id
- * (it always appears — `exec …`/`kill …`/`rm …` at argv[1], `inspect -f …` at
- * the end) and falls back to docker for unregistered ids, preserving upstream
- * behaviour for the default docker runtime.
- */
-function containerBinForArgv(argv: string[]): string {
-	for (const a of argv) {
-		const rt = runtimeForContainerId(a);
-		if (rt) return rt.bin;
-	}
-	return "docker";
-}
-
 export const defaultEnv: BgEnv = {
 	isHostPidAlive(pid: number): boolean {
 		if (!pid || pid <= 0) return false;
@@ -92,7 +74,7 @@ export const defaultEnv: BgEnv = {
 	},
 	dockerCli(argv: string[]): { code: number; stdout: string } {
 		try {
-			const r = spawnSync(containerBinForArgv(argv), argv, { encoding: "utf-8", env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" } });
+			const r = spawnSync("docker", argv, { encoding: "utf-8", env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" } });
 			return { code: r.status ?? -1, stdout: r.stdout ?? "" };
 		} catch {
 			return { code: -1, stdout: "" };
@@ -218,7 +200,7 @@ function buildPosixWrapper(
 function defaultSpawn(command: string, cwd: string, containerId: string | undefined, paths: BgPaths): ChildProcess {
 	if (containerId) {
 		const wrapper = buildDockerWrapper(command, paths);
-		return spawn(runtimeForContainerIdOrDocker(containerId).bin, ["exec", "-w", cwd, containerId, "setsid", "/bin/sh", "-c", wrapper], {
+		return spawn("docker", ["exec", "-w", cwd, containerId, "setsid", "/bin/sh", "-c", wrapper], {
 			stdio: ["ignore", "ignore", "ignore"],
 			detached: false,
 			env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" },
@@ -350,12 +332,12 @@ export interface DockerExec {
 export const defaultDockerExec: DockerExec = {
 	probeSize(containerId: string, spool: string): number {
 		try {
-			const r = spawnSync(runtimeForContainerIdOrDocker(containerId).bin, ["exec", containerId, "sh", "-c", `wc -c < ${shQuote(spool)} 2>/dev/null || echo 0`], { encoding: "utf-8" });
+			const r = spawnSync("docker", ["exec", containerId, "sh", "-c", `wc -c < ${shQuote(spool)} 2>/dev/null || echo 0`], { encoding: "utf-8" });
 			return parseInt((r.stdout || "0").trim(), 10) || 0;
 		} catch { return 0; }
 	},
 	follow(containerId: string, spool: string, fromByteOffset: number): ChildProcess {
-		return spawn(runtimeForContainerIdOrDocker(containerId).bin, ["exec", containerId, "tail", "-c", `+${fromByteOffset + 1}`, "-F", spool], {
+		return spawn("docker", ["exec", containerId, "tail", "-c", `+${fromByteOffset + 1}`, "-F", spool], {
 			stdio: ["ignore", "pipe", "ignore"],
 			env: { ...process.env, MSYS_NO_PATHCONV: "1", MSYS2_ARG_CONV_EXCL: "*" },
 		});
