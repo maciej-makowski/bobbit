@@ -50,6 +50,7 @@ function makeManager(projects: Record<string, "none" | "docker" | "podman">): an
 			if (mode === undefined) return null;
 			return {
 				projectConfigStore: {
+					get: (key: string) => (key === "sandbox" ? mode : undefined),
 					// Mirrors ProjectConfigStore.getSandboxRuntime(): podman → podman, else docker.
 					getSandboxRuntime: () => (mode === "podman" ? "podman" : "docker"),
 				},
@@ -79,6 +80,21 @@ describe("ensureSandboxNetwork resolves runtime from the project config", () => 
 		const create = calls.find((c) => c.args[0] === "network" && c.args[1] === "create");
 		assert.ok(create, "expected a `network create` call");
 		assert.equal(create!.bin, "docker", "docker project must use the docker binary");
+	});
+
+	it("THROWS when the project's sandbox mode is \"none\" (setup must be unreachable when disabled)", async () => {
+		const manager = makeManager({ "proj-off": "none" });
+		await assert.rejects(
+			() => manager.ensureSandboxNetwork("proj-off"),
+			/sandbox mode is "none".*must not be reached when disabled/,
+		);
+		assert.equal(calls.length, 0, "no CLI command should be issued for a disabled project");
+	});
+
+	it("THROWS when called without a projectId", async () => {
+		const manager = makeManager({ "proj-podman": "podman" });
+		await assert.rejects(() => manager.ensureSandboxNetwork(), /projectId missing|sandbox mode is "none"/);
+		assert.equal(calls.length, 0, "no CLI command should be issued without a projectId");
 	});
 
 	it("cleanupSandboxNetwork removes the network across every distinct project runtime", async () => {

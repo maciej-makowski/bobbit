@@ -80,6 +80,13 @@ export interface ProjectSandboxOptions {
 	 * constructions, e.g. tests).
 	 */
 	runtime?: ContainerRuntime;
+	/**
+	 * The project's resolved `sandbox` mode (`none|docker|podman`). Optional for
+	 * back-compat (direct test constructions omit it → treated as enabled). When
+	 * explicitly `"none"`, `init()` hard-fails: reaching container creation with
+	 * a disabled sandbox is a programming bug.
+	 */
+	sandboxMode?: string;
 	projectId: string;
 	projectDir: string;        // host project root
 	repoUrl: string;           // git remote URL to clone inside container (single-repo)
@@ -167,6 +174,14 @@ export class ProjectSandbox {
 
 	/** Create or reconnect to the project container. */
 	async init(): Promise<void> {
+		// Defense-in-depth: container creation must be unreachable when the
+		// project's sandbox is disabled. An explicit "none" here is a bug
+		// (the bootstrap returns null for disabled projects before we get here).
+		if (this.options.sandboxMode === "none") {
+			throw new Error(
+				`[project-sandbox] init() for project ${this.options.projectId} reached but sandbox mode is "none" — container setup must not be reached when disabled (bug)`,
+			);
+		}
 		this._readyPromise = new Promise((resolve, reject) => {
 			this._readyResolve = resolve;
 			this._readyReject = reject;

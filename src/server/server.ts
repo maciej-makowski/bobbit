@@ -2031,6 +2031,7 @@ export function createGateway(config: GatewayConfig) {
 				const sandboxTokenEntries = cfg.getSandboxTokens();
 				return {
 					runtime,
+					sandboxMode: sandboxCfg,
 					projectId,
 					projectDir,
 					repoUrl,

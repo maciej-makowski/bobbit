@@ -1241,11 +1241,30 @@ export class SessionManager {
 		return resolveContainerRuntime(store ?? this.projectConfigStore ?? null);
 	}
 
+	/** Resolve a project's `sandbox` mode (`none|docker|podman`). Defaults to "none". */
+	private sandboxModeFor(projectId?: string): string {
+		const store = (projectId && this.projectContextManager)
+			? this.projectContextManager.getOrCreate(projectId)?.projectConfigStore
+			: undefined;
+		return (store ?? this.projectConfigStore)?.get("sandbox") || "none";
+	}
+
 	/**
 	 * Ensure the bridge network for sandboxed containers exists.
 	 * Idempotent — checks with `<runtime> network inspect` first.
+	 *
+	 * This is a sandbox-SETUP entry point: it must be unreachable when the
+	 * project's sandbox is disabled. Reaching it with `sandbox === "none"` (or
+	 * without a `projectId`) is a programming bug — fail loudly so a wrong-store
+	 * runtime resolution can never silently spawn the wrong CLI again.
 	 */
 	async ensureSandboxNetwork(projectId?: string): Promise<string> {
+		const mode = this.sandboxModeFor(projectId);
+		if (!projectId || mode === "none") {
+			throw new Error(
+				`[sandbox] ensureSandboxNetwork(${projectId ?? "<no projectId>"}) called but sandbox mode is "${mode}" (or projectId missing) — sandbox setup must not be reached when disabled (bug)`,
+			);
+		}
 		const name = SessionManager.SANDBOX_NETWORK;
 		const runtime = this.containerRuntimeFor(projectId);
 		try {
@@ -1372,6 +1391,18 @@ export class SessionManager {
 		const projectId = opts?.projectId;
 		if (!projectId) {
 			throw new Error("Sandbox mode requires a projectId");
+		}
+
+		// Defense-in-depth: this container-creation path must be unreachable when
+		// the SESSION'S PROJECT has its sandbox disabled. The early return above
+		// guards the default store; assert the project's resolved mode too so a
+		// wrong-store resolution can never silently create a container with the
+		// wrong (or no) runtime.
+		const projectSandboxMode = this.sandboxModeFor(projectId);
+		if (projectSandboxMode === "none") {
+			throw new Error(
+				`[sandbox] applySandboxWiring(${projectId}) reached but project sandbox mode is "none" — sandbox container setup must not be reached when disabled (bug)`,
+			);
 		}
 
 		// Get the ProjectSandbox for this project
