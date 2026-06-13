@@ -1992,7 +1992,7 @@ export function createGateway(config: GatewayConfig) {
 					poolCredentials = credsRaw ? JSON.parse(credsRaw) : {};
 				} catch (err) { console.warn(`[sandbox] Invalid sandbox_credentials JSON for project ${projectId}, ignoring: ${err}`); }
 
-				const sandboxNetwork = await sessionManager.ensureSandboxNetwork();
+				const sandboxNetwork = await sessionManager.ensureSandboxNetwork(projectId);
 
 				const githubTokenEnabled = cfg.get("sandbox_github_token") !== "false";
 				const githubToken = githubTokenEnabled ? resolveHostTokenValue("GITHUB_TOKEN") : undefined;

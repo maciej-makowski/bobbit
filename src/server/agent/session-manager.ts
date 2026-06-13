@@ -1245,9 +1245,9 @@ export class SessionManager {
 	 * Ensure the bridge network for sandboxed containers exists.
 	 * Idempotent — checks with `<runtime> network inspect` first.
 	 */
-	async ensureSandboxNetwork(): Promise<string> {
+	async ensureSandboxNetwork(projectId?: string): Promise<string> {
 		const name = SessionManager.SANDBOX_NETWORK;
-		const runtime = this.containerRuntimeFor();
+		const runtime = this.containerRuntimeFor(projectId);
 		try {
 			await runtime.createNetwork(name, { driver: "bridge" });
 			console.log(`[session-manager] Created ${runtime.bin} network "${name}"`);
@@ -1267,11 +1267,31 @@ export class SessionManager {
 	 * or has connected containers.
 	 */
 	async cleanupSandboxNetwork(): Promise<void> {
-		try {
-			await this.containerRuntimeFor().removeNetwork(SessionManager.SANDBOX_NETWORK);
-			console.log(`[session-manager] Removed network "${SessionManager.SANDBOX_NETWORK}"`);
-		} catch {
-			// Non-fatal — network may not exist or may have connected containers
+		const name = SessionManager.SANDBOX_NETWORK;
+		// Networks live in per-runtime namespaces (a podman network can only be
+		// removed via podman), so remove the network from EVERY distinct runtime
+		// across all registered projects. Dedupe by runtime `bin` to avoid
+		// redundant calls when multiple projects share a runtime.
+		const runtimes = new Map<string, ContainerRuntime>();
+		const registry = this.projectContextManager?.getRegistry();
+		if (registry) {
+			for (const project of registry.list()) {
+				const runtime = this.containerRuntimeFor(project.id);
+				if (!runtimes.has(runtime.bin)) runtimes.set(runtime.bin, runtime);
+			}
+		}
+		// Fallback (test harness / no PCM): use the default-resolved runtime.
+		if (runtimes.size === 0) {
+			const runtime = this.containerRuntimeFor();
+			runtimes.set(runtime.bin, runtime);
+		}
+		for (const runtime of runtimes.values()) {
+			try {
+				await runtime.removeNetwork(name);
+				console.log(`[session-manager] Removed ${runtime.bin} network "${name}"`);
+			} catch {
+				// Non-fatal — network may not exist or may have connected containers
+			}
 		}
 	}
 

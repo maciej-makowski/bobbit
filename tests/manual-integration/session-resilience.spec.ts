@@ -379,11 +379,11 @@ async function createGoalViaBrowser(
 	// Fill in the title
 	await titleInput.fill(title);
 
-	// Check "Sandbox (Docker)" if requested
+	// Check the "Sandbox" toggle if requested
 	if (opts?.sandboxed) {
 		const sandboxCheckbox = page.locator("input[type='checkbox']").filter({ has: page.locator("~ *:has-text('Sandbox')") }).first();
 		// Try finding the checkbox by its label text
-		const sandboxLabel = page.getByText("Sandbox (Docker)").first();
+		const sandboxLabel = page.getByText("Sandbox", { exact: true }).first();
 		if (await sandboxLabel.isVisible({ timeout: 3_000 }).catch(() => false)) {
 			await sandboxLabel.click();
 		}

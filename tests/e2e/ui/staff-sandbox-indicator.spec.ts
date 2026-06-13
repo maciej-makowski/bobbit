@@ -128,13 +128,13 @@ test.describe("Staff sandbox indicator", () => {
 		// After the click the app navigates to the new staff-assistant
 		// session. state.assistantType becomes "staff", the render router
 		// invokes staffPreviewPanel(), which always renders the sandbox
-		// checkbox. The unique copy "Sandbox (Docker)" appears ONLY inside
-		// that panel.
-		const sandboxLabel = page.getByText("Sandbox (Docker)").first();
-		await expect(sandboxLabel).toBeVisible({ timeout: 15_000 });
-
+		// checkbox. The runtime-neutral "Sandbox" label lives inside that
+		// panel — scope to the panel to disambiguate from the team toggle.
 		const panel = page.locator("[data-panel='staff-proposal']");
-		await expect(panel).toBeVisible({ timeout: 5_000 });
+		await expect(panel).toBeVisible({ timeout: 15_000 });
+
+		const sandboxLabel = panel.getByText("Sandbox", { exact: true }).first();
+		await expect(sandboxLabel).toBeVisible({ timeout: 5_000 });
 
 		// The checkbox input itself must be attached to the DOM. It may
 		// carry the `disabled` attribute (no Docker image available in the

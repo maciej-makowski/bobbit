@@ -959,8 +959,8 @@ function renderGoalForm(config: GoalFormConfig) {
 							@change=${config.onSandboxChange} />
 						<span class="text-xs text-muted-foreground font-medium">Sandbox</span>
 						<span title=${!sandboxAvailable
-							? "Docker sandbox is configured but unavailable — check Docker status and image in Settings"
-							: "Runs each team agent in an isolated Docker container with restricted filesystem and network access"}
+							? "Sandbox is configured but unavailable — check the runtime status and image in Settings"
+							: "Runs each team agent in an isolated sandbox container with restricted filesystem and network access"}
 							class="text-[9px] text-muted-foreground cursor-help">ⓘ</span>
 					</label>
 				` : ""}
@@ -2177,10 +2177,10 @@ function staffPreviewPanel() {
 						<input type="checkbox" class="toggle-switch" .checked=${_staffSandboxed}
 							?disabled=${!(state.sandboxStatus?.available && state.sandboxStatus?.imageExists)}
 							@change=${(e: Event) => { _staffSandboxed = (e.target as HTMLInputElement).checked; renderApp(); }} />
-						<span class="text-xs text-muted-foreground font-medium">Sandbox (Docker)</span>
+						<span class="text-xs text-muted-foreground font-medium">Sandbox</span>
 						<span title=${!(state.sandboxStatus?.available && state.sandboxStatus?.imageExists)
-							? "Docker sandbox is configured but unavailable — check Docker status and image in Settings"
-							: "Runs this staff agent in an isolated Docker container with restricted filesystem and network access"}
+							? "Sandbox is configured but unavailable — check the runtime status and image in Settings"
+							: "Runs this staff agent in an isolated sandbox container with restricted filesystem and network access"}
 							class="text-[9px] text-muted-foreground cursor-help">ⓘ</span>
 					</label>
 				</div>

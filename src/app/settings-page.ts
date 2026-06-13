@@ -550,10 +550,11 @@ function renderSandboxSection(
 	loadSandboxStatus(sandboxMode);
 	const imageName = pendingChanges.sandbox_image ?? resolved.sandbox_image?.value ?? "bobbit-agent";
 	// Display name derived generically from the server-provided runtime id —
-	// no per-runtime branching (capitalize first char). Falls back to Docker.
+	// no per-runtime branching (capitalize first char). Falls back to a
+	// runtime-neutral label when the status doesn't supply a runtime id.
 	const runtimeName = sandboxStatusLocal?.runtime
 		? sandboxStatusLocal.runtime[0].toUpperCase() + sandboxStatusLocal.runtime.slice(1)
-		: "Docker";
+		: "Container runtime";
 	const tokenEntries = _sandboxTokenEntries.get(projectId) || [];
 	const mountEntries = _sandboxMountEntries.get(projectId) || [];
 
@@ -3387,7 +3388,7 @@ function renderProjectGeneralTab(projectId: string) {
 
 			<hr class="border-border" />
 
-			<!-- Docker Sandbox -->
+			<!-- Container Sandbox -->
 			${renderSandboxSection(projectId, resolved, pendingChanges, inputClass, labelClass)}
 
 			<!-- Save -->
