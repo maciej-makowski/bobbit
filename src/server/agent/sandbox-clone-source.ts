@@ -23,6 +23,13 @@
  *   container (the host path is unreachable / a drive-letter is misparsed as
  *   scp), so the caller must configure a clonable network remote or remove the
  *   origin to fall back to the mounted project repo.
+ *
+ * SSH/scp/git-protocol remotes are normalized to HTTPS for the container: the
+ * sandbox image has NO ssh client or keys, so an SSH origin (`git@host:o/r`,
+ * `ssh://…`, `git://…`) would fail with `cannot run ssh: No such file or
+ * directory`. Containers authenticate over HTTPS via the built-in credential
+ * helper (`username=x-access-token` / `password=$GITHUB_TOKEN`), so every
+ * non-HTTP(S) remote is rewritten to `https://host/owner/repo` before cloning.
  */
 
 import { stripTokenFromGitUrl } from "../skills/git.js";
@@ -31,6 +38,70 @@ import { stripTokenFromGitUrl } from "../skills/git.js";
 export const MOUNTED_SRC_PATH = "/workspace-src";
 /** Clone URL git uses inside the container for the bind-mounted source. */
 export const MOUNTED_SRC_CLONE_URL = "file:///workspace-src";
+
+/**
+ * Rewrite an SSH/scp/git-protocol remote to its `https://` equivalent so the
+ * in-container HTTPS credential helper (`x-access-token` / `$GITHUB_TOKEN`) can
+ * authenticate — the sandbox image has no ssh client or keys.
+ *
+ * Handles:
+ * - scp-style `git@host:owner/repo(.git)` → `https://host/owner/repo(.git)`
+ * - `ssh://git@host[:port]/owner/repo(.git)` → `https://host/owner/repo(.git)`
+ *   (drops `user@` and any `:port`)
+ * - `git+ssh://…` → `https://…`
+ * - `git://host/…` → `https://host/…`
+ * - already `http://` / `https://` → returned unchanged (passthrough)
+ */
+export function toHttpsCloneUrl(origin: string): string {
+	const url = origin.trim();
+	if (!url) return url;
+
+	// Already HTTP(S) → passthrough unchanged.
+	if (/^https?:\/\//i.test(url)) return url;
+
+	// URL-scheme forms: ssh://, git+ssh://, git://, ssh+git://, …
+	const schemeMatch = url.match(/^([a-z][a-z0-9+.-]*):\/\/(.*)$/i);
+	if (schemeMatch) {
+		const scheme = schemeMatch[1].toLowerCase();
+		if (scheme === "ssh" || scheme === "git" || scheme.includes("ssh")) {
+			let rest = schemeMatch[2];
+			// Strip leading `user@`.
+			const at = rest.indexOf("@");
+			const firstSlash = rest.indexOf("/");
+			if (at >= 0 && (firstSlash < 0 || at < firstSlash)) {
+				rest = rest.slice(at + 1);
+			}
+			// Drop `:port` from the host segment (text before the first slash).
+			const slash = rest.indexOf("/");
+			if (slash >= 0) {
+				const hostPart = rest.slice(0, slash).replace(/:\d+$/, "");
+				rest = hostPart + rest.slice(slash);
+			} else {
+				rest = rest.replace(/:\d+$/, "");
+			}
+			return `https://${rest}`;
+		}
+		// Any other explicit scheme (file://, https already handled) → unchanged.
+		return url;
+	}
+
+	// scp-style `[user@]host:owner/repo` (colon before first slash).
+	const slashIdx = url.indexOf("/");
+	const colonIdx = url.indexOf(":");
+	if (colonIdx > 0 && (slashIdx < 0 || colonIdx < slashIdx)) {
+		let host = url.slice(0, colonIdx);
+		const path = url.slice(colonIdx + 1);
+		const at = host.lastIndexOf("@");
+		if (at >= 0) host = host.slice(at + 1);
+		// A single-character host is a Windows drive letter, not an scp host —
+		// leave it untouched (the resolver classifies it as local and throws).
+		if (host.length > 1) {
+			return `https://${host}/${path}`;
+		}
+	}
+
+	return url;
+}
 
 export type SandboxCloneSource =
 	| { kind: "remote"; cloneUrl: string }
@@ -110,7 +181,7 @@ export function resolveSandboxCloneSource(opts: {
 
 	// Network remote → clone directly.
 	if (origin && isNetworkRemote(origin)) {
-		return { kind: "remote", cloneUrl: stripTokenFromGitUrl(origin) };
+		return { kind: "remote", cloneUrl: stripTokenFromGitUrl(toHttpsCloneUrl(origin)) };
 	}
 
 	// Absent origin → mount the caller-supplied canonical main repo root (the

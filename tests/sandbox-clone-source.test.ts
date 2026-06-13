@@ -21,7 +21,10 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { resolveSandboxCloneSource } from "../src/server/agent/sandbox-clone-source.js";
+import {
+	resolveSandboxCloneSource,
+	toHttpsCloneUrl,
+} from "../src/server/agent/sandbox-clone-source.js";
 
 // A POSIX-style canonical mount source (what the caller's resolveSandboxMountRoot
 // returns). Pure resolver — never touches the filesystem, so this need not exist.
@@ -36,34 +39,51 @@ describe("resolveSandboxCloneSource — network remotes", () => {
 		assert.deepEqual(result, { kind: "remote", cloneUrl: "https://github.com/foo/bar.git" });
 	});
 
-	it("classifies an scp-style origin with user (git@host:path) as a remote", () => {
+	it("normalizes an scp-style origin with user (git@host:path) to HTTPS", () => {
 		const result = resolveSandboxCloneSource({
 			originUrl: "git@github.com:foo/bar.git",
 			mountSourcePath: MOUNT_SRC,
 		});
 		assert.equal(result.kind, "remote");
-		// stripTokenFromGitUrl leaves scp-style host:path remotes intact here.
-		assert.equal(result.cloneUrl, "git@github.com:foo/bar.git");
+		// ssh is unavailable in the container → scp remotes are rewritten to HTTPS
+		// so the in-container credential helper can authenticate.
+		assert.equal(result.cloneUrl, "https://github.com/foo/bar.git");
 	});
 
-	it("classifies an scp-style origin WITHOUT user (host:path) as a remote", () => {
+	it("normalizes an scp-style origin WITHOUT user (host:path) to HTTPS", () => {
 		// A host-without-user scp remote must not be misclassified as local.
 		const result = resolveSandboxCloneSource({
 			originUrl: "github.example.com:team/repo.git",
 			mountSourcePath: MOUNT_SRC,
 		});
 		assert.equal(result.kind, "remote");
-		assert.equal(result.cloneUrl, "github.example.com:team/repo.git");
+		assert.equal(result.cloneUrl, "https://github.example.com/team/repo.git");
 	});
 
-	it("classifies an ssh:// origin as a remote", () => {
+	it("normalizes an ssh:// origin to HTTPS", () => {
 		const result = resolveSandboxCloneSource({
 			originUrl: "ssh://git@host/foo.git",
 			mountSourcePath: MOUNT_SRC,
 		});
 		assert.equal(result.kind, "remote");
-		assert.ok(/^ssh:\/\//.test(result.cloneUrl));
+		assert.equal(result.cloneUrl, "https://host/foo.git");
 	});
+});
+
+describe("toHttpsCloneUrl — SSH/scp/git remotes are normalized to HTTPS", () => {
+	for (const [input, expected] of [
+		["git@github.com:o/r.git", "https://github.com/o/r.git"],
+		["ssh://git@github.com/o/r.git", "https://github.com/o/r.git"],
+		["ssh://git@host:2222/o/r.git", "https://host/o/r.git"],
+		["git+ssh://git@github.com/o/r.git", "https://github.com/o/r.git"],
+		["git://github.com/o/r.git", "https://github.com/o/r.git"],
+		["https://github.com/o/r.git", "https://github.com/o/r.git"],
+		["http://github.com/o/r.git", "http://github.com/o/r.git"],
+	] as const) {
+		it(`${input} → ${expected}`, () => {
+			assert.equal(toHttpsCloneUrl(input), expected);
+		});
+	}
 });
 
 describe("resolveSandboxCloneSource — absent origin (mount the supplied source)", () => {
