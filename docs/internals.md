@@ -2027,19 +2027,26 @@ sandbox: "podman"            # mode: "none" (off) | "docker" | "podman"
 
 **Selecting the runtime in the UI.** Project Settings → **Container Sandbox** surfaces a single **Sandbox Mode** dropdown with three options — `none` / `docker` / `podman` — wired to `sandbox` through the generic `PUT /api/projects/:id/config` save flow, so selecting `podman` and saving writes `sandbox: "podman"` with no hand-editing of `project.yaml` (`renderSandboxSection` in `src/app/settings-page.ts`). There is no longer a separate Container Runtime dropdown; the mode is the sole control. The UI only reads/writes the `sandbox` string and lists the three options — there is no `=== "podman"` behaviour in the UI; all runtime behaviour stays behind `ContainerRuntime`.
 
-**Runtime-aware status display.** `GET /api/sandbox-status` resolves the project's runtime via `resolveContainerRuntime(projectConfigStore)` and includes a `runtime` field (`runtime.id`, `"docker" | "podman"`). The Settings status row reflects the *selected* runtime rather than a hardcoded "Docker": the availability probe (`checkDockerAvailability`) runs `getVersion()` against the chosen binary, the UI labels the line with the runtime's display name (e.g. "Podman available (v5.8.2)"), and the build-command hint shown when the image is missing uses the selected binary (`<runtime> build -t <image> docker/`). The section header and status row were generalized for this ("Docker Sandbox" → "Container Sandbox", "Docker Status" → "Runtime Status") so they read correctly under either runtime.
+**Runtime-aware status display.** `GET /api/sandbox-status` includes a `runtime` field (`runtime.id`, `"docker" | "podman"`) and probes that runtime's availability. The Settings status row reflects the *selected* runtime rather than a hardcoded "Docker": the availability probe (`checkDockerAvailability`) runs `getVersion()` against the chosen binary, the UI labels the line with the runtime's display name (e.g. "Podman available (v5.8.2)"), and the build-command hint shown when the image is missing uses the selected binary (`<runtime> build -t <image> docker/`). The section header and status row were generalized for this ("Docker Sandbox" → "Container Sandbox", "Docker Status" → "Runtime Status") so they read correctly under either runtime.
+
+**Status probes the *selected* mode, not the saved config.** `GET /api/sandbox-status` accepts an optional `?sandbox=<none|docker|podman>` query param. The Settings UI passes the **pending dropdown selection** (`fetchSandboxStatus(mode)` in `src/app/api.ts`, re-fired from the `@change` handler in `renderSandboxSection`), so picking `podman` immediately probes `podman` — *before* the change is saved — instead of the runtime in the on-disk `project.yaml`. This is why the status row updates the instant you change the dropdown. When the param is absent (e.g. the sidebar's startup probe), the endpoint falls back to the saved-config runtime via `resolveContainerRuntime(projectConfigStore)` for back-compat. The motivation: without this, selecting Podman would have shown Docker's availability until you saved and reloaded, which is misleading — the user wants to know whether the backend they're choosing actually works.
 
 When the chosen runtime's availability probe fails, the Runtime Status row must say something actionable rather than a bare "podman is not available". The `ContainerRuntime` contract therefore exposes `availabilityHint(): string | undefined` — `BaseCliRuntime`/`DockerRuntime` return `undefined`, and `PodmanRuntime` returns a hint naming the common rootless/SELinux failures and the `info --format` schema gotcha (Podman nests `.Version.Version` / `.Host.CPUs` / `.Host.MemTotal`). `checkDockerAvailability` appends the hint to the error so it surfaces in the status row when mode is `podman`.
 
 **Out of scope (first cut):** rootless-Podman edge cases beyond the `:Z` relabel and host-gateway mapping above, remote daemon/socket transports, nerdctl, and podman-machine provisioning. These land as fast-follows if real-Podman use surfaces them — the point of the interface is that each one is a change confined to `PodmanRuntime`, not a new conditional sprinkled across the codebase.
 
-### Docker image
+### Building the sandbox image
+
+The agent image (default tag `bobbit-agent`, matching the `sandbox_image` config) is built from `docker/Dockerfile`. It includes Node.js 20, git, curl, gh, build-essential, and the pinned `pi-coding-agent` package used by sandboxed agents. Two npm scripts build it with the appropriate runtime:
 
 ```bash
-docker build -t bobbit-agent docker/
+npm run sandbox:build:docker   # builds + tags `bobbit-agent` using docker
+npm run sandbox:build:podman   # builds + tags `bobbit-agent` using podman
 ```
 
-Auto-built on startup if image missing but `docker/Dockerfile` exists (120s timeout). Includes Node.js 20, git, curl, gh, build-essential, and the pinned `pi-coding-agent` package used by sandboxed agents.
+Both scripts bake the **host's** installed `pi-coding-agent` version into the image (passing `--build-arg PI_AGENT_VERSION=<host-version>`) so the container's agent always matches the gateway. Set `SANDBOX_IMAGE=<tag>` to override the default `bobbit-agent` tag (use the same tag in `sandbox_image`).
+
+**Auto-build vs. manual build.** In `docker` mode the gateway auto-builds the image on first use when it is missing but `docker/Dockerfile` exists, and rebuilds when the baked agent version drifts from the host's. **Building the image is otherwise the user's responsibility** — especially under Podman, where rootless/SELinux setup varies per host: install Podman, then run `npm run sandbox:build:podman` (or use the **Build Image** button in Settings → Container Sandbox / `POST /api/sandbox-image/build`). A server restart is required after a manual build so the sandbox pool picks up the new image.
 
 ### How it works
 

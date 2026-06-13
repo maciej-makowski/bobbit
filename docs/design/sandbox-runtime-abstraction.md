@@ -240,8 +240,26 @@ ignored (no migration, no warning). A project that selected Podman via the old
 Container Runtime dropdown). The sandbox status display is runtime-aware:
 `GET /api/sandbox-status` returns a `runtime` field and the UI labels
 availability and the build-command hint with the selected runtime; when a
-Podman probe fails, `PodmanRuntime.availabilityHint()` enriches the error. See
+Podman probe fails, `PodmanRuntime.availabilityHint()` enriches the error.
+
+**Status probes the *selected* mode.** `GET /api/sandbox-status` accepts an
+optional `?sandbox=<none|docker|podman>` param. The Settings UI passes the
+*pending* dropdown selection so the Runtime Status row probes the backend the
+user just picked — before saving — rather than the saved-config runtime. Without
+the param it falls back to `resolveContainerRuntime(projectConfigStore)`. This
+avoids the misleading case where selecting Podman would show Docker's
+availability until the change was saved and the page reloaded. See
 [internals.md → Container runtime abstraction](../internals.md#container-runtime-abstraction).
+
+**Building the image (operations).** The agent image (default `bobbit-agent`) is
+built from `docker/Dockerfile` via two npm scripts: `npm run sandbox:build:docker`
+and `npm run sandbox:build:podman`. Both bake the host's `pi-coding-agent`
+version (`--build-arg PI_AGENT_VERSION=<host>`) and honour `SANDBOX_IMAGE` to
+override the tag. Docker mode auto-builds the image on first use; under Podman,
+building the image (and installing/configuring rootless Podman) is the user's
+responsibility — the Settings status row and **Build Image** button stay as-is.
+This matches the abstraction's non-goal of changing image contents: the build
+context is shared across runtimes; only the building binary differs.
 
 ## 6. Migration plan (incremental, behind the interface)
 

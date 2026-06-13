@@ -4,13 +4,25 @@ Minimal Docker image for running Bobbit agent sessions in a sandboxed environmen
 
 ## Build
 
+Bobbit ships two npm scripts that build this image and tag it `bobbit-agent` (the default `sandbox_image`), one per container runtime:
+
 ```bash
-docker build -t bobbit-agent docker/
+npm run sandbox:build:docker   # build with docker
+npm run sandbox:build:podman   # build with podman
 ```
 
-The default image name `bobbit-agent` matches Bobbit's default `sandbox_image` config. To use a different name, update `sandbox_image` in your project settings.
+Or build directly:
 
-**Auto-build**: When `sandbox: "docker"` is configured and the image doesn't exist, the Bobbit gateway automatically builds it on startup from this Dockerfile (120s timeout). You can also trigger a build manually from Settings → Project tab → Docker Sandbox → "Build Image" button, or via `POST /api/sandbox-image/build`. A manual build is not normally needed — the auto-build handles the first-run case.
+```bash
+docker build -t bobbit-agent docker/
+podman build -t bobbit-agent docker/
+```
+
+The default image name `bobbit-agent` matches Bobbit's default `sandbox_image` config. Set `SANDBOX_IMAGE=<tag>` to build under a different tag (then point `sandbox_image` in your project settings at it).
+
+**`PI_AGENT_VERSION` build-arg**: the agent CLI version baked into the image. The npm scripts pass `--build-arg PI_AGENT_VERSION=<host-version>` so the container's `pi-coding-agent` matches the gateway's. A direct `docker`/`podman build` without the arg uses the Dockerfile's `ARG PI_AGENT_VERSION` default (a pinned fallback, not necessarily your host version).
+
+**Auto-build vs. manual**: in `sandbox: "docker"` mode the gateway auto-builds the image on startup when it's missing (and rebuilds when the baked agent version drifts from the host's). Under `sandbox: "podman"`, building the image — and installing/configuring rootless Podman — is **your responsibility**, since rootless/SELinux setup is host-specific: run `npm run sandbox:build:podman`. Either way you can trigger a build from Settings → Container Sandbox → "Build Image" button, or via `POST /api/sandbox-image/build` (which uses the project's selected runtime). Restart the server after a manual build so the sandbox pool reloads the image.
 
 ## What's Included
 
@@ -128,8 +140,8 @@ After building a custom image, update `sandbox_image` in your Bobbit project set
 
 This image is used automatically by Bobbit when sandbox mode is enabled. You do not need to run `docker run` manually. Configure sandbox mode in your project settings:
 
-1. Set `sandbox` to `"docker"` in project config
-2. The image is built automatically on the next server startup if missing — or build manually: `docker build -t bobbit-agent docker/`
+1. Set **Sandbox Mode** (the single `sandbox` config key) to `docker` or `podman` (`none` disables sandboxing). The same key both enables sandboxing and selects the runtime — there is no separate runtime setting.
+2. Make sure the image exists: in `docker` mode it is auto-built on the next server startup if missing; in `podman` mode build it yourself with `npm run sandbox:build:podman`. You can always build manually with `npm run sandbox:build:docker` / `npm run sandbox:build:podman` or the Settings → Container Sandbox → "Build Image" button.
 3. Enable the "Sandbox" checkbox when creating a new session
 
 See the main Bobbit documentation for full sandbox configuration options including credentials and additional mounts.
