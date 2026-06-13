@@ -76,6 +76,8 @@ import { resolveRolePrompt, buildRestoreRolePrompt } from "./role-prompt.js";
 import { applyPromptConditionals } from "./prompt-conditionals.js";
 // createWorktree is used in session-setup.ts pipeline
 import { ProjectContextManager } from "./project-context-manager.js";
+import { resolveContainerRuntime } from "./container-runtime/index.js";
+import type { ContainerRuntime } from "./container-runtime/types.js";
 import { GoalStore, type PersistedGoal } from "./goal-store.js";
 import { PrStatusStore } from "./pr-status-store.js";
 import { TaskStore } from "./task-store.js";
@@ -807,24 +809,18 @@ export class SessionManager {
 				// Verify/repair/recreate worktree if needed
 				if (session.cwd?.startsWith("/workspace-wt/")) {
 					let worktreeOk = false;
+					const runtime = this.containerRuntimeFor(session.projectId);
 
 					// Check if worktree still exists (volumes may survive rm -f)
 					try {
-						await execFileAsync("docker", [
-							"exec", newContainerId, "test", "-d", session.cwd,
-						], { timeout: 5_000 });
+						await runtime.exec(newContainerId, ["test", "-d", session.cwd], { timeoutMs: 5_000 });
 						worktreeOk = true;
 					} catch {
 						// Try git worktree repair first
 						try {
-							await execFileAsync("docker", [
-								"exec", "-w", "/workspace", newContainerId,
-								"git", "worktree", "repair",
-							], { timeout: 10_000 });
+							await runtime.exec(newContainerId, ["git", "worktree", "repair"], { cwd: "/workspace", timeoutMs: 10_000 });
 							// Re-check after repair
-							await execFileAsync("docker", [
-								"exec", newContainerId, "test", "-d", session.cwd,
-							], { timeout: 5_000 });
+							await runtime.exec(newContainerId, ["test", "-d", session.cwd], { timeoutMs: 5_000 });
 							worktreeOk = true;
 							console.log(`[session-manager] Worktree repaired for session ${session.id}`);
 						} catch {
@@ -1132,9 +1128,9 @@ export class SessionManager {
 		return this._testGoalManager?.getGoalStore().get(goalId);
 	}
 
-	/** Whether Docker sandbox mode is enabled in project config. */
+	/** Whether the container sandbox is enabled (docker or podman) in project config. */
 	get isSandboxEnabled(): boolean {
-		return (this.projectConfigStore?.get("sandbox") || "none") === "docker";
+		return (this.projectConfigStore?.get("sandbox") || "none") !== "none";
 	}
 
 	/**
@@ -1220,22 +1216,31 @@ export class SessionManager {
 	private static readonly SANDBOX_NETWORK = "bobbit-sandbox-net";
 
 	/**
-	 * Ensure the Docker bridge network for sandboxed containers exists.
-	 * Idempotent — checks with `docker network inspect` first.
+	 * Resolve the container runtime (docker/podman) for a project from its
+	 * single `sandbox` mode config. Falls back to the default project config
+	 * store (and ultimately Docker) when the project context is unavailable.
+	 */
+	private containerRuntimeFor(projectId?: string): ContainerRuntime {
+		const store = (projectId && this.projectContextManager)
+			? this.projectContextManager.getOrCreate(projectId)?.projectConfigStore
+			: undefined;
+		return resolveContainerRuntime(store ?? this.projectConfigStore ?? null);
+	}
+
+	/**
+	 * Ensure the bridge network for sandboxed containers exists.
+	 * Idempotent — checks with `<runtime> network inspect` first.
 	 */
 	async ensureSandboxNetwork(): Promise<string> {
 		const name = SessionManager.SANDBOX_NETWORK;
+		const runtime = this.containerRuntimeFor();
 		try {
-			await execFileAsync("docker", [
-				"network", "create", name,
-				"--driver", "bridge",
-				"--opt", "com.docker.network.bridge.enable_icc=false",
-			], { timeout: 15_000 });
-			console.log(`[session-manager] Created Docker network "${name}"`);
+			await runtime.createNetwork(name, { driver: "bridge" });
+			console.log(`[session-manager] Created ${runtime.bin} network "${name}"`);
 		} catch (err: any) {
 			const msg = err.stderr || err.message || "";
 			if (!msg.includes("already exists")) {
-				console.error(`[session-manager] Failed to create Docker network "${name}":`, err);
+				console.error(`[session-manager] Failed to create ${runtime.bin} network "${name}":`, err);
 				throw err;
 			}
 			// Network was created concurrently — that's fine
@@ -1244,13 +1249,13 @@ export class SessionManager {
 	}
 
 	/**
-	 * Remove the sandbox Docker network. Non-fatal if it doesn't exist
+	 * Remove the sandbox network. Non-fatal if it doesn't exist
 	 * or has connected containers.
 	 */
 	async cleanupSandboxNetwork(): Promise<void> {
 		try {
-			await execFileAsync("docker", ["network", "rm", SessionManager.SANDBOX_NETWORK], { timeout: 10_000 });
-			console.log(`[session-manager] Removed Docker network "${SessionManager.SANDBOX_NETWORK}"`);
+			await this.containerRuntimeFor().removeNetwork(SessionManager.SANDBOX_NETWORK);
+			console.log(`[session-manager] Removed network "${SessionManager.SANDBOX_NETWORK}"`);
 		} catch {
 			// Non-fatal — network may not exist or may have connected containers
 		}
@@ -1327,7 +1332,7 @@ export class SessionManager {
 	): Promise<boolean> {
 		if (!this.projectConfigStore) return false;
 		const sandboxConfig = this.projectConfigStore.get("sandbox") || "none";
-		if (sandboxConfig !== "docker") return false;
+		if (sandboxConfig === "none") return false;
 
 		// Resolve project ID
 		const projectId = opts?.projectId;
@@ -1375,6 +1380,7 @@ export class SessionManager {
 
 		bridgeOptions.sandboxed = true;
 		bridgeOptions.containerId = containerId;
+		bridgeOptions.runtime = this.containerRuntimeFor(projectId);
 
 		// Create a worktree inside the container when a branch is specified.
 		// This is the primary code path for goal agents (team lead + members).
@@ -3579,10 +3585,9 @@ export class SessionManager {
 			});
 			// Verify the sandbox worktree still exists inside the container
 			if (ps.cwd?.startsWith("/workspace-wt/") && bridgeOptions.containerId) {
+				const runtime = this.containerRuntimeFor(ps.projectId);
 				try {
-					await execFileAsync("docker", [
-						"exec", bridgeOptions.containerId, "test", "-d", ps.cwd,
-					], { timeout: 5_000 });
+					await runtime.exec(bridgeOptions.containerId, ["test", "-d", ps.cwd], { timeoutMs: 5_000 });
 					console.log(`[session-manager] Sandbox worktree verified for ${ps.id}: ${ps.cwd}`);
 				} catch {
 					console.warn(`[session-manager] Sandbox worktree MISSING for ${ps.id}: ${ps.cwd} — attempting recovery`);
@@ -3590,14 +3595,9 @@ export class SessionManager {
 
 					// Try git worktree repair first — handles broken .git link files after hard container kill
 					try {
-						await execFileAsync("docker", [
-							"exec", "-w", "/workspace", bridgeOptions.containerId!,
-							"git", "worktree", "repair",
-						], { timeout: 10_000 });
+						await runtime.exec(bridgeOptions.containerId!, ["git", "worktree", "repair"], { cwd: "/workspace", timeoutMs: 10_000 });
 						// Re-check if worktree now exists after repair
-						await execFileAsync("docker", [
-							"exec", bridgeOptions.containerId!, "test", "-d", ps.cwd!,
-						], { timeout: 5_000 });
+						await runtime.exec(bridgeOptions.containerId!, ["test", "-d", ps.cwd!], { timeoutMs: 5_000 });
 						console.log(`[session-manager] Sandbox worktree repaired for ${ps.id}: ${ps.cwd}`);
 						recovered = true;
 					} catch {

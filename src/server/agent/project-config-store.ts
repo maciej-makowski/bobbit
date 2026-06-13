@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "yaml";
+import type { RuntimeId } from "./container-runtime/types.js";
 
 // ── Component yaml normalization ────────────────────────────
 // SECURITY: `component.repo` and `component.relativePath` are joined onto
@@ -311,7 +312,7 @@ const DEFAULTS: Record<string, string> = {
 	test_e2e_command: "npm run test:e2e",
 	worktree_setup_command: "",  // Empty = no setup runs on new worktrees
 	base_ref: "",                      // Empty = today's behaviour (resolveRemotePrimary, typically origin/master). Else a branch ref — local ("master") or remote ("origin/develop"). See docs/design/base-ref.md.
-	sandbox: "none",                    // "none" | "docker"
+	sandbox: "none",                    // "none" | "docker" | "podman" — sandbox mode (off / Docker / Podman)
 	sandbox_image: "bobbit-agent",      // Docker image name
 	sandbox_credentials: "",            // DEPRECATED — use sandbox_tokens. JSON object: '{"GITHUB_TOKEN":"ghp_xxx"}'
 	sandbox_github_token: "true",       // DEPRECATED — use sandbox_tokens. "true" | "false"
@@ -797,6 +798,16 @@ export class ProjectConfigStore {
 	}
 
 	// ── Native-YAML typed accessors (preferred over flat get/set) ────
+
+	/**
+	 * Resolve the container provider from the single `sandbox` mode.
+	 * "podman" → podman; "docker"/"none"/unknown → docker. The legacy
+	 * `sandbox_runtime` key is intentionally NOT read (no migration).
+	 */
+	getSandboxRuntime(): RuntimeId {
+		const raw = (this.get("sandbox") ?? "").trim().toLowerCase();
+		return raw === "podman" ? "podman" : "docker";
+	}
 
 	getConfigDirectories(): ConfigDirectoryEntry[] {
 		return this.configDirectories.map(e => ({ path: e.path, types: [...e.types] }));

@@ -551,7 +551,11 @@ The bug is a stale-state race between three fields on `GitStatusWidget` (`src/ui
 
 ## Sandbox sessions
 
-- `GET /api/sandbox-status` for Docker availability
+- `GET /api/sandbox-status` for runtime availability
+- **Runtime selection**: the spawned container binary is derived from the single `sandbox` **mode** (`none`|`docker`|`podman`) by `getSandboxRuntime()` — `podman` → podman, anything else → docker — then resolved to a `ContainerRuntime` via `resolveContainerRuntime` (never throws). `sandbox: "docker"` both enables sandboxing AND selects Docker; `sandbox: "podman"` enables it AND selects Podman. There is no separate `sandbox_runtime` key any more. See [internals.md — Container runtime abstraction](internals.md#container-runtime-abstraction).
+- **Availability error names the runtime** (`<bin> is not available: …`) — if it says `podman is not available`, the chosen binary is missing or its `info` probe failed. For Podman the error is enriched with `PodmanRuntime.availabilityHint()`, which calls out the common rootless/SELinux causes (rootless Podman not started / `CONTAINER_HOST` socket unset; SELinux blocking the rootless socket) and the `info --format` schema gotcha — run `podman info` to verify.
+- **Podman `info --format` schema gotcha**: Docker is flat (`.ServerVersion`/`.NCPU`/`.MemTotal`), Podman is nested (`.Version.Version`/`.Host.CPUs`/`.Host.MemTotal`). A Docker template run against Podman throws → spurious "not available". Each impl owns its own templates (`DockerRuntime`/`PodmanRuntime`); never branch on the runtime at a call site.
+- **Podman silently fell back to Docker after upgrade?** A project that previously ran Podman via the OLD two-field combo (`sandbox: docker` + `sandbox_runtime: podman`) loses Podman after upgrading to the single-mode model: `sandbox: docker` maps to Docker and the stale `sandbox_runtime: podman` key is ignored with no migration or warning. Fix: set `sandbox: "podman"` in project settings (or `project.yaml`).
 - Worktree sessions now correctly call `applySandboxWiring()` via the pipeline (previously `_setupWorktreeAndLaunchAgent()` skipped sandbox wiring)
 - `sessions.json` has `sandboxed: boolean`
 - Container can't reach internet? Check: (1) `docker network inspect bobbit-sandbox-net` shows the network exists, (2) container is attached to it (`docker inspect <container>` → Networks), (3) host firewall isn't blocking Docker bridge traffic
