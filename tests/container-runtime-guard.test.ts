@@ -7,9 +7,11 @@
  * runtime and breaks podman projects. This scans the source for those call
  * patterns and fails if any reappear.
  *
- * Allowlisted (NOT spawned-binary literals): the `sandbox` enable-value
- * comparisons (`=== "docker"`), the `docker/Dockerfile` build-context path,
- * RuntimeId unions, config defaults, comments, and log/label strings.
+ * Allowlisted (NOT spawned-binary literals): the single `sandbox` mode-value
+ * comparisons (`=== "none"` / `!== "none"`, and the `"docker"`/`"podman"`
+ * literals in `getSandboxRuntime()` and the UI dropdown), the
+ * `docker/Dockerfile` build-context path, RuntimeId unions, config defaults,
+ * comments, and log/label strings.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
