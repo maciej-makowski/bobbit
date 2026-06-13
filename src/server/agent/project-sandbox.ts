@@ -605,10 +605,9 @@ export class ProjectSandbox {
 			const stale = await this._isContainerImageStale(existingId, image);
 			if (stale) {
 				console.warn(`[project-sandbox] Container ${existingId.substring(0, 12)} was created from a stale image (image "${image}" has been rebuilt since); recreating`);
+				// Leave this.containerId null so the create/init fall-through below
+				// rebuilds the container and runs the (idempotent) init sequence.
 				await this._removeContainer(existingId);
-				await this._createContainer();
-				await this._runInitSequence();
-				return;
 			}
 
 			// Check if running
@@ -625,7 +624,9 @@ export class ProjectSandbox {
 					} catch {
 						console.log(`[project-sandbox] Reconnected to running container ${existingId.substring(0, 12)} for project ${projectId}`);
 					}
-					return;
+					// Fall through to _runInitSequence() — idempotent, but ensures a
+					// half-initialized reused container (e.g. prior failed clone) is
+					// fully populated before any worktree op.
 				} catch {
 					// Container is in a bad state — remove and recreate
 					console.warn(`[project-sandbox] Container ${existingId.substring(0, 12)} failed health check, recreating`);
@@ -645,7 +646,7 @@ export class ProjectSandbox {
 					} catch {
 						console.log(`[project-sandbox] Restarted stopped container ${existingId.substring(0, 12)} for project ${projectId}`);
 					}
-					return;
+					// Fall through to _runInitSequence() — see note above.
 				} catch {
 					console.warn(`[project-sandbox] Failed to restart container ${existingId.substring(0, 12)}, recreating`);
 					await this._removeContainer(existingId);
@@ -653,10 +654,15 @@ export class ProjectSandbox {
 			}
 		}
 
-		// 2. No usable container — create new one
-		await this._createContainer();
+		// 2. No usable container — create one only if we didn't reconnect above.
+		if (!this.containerId) {
+			await this._createContainer();
+		}
 
-		// 3. Run init sequence if needed
+		// 3. Always ensure the workspace is initialized. _runInitSequence() is
+		// idempotent: a no-op for healthy reconnects (`/workspace/.git` exists),
+		// and it completes the clone for a half-initialized reused container
+		// (e.g. a prior failed clone left /workspace empty) BEFORE any worktree op.
 		await this._runInitSequence();
 	}
 

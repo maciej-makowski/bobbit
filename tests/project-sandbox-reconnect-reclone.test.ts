@@ -1,0 +1,105 @@
+/**
+ * Regression test for the "stale reused container skips the clone" bug.
+ *
+ * `ProjectSandbox._initContainer()` used to `return` early in both reconnect
+ * branches (running container, restarted-stopped container) after setting
+ * `this.containerId`, SKIPPING `_runInitSequence()`. So a container that was
+ * reused but whose `/workspace` was never populated (e.g. a prior clone
+ * failed) was trusted as initialized, and the subsequent `createWorktree` →
+ * `git worktree add` in `/workspace` failed with "fatal: not a git repository".
+ *
+ * The fix makes every reconnect path fall through to the idempotent
+ * `_runInitSequence()`:
+ *  - when `/workspace/.git` is MISSING → the clone IS issued (re-clone), and
+ *  - when `/workspace/.git` is PRESENT → the clone is SKIPPED (no-op).
+ *
+ * We inject a fake ContainerRuntime that returns an existing RUNNING container
+ * (so `_createContainer` — which has fs side effects — is never reached) and
+ * records every `exec` argv. The `test -d /workspace/.git` probe outcome is
+ * toggled per scenario.
+ */
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+
+const { ProjectSandbox } = await import("../src/server/agent/project-sandbox.ts");
+
+/** A minimal fake ContainerRuntime that records exec calls and lets the test
+ * decide whether `/workspace/.git` exists. */
+function makeFakeRuntime(opts: { workspaceHasGit: boolean }) {
+	const execCalls: string[][] = [];
+	const runtime: any = {
+		bin: "podman",
+		async findContainerByLabel() { return "existing-container-id"; },
+		async isRunning() { return true; },
+		// Not stale: same image id for container and tag.
+		async getContainerImageId() { return "img-sha"; },
+		async getImageId() { return "img-sha"; },
+		async startContainer() { /* unused — container is running */ },
+		async removeContainer() { throw new Error("removeContainer must not be called in reconnect"); },
+		async createContainer() { throw new Error("createContainer must not be called when reconnecting to a running container"); },
+		async getResourceLimits() { return null; },
+		async exec(_id: string, argv: string[]) {
+			execCalls.push(argv);
+			// Simulate the `/workspace/.git` presence probe.
+			if (argv[0] === "test" && argv.includes("/workspace/.git")) {
+				if (!opts.workspaceHasGit) throw new Error("test -d /workspace/.git → not found");
+				return { stdout: "", stderr: "" };
+			}
+			// Everything else (echo ok, ls worktrees, git config, git clone, npm probes) succeeds.
+			// Make the package.json / package-lock probes fail so the post-clone
+			// npm steps are skipped (keep the call list focused on the clone).
+			if (argv[0] === "test" && argv.some(a => a.includes("package") || a.includes("node_modules"))) {
+				throw new Error("no such file");
+			}
+			if (argv[0] === "node") throw new Error("no build script");
+			return { stdout: "", stderr: "" };
+		},
+	};
+	return { runtime, execCalls };
+}
+
+function clonedInto(execCalls: string[][], dest: string): boolean {
+	return execCalls.some(a => a[0] === "git" && a[1] === "clone" && a[a.length - 1] === dest);
+}
+
+describe("ProjectSandbox._initContainer reconnect always ensures the workspace is initialized", () => {
+	it("RE-CLONES when reconnecting to a running container whose /workspace has no .git", async () => {
+		const { runtime, execCalls } = makeFakeRuntime({ workspaceHasGit: false });
+		const sandbox = new ProjectSandbox({
+			runtime,
+			sandboxMode: "podman",
+			projectId: "proj-reclone",
+			projectDir: "/tmp/does-not-matter",
+			repoUrl: "https://example.com/repo.git",
+			image: "bobbit-agent",
+		});
+
+		await sandbox.init();
+
+		assert.equal(await sandbox.getContainerId(), "existing-container-id", "must reconnect, not recreate");
+		assert.ok(
+			clonedInto(execCalls, "."),
+			`expected a 'git clone … .' into /workspace for an uninitialized reused container; calls: ${JSON.stringify(execCalls)}`,
+		);
+	});
+
+	it("SKIPS the clone when reconnecting to a running container whose /workspace already has .git", async () => {
+		const { runtime, execCalls } = makeFakeRuntime({ workspaceHasGit: true });
+		const sandbox = new ProjectSandbox({
+			runtime,
+			sandboxMode: "podman",
+			projectId: "proj-noclone",
+			projectDir: "/tmp/does-not-matter",
+			repoUrl: "https://example.com/repo.git",
+			image: "bobbit-agent",
+		});
+
+		await sandbox.init();
+
+		assert.equal(await sandbox.getContainerId(), "existing-container-id", "must reconnect, not recreate");
+		assert.ok(
+			!clonedInto(execCalls, "."),
+			`expected NO clone for a healthy reused container (/workspace/.git present); calls: ${JSON.stringify(execCalls)}`,
+		);
+	});
+});
