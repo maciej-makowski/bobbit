@@ -1976,11 +1976,10 @@ Bobbit server                           /workspace        (repo clone, native Li
 
 ### Configuration
 
-All settings live in `project.yaml`; the common ones are also editable from the **Container Sandbox** section of Project Settings (including the **Container Runtime** dropdown described below):
+All settings live in `project.yaml`; the common ones are also editable from the **Container Sandbox** section of Project Settings (via the single **Sandbox Mode** dropdown described below):
 
 ```yaml
-sandbox: "docker"                      # enable flag: "none" (default) or "docker"
-sandbox_runtime: "docker"              # provider: "docker" (default) or "podman" — see Container runtime abstraction
+sandbox: "docker"                      # mode: "none" (off) | "docker" | "podman" — see Container runtime abstraction
 sandbox_image: "bobbit-agent"          # must be pre-built
 sandbox_tokens:
   - key: GITHUB_TOKEN
@@ -1994,7 +1993,7 @@ sandbox_mounts: '["/data/shared:/data:ro"]'  # bind mounts
 
 ### Container runtime abstraction
 
-Sandboxing is gated by the `sandbox` **enable flag** (`"none" | "docker"`); *which* container CLI actually runs the containers is a **separate** choice, the `sandbox_runtime` **provider selector** (`"docker" | "podman"`). The two strings look alike but mean different things — `sandbox: "docker"` is the on/off switch, `sandbox_runtime` names the provider binary. Keeping them independent lets a project run the identical sandbox flows on Podman, with no `docker` binary on the host. (The rest of this page still says "Docker" for the common case; everything applies to whichever runtime is selected.)
+Sandboxing is controlled by a **single `sandbox` mode** with three values: `"none"` turns sandboxing off, `"docker"` enables it on `DockerRuntime`, and `"podman"` enables it on `PodmanRuntime`. The mode is both the on/off switch *and* the provider selector — selecting `podman` enables sandboxing and routes every container call through Podman in one step, with no `docker` binary on the host. (Earlier the provider was a separate `sandbox_runtime` key; that key was removed — see *Configuration recap* below. The rest of this page still says "Docker" for the common case; everything applies to whichever runtime is selected.)
 
 **Why a provider interface, not a binary-name string.** The first attempt simply threaded a `"docker" | "podman"` string to every call site and reused Docker's argument arrays verbatim, assuming the two CLIs are argument-for-argument identical. They are not, and the gaps leaked everywhere — most visibly, `docker info --format '{{.ServerVersion}}'` *throws* against Podman, whose `info` schema is nested. Threading a string meant every new difference became another `if (bin === "podman")` scattered across the codebase: it doesn't scale and is hard to test. The fix is a provider interface — one place per runtime that owns its own arg/template/quirk differences — so call sites stay runtime-agnostic. Full rationale and migration plan: [design/sandbox-runtime-abstraction.md](design/sandbox-runtime-abstraction.md).
 
@@ -2016,20 +2015,21 @@ Sandboxing is gated by the `sandbox` **enable flag** (`"none" | "docker"`); *whi
 
 `PodmanRuntime` is validated against rootless podman 5.8.2.
 
-**Factory and wiring.** `createContainerRuntime(id)` maps a `RuntimeId` to an instance; `resolveContainerRuntime(store)` reads `ProjectConfigStore.getSandboxRuntime()` and **never throws** — an unknown, empty, or missing value resolves to Docker, preserving today's behaviour. `SessionManager` resolves the runtime once per project and threads the *instance* (not a binary string) into `ProjectSandbox`, the rpc-bridge options, and bg-process wiring. Server-side git-panel helpers (commit/push/status/diff) only have a `containerId` in scope, not the project's runtime, so `ProjectSandbox` registers a `containerId → runtime` mapping in a small registry that `runtimeForContainerId()` / `runtimeForContainerIdOrDocker()` look up (Docker fallback for unregistered ids). End state: no `=== "podman"` branch exists anywhere outside the implementation files — `rg '"docker"' src/server` shows only the `DockerRuntime` impl, the `sandbox` enable-flag comparisons, and the `docker/Dockerfile` build-context path.
+**Factory and wiring.** `createContainerRuntime(id)` maps a `RuntimeId` to an instance; `resolveContainerRuntime(store)` reads `ProjectConfigStore.getSandboxRuntime()` and **never throws** — `getSandboxRuntime()` derives the runtime from the single `sandbox` mode (`"podman"` → Podman; anything else, including `"docker"`, `"none"`, unknown, empty, or missing → Docker), preserving today's behaviour. `SessionManager` resolves the runtime once per project and threads the *instance* (not a binary string) into `ProjectSandbox`, the rpc-bridge options, and bg-process wiring. Server-side git-panel helpers (commit/push/status/diff) only have a `containerId` in scope, not the project's runtime, so `ProjectSandbox` registers a `containerId → runtime` mapping in a small registry that `runtimeForContainerId()` / `runtimeForContainerIdOrDocker()` look up (Docker fallback for unregistered ids). End state: no `=== "podman"` branch exists anywhere outside the implementation files — `rg '"docker"' src/server` shows only the `DockerRuntime` impl, the `sandbox` enable-flag comparisons, and the `docker/Dockerfile` build-context path.
 
-**Configuration recap.** Set both keys in `project.yaml`:
+**Configuration recap.** Set the single mode in `project.yaml`:
 
 ```yaml
-sandbox: "docker"            # enable flag: "none" (default) | "docker"
-sandbox_runtime: "podman"    # provider:    "docker" (default) | "podman"
+sandbox: "podman"            # mode: "none" (off) | "docker" | "podman"
 ```
 
-`getSandboxRuntime()` is the only reader (lower-cases and trims the value, falling back to `docker`).
+`getSandboxRuntime()` is the only reader: it lower-cases and trims the `sandbox` value, returns `"podman"` for `podman` and `"docker"` for everything else. The old `sandbox_runtime` provider key was **removed** — it is never read, and a stale `sandbox_runtime` left in a `project.yaml` is silently ignored (no migration, no warning). A project that previously selected Podman via the old `sandbox: docker` + `sandbox_runtime: podman` combo therefore falls back to Docker until `sandbox` is set to `"podman"`.
 
-**Selecting the runtime in the UI.** Project Settings → **Container Sandbox** surfaces a **Container Runtime** dropdown (Docker / Podman) directly below the **Sandbox Mode** selector, wired to `sandbox_runtime` through the generic `PUT /api/projects/:id/config` save flow — no hand-editing of `project.yaml` required (`renderSandboxSection` in `src/app/settings-page.ts`). Default/absent renders **Docker** selected. The dropdown is *relevance-gated*: it is always visible but disabled and greyed (with an "Applies when Sandbox Mode is enabled" hint) unless Sandbox Mode is `docker`, since the runtime choice is moot when sandboxing is off. The UI only reads/writes the `sandbox_runtime` string and lists the two options — there is no `=== "podman"` behaviour in the UI; all runtime behaviour stays behind `ContainerRuntime`.
+**Selecting the runtime in the UI.** Project Settings → **Container Sandbox** surfaces a single **Sandbox Mode** dropdown with three options — `none` / `docker` / `podman` — wired to `sandbox` through the generic `PUT /api/projects/:id/config` save flow, so selecting `podman` and saving writes `sandbox: "podman"` with no hand-editing of `project.yaml` (`renderSandboxSection` in `src/app/settings-page.ts`). There is no longer a separate Container Runtime dropdown; the mode is the sole control. The UI only reads/writes the `sandbox` string and lists the three options — there is no `=== "podman"` behaviour in the UI; all runtime behaviour stays behind `ContainerRuntime`.
 
 **Runtime-aware status display.** `GET /api/sandbox-status` resolves the project's runtime via `resolveContainerRuntime(projectConfigStore)` and includes a `runtime` field (`runtime.id`, `"docker" | "podman"`). The Settings status row reflects the *selected* runtime rather than a hardcoded "Docker": the availability probe (`checkDockerAvailability`) runs `getVersion()` against the chosen binary, the UI labels the line with the runtime's display name (e.g. "Podman available (v5.8.2)"), and the build-command hint shown when the image is missing uses the selected binary (`<runtime> build -t <image> docker/`). The section header and status row were generalized for this ("Docker Sandbox" → "Container Sandbox", "Docker Status" → "Runtime Status") so they read correctly under either runtime.
+
+When the chosen runtime's availability probe fails, the Runtime Status row must say something actionable rather than a bare "podman is not available". The `ContainerRuntime` contract therefore exposes `availabilityHint(): string | undefined` — `BaseCliRuntime`/`DockerRuntime` return `undefined`, and `PodmanRuntime` returns a hint naming the common rootless/SELinux failures and the `info --format` schema gotcha (Podman nests `.Version.Version` / `.Host.CPUs` / `.Host.MemTotal`). `checkDockerAvailability` appends the hint to the error so it surfaces in the status row when mode is `podman`.
 
 **Out of scope (first cut):** rootless-Podman edge cases beyond the `:Z` relabel and host-gateway mapping above, remote daemon/socket transports, nerdctl, and podman-machine provisioning. These land as fast-follows if real-Podman use surfaces them — the point of the interface is that each one is a change confined to `PodmanRuntime`, not a new conditional sprinkled across the codebase.
 
