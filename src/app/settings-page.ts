@@ -354,7 +354,7 @@ async function resetProjectScopeField(projectId: string, key: string): Promise<v
 }
 
 // ── Sandbox section state ──
-let sandboxStatusLocal: { available: boolean; error?: string; runtime?: "docker" | "podman"; dockerVersion?: string; imageExists?: boolean; dockerfileExists?: boolean; buildCommand?: string; configured: boolean } | null = null;
+let sandboxStatusLocal: { available: boolean; error?: string; dockerVersion?: string; imageExists?: boolean; dockerfileExists?: boolean; buildCommand?: string; configured: boolean } | null = null;
 let sandboxStatusLoaded = false;
 let sandboxBuildInProgress = false;
 let sandboxBuildError = "";
@@ -548,22 +548,15 @@ function renderSandboxSection(
 	initSandboxEntries(projectId, resolved);
 
 	const sandboxMode = pendingChanges.sandbox ?? resolved.sandbox?.value ?? "none";
-	const sandboxRuntime = pendingChanges.sandbox_runtime ?? resolved.sandbox_runtime?.value ?? "docker";
-	const runtimeEnabled = sandboxMode === "docker";
 	const imageName = pendingChanges.sandbox_image ?? resolved.sandbox_image?.value ?? "bobbit-agent";
-	// Display name derived generically from the server-provided runtime id —
-	// no per-runtime branching (capitalize first char). Falls back to Docker.
-	const runtimeName = sandboxStatusLocal?.runtime
-		? sandboxStatusLocal.runtime[0].toUpperCase() + sandboxStatusLocal.runtime.slice(1)
-		: "Docker";
 	const tokenEntries = _sandboxTokenEntries.get(projectId) || [];
 	const mountEntries = _sandboxMountEntries.get(projectId) || [];
 
 	return html`
 		<div class="flex flex-col gap-2">
-			<div class="text-[11px] text-muted-foreground uppercase tracking-wider font-medium">Container Sandbox</div>
+			<div class="text-[11px] text-muted-foreground uppercase tracking-wider font-medium">Docker Sandbox</div>
 			<p class="text-xs text-muted-foreground -mt-1">
-				Run agent sessions in isolated containers with restricted filesystem and network access.
+				Run agent sessions in isolated Docker containers with restricted filesystem and network access.
 			</p>
 
 			<!-- Sandbox Mode -->
@@ -582,34 +575,16 @@ function renderSandboxSection(
 				</select>
 			</div>
 
-			<!-- Container Runtime -->
-			<div class="flex items-center gap-3 ${runtimeEnabled ? "" : "opacity-60"}">
-				<span class="${labelClass}">Container Runtime</span>
-				<select
-					class="${inputClass} max-w-48"
-					.value=${sandboxRuntime}
-					?disabled=${!runtimeEnabled}
-					@change=${(e: Event) => {
-						pendingChanges.sandbox_runtime = (e.target as HTMLSelectElement).value;
-						renderApp();
-					}}
-				>
-					<option value="docker">Docker</option>
-					<option value="podman">Podman</option>
-				</select>
-				${runtimeEnabled ? "" : html`<span class="text-xs text-muted-foreground">Applies when Sandbox Mode is enabled</span>`}
-			</div>
-
-			<!-- Runtime Status -->
+			<!-- Docker Status -->
 			<div class="flex items-center gap-3">
-				<span class="${labelClass}">Runtime Status</span>
+				<span class="${labelClass}">Docker Status</span>
 				<div class="flex items-center gap-2 text-sm">
 					${sandboxStatusLocal === null
 						? html`<span class="text-muted-foreground">Checking...</span>`
 						: sandboxStatusLocal.available
 							? html`
 								<span class="w-2 h-2 rounded-full bg-green-500"></span>
-								<span class="text-foreground">${runtimeName} available${sandboxStatusLocal.dockerVersion ? ` (v${sandboxStatusLocal.dockerVersion})` : ""}</span>
+								<span class="text-foreground">Available${sandboxStatusLocal.dockerVersion ? ` (v${sandboxStatusLocal.dockerVersion})` : ""}</span>
 								${sandboxStatusLocal.imageExists !== undefined
 									? sandboxStatusLocal.imageExists
 										? html`<span class="text-xs text-muted-foreground ml-2">Image "${imageName}": found</span>`
@@ -658,7 +633,7 @@ function renderSandboxSection(
 							`}
 					<button
 						class="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors ml-1"
-						title="Refresh runtime status"
+						title="Refresh Docker status"
 						@click=${() => { sandboxStatusLoaded = false; loadSandboxStatus(); }}
 					>${icon(RotateCcw, "xs")}</button>
 				</div>
