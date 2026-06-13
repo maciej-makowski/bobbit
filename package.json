@@ -38,7 +38,9 @@
     "test": "npm run build && npm run test:unit && npm run test:e2e:run --",
     "clean": "shx rm -rf dist",
     "prepublishOnly": "npm run build",
-    "build:binaries": "node scripts/build-binaries.mjs"
+    "build:binaries": "node scripts/build-binaries.mjs",
+    "sandbox:build:docker": "node scripts/build-sandbox-image.mjs docker",
+    "sandbox:build:podman": "node scripts/build-sandbox-image.mjs podman"
   },
   "optionalDependencies": {
     "@bobbit/binaries-darwin-arm64": "0.9.0",
