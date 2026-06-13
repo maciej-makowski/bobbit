@@ -368,10 +368,10 @@ let hostTokensLoaded = false;
 const _sandboxTokenEntries = new Map<string, { key: string; value: string; enabled: boolean; isHost: boolean; redacted: boolean }[]>();
 const _sandboxMountEntries = new Map<string, string[]>();
 
-function loadSandboxStatus(): void {
+function loadSandboxStatus(mode?: string): void {
 	if (sandboxStatusLoaded) return;
 	sandboxStatusLoaded = true;
-	fetchSandboxStatus().then(s => {
+	fetchSandboxStatus(mode).then(s => {
 		sandboxStatusLocal = s;
 		state.sandboxStatus = s;
 		renderApp();
@@ -544,10 +544,10 @@ function renderSandboxSection(
 	inputClass: string,
 	labelClass: string,
 ) {
-	loadSandboxStatus();
 	initSandboxEntries(projectId, resolved);
 
 	const sandboxMode = pendingChanges.sandbox ?? resolved.sandbox?.value ?? "none";
+	loadSandboxStatus(sandboxMode);
 	const imageName = pendingChanges.sandbox_image ?? resolved.sandbox_image?.value ?? "bobbit-agent";
 	// Display name derived generically from the server-provided runtime id —
 	// no per-runtime branching (capitalize first char). Falls back to Docker.
@@ -571,7 +571,10 @@ function renderSandboxSection(
 					class="${inputClass} max-w-48"
 					.value=${sandboxMode}
 					@change=${(e: Event) => {
-						pendingChanges.sandbox = (e.target as HTMLSelectElement).value;
+						const value = (e.target as HTMLSelectElement).value;
+						pendingChanges.sandbox = value;
+						sandboxStatusLoaded = false;
+						loadSandboxStatus(value);
 						renderApp();
 					}}
 				>
@@ -613,7 +616,7 @@ function renderSandboxSection(
 																	if (resp.ok && result.success) {
 																		sandboxBuildInProgress = false;
 																		sandboxStatusLoaded = false;
-																		loadSandboxStatus();
+																		loadSandboxStatus(sandboxMode);
 																	} else {
 																		sandboxBuildInProgress = false;
 																		sandboxBuildError = result.error || "Build failed";
@@ -640,7 +643,7 @@ function renderSandboxSection(
 					<button
 						class="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors ml-1"
 						title="Refresh runtime status"
-						@click=${() => { sandboxStatusLoaded = false; loadSandboxStatus(); }}
+						@click=${() => { sandboxStatusLoaded = false; loadSandboxStatus(sandboxMode); }}
 					>${icon(RotateCcw, "xs")}</button>
 				</div>
 			</div>

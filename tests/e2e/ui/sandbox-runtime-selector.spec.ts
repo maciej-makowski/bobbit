@@ -135,6 +135,34 @@ test.describe("Sandbox Mode selector (single-field)", () => {
 		}
 	});
 
+	test("runtime-status probe targets the SELECTED backend", async ({ page }) => {
+		const { id, cleanup } = await registerProject(`e2e-runtime-probe-${Date.now()}`);
+		try {
+			await openApp(page, `/settings/${id}/general`);
+			await expect(page.getByText("Sandbox Mode", { exact: true })).toBeVisible({ timeout: 15_000 });
+
+			// Selecting podman must re-probe the runtime against the SELECTED
+			// backend, i.e. the GET /api/sandbox-status carries sandbox=podman —
+			// NOT the saved config (which is still "none").
+			const podmanReq = page.waitForRequest(
+				(r) => r.url().includes("/api/sandbox-status") && r.url().includes("sandbox=podman"),
+				{ timeout: 15_000 },
+			);
+			await modeSelect(page).selectOption("podman");
+			await podmanReq;
+
+			// Switching to docker re-probes docker.
+			const dockerReq = page.waitForRequest(
+				(r) => r.url().includes("/api/sandbox-status") && r.url().includes("sandbox=docker"),
+				{ timeout: 15_000 },
+			);
+			await modeSelect(page).selectOption("docker");
+			await dockerReq;
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("ignores a stale sandbox_runtime key (back-compat) — shows docker mode", async ({ page }) => {
 		const { id, rootPath, cleanup } = await registerProject(`e2e-runtime-stale-${Date.now()}`);
 		try {

@@ -232,7 +232,7 @@ import { ProjectConfigStore, type PackOrderScope } from "./agent/project-config-
 import { ToolGroupPolicyStore } from "./agent/tool-group-policy-store.js";
 import { getAllConfigDirectories, removeBuiltinDirectory, resetConfigDirectories } from "./agent/config-directories.js";
 import { checkDockerAvailability, buildSandboxImage, isBuildingImage, ensureImageAgentVersion } from "./agent/sandbox-status.js";
-import { resolveContainerRuntime, runtimeForContainerId, runtimeForContainerIdOrDocker } from "./agent/container-runtime/index.js";
+import { resolveContainerRuntime, createContainerRuntime, runtimeForContainerId, runtimeForContainerIdOrDocker } from "./agent/container-runtime/index.js";
 import { SandboxManager, type SandboxBootstrap } from "./agent/sandbox-manager.js";
 import { resolveSandboxCloneSource, type SandboxCloneSource } from "./agent/sandbox-clone-source.js";
 import { validateSandboxMounts } from "./agent/sandbox-mounts.js";
@@ -2945,10 +2945,22 @@ async function handleApiRoute(
 
 	// GET /api/sandbox-status
 	if (url.pathname === "/api/sandbox-status" && req.method === "GET") {
-		const sandboxConfig = projectConfigStore.get("sandbox") || "none";
 		const imageName = projectConfigStore.get("sandbox_image") || "bobbit-agent";
-		const configured = sandboxConfig !== "none";
-		const status = await checkDockerAvailability(configured ? imageName : undefined, resolveContainerRuntime(projectConfigStore));
+		// Optional ?sandbox=<none|docker|podman> lets the Settings UI probe the
+		// SELECTED (pending) backend before it is saved. When absent, fall back
+		// to the saved-config runtime for back-compat.
+		const sandboxParam = url.searchParams.get("sandbox");
+		let configured: boolean;
+		let runtime;
+		if (sandboxParam !== null) {
+			configured = sandboxParam !== "none";
+			runtime = createContainerRuntime(sandboxParam === "podman" ? "podman" : "docker");
+		} else {
+			const sandboxConfig = projectConfigStore.get("sandbox") || "none";
+			configured = sandboxConfig !== "none";
+			runtime = resolveContainerRuntime(projectConfigStore);
+		}
+		const status = await checkDockerAvailability(configured ? imageName : undefined, runtime);
 		json({ ...status, configured });
 		return;
 	}

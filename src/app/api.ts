@@ -2388,8 +2388,9 @@ export async function postBootTiming(sample: unknown): Promise<void> {
 // SANDBOX STATUS API
 // ============================================================================
 
-export async function fetchSandboxStatus() {
-	const res = await gatewayFetch("/api/sandbox-status");
+export async function fetchSandboxStatus(sandboxMode?: string) {
+	const qs = sandboxMode ? `?sandbox=${encodeURIComponent(sandboxMode)}` : "";
+	const res = await gatewayFetch(`/api/sandbox-status${qs}`);
 	if (!res.ok) return null;
 	return res.json();
 }
