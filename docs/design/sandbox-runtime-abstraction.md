@@ -48,7 +48,7 @@ proper **provider interface**: one place per runtime that owns its quirks.
 `src/server/agent/container-runtime/types.ts`
 
 ```ts
-/** Identifies the provider; also the value of the `sandbox_runtime` config key. */
+/** Identifies the provider; derived from the single `sandbox` mode (`podman` → podman, else docker). */
 export type RuntimeId = "docker" | "podman";
 
 /** One-shot exec result. */
@@ -97,6 +97,13 @@ export interface ContainerRuntime {
   getVersion(): Promise<string>;
   /** Daemon-reported CPU/mem, or null if unavailable (caller falls back to host). */
   getResourceLimits(): Promise<{ cpus: number; memBytes: number } | null>;
+  /**
+   * Actionable hint appended to the availability error when getVersion() fails,
+   * or undefined if there is nothing runtime-specific to add. BaseCliRuntime /
+   * DockerRuntime return undefined; PodmanRuntime returns the rootless/SELinux +
+   * info-schema hint so the status row never just says "podman is not available".
+   */
+  availabilityHint(): string | undefined;
 
   // ── Images ─────────────────────────────────────────────────────
   buildImage(spec: BuildSpec): Promise<void>;
@@ -207,25 +214,34 @@ DockerRuntime impl, the `sandbox` enable-value comparisons, and the
 
 ## 5. Configuration
 
-- Keep the `sandbox: "none" | "docker"` **enable flag** unchanged (on/off).
-- Keep `sandbox_runtime: "docker" | "podman"` as the **provider selector**,
-  validated by `ProjectConfigStore.getSandboxRuntime()` (unknown/empty →
-  `"docker"`, never throws).
-- `resolveContainerRuntime(projectConfigStore)` maps the key to an instance.
-- No Settings UI in *this* cut (config-file only); a later goal surfaces a
-  provider dropdown with a browser E2E.
-  - **Update (landed):** the dropdown shipped. Project Settings → **Container
-    Sandbox** now exposes a **Container Runtime** select (Docker / Podman)
-    below **Sandbox Mode**, wired to `sandbox_runtime` via the existing
-    `PUT /api/projects/:id/config` flow. It is relevance-gated — always shown
-    but disabled/greyed with an "Applies when Sandbox Mode is enabled" hint
-    when sandboxing is off. The sandbox status display is runtime-aware:
-    `GET /api/sandbox-status` returns a `runtime` field and the UI labels
-    availability and the build-command hint with the selected runtime. See
-    [internals.md → Container runtime abstraction](../internals.md#container-runtime-abstraction).
+**Single-mode model (current).** Sandboxing is controlled by one config key,
+`sandbox`, with three values:
 
-(Open question: rename `sandbox_runtime` → `sandbox_provider`? `runtime` reads
-well and avoids a migration; leaning keep. See §8.)
+- `"none"` — sandboxing off.
+- `"docker"` — sandboxing on, `DockerRuntime`.
+- `"podman"` — sandboxing on, `PodmanRuntime`.
+
+The mode is both the enable flag and the provider selector — there is no separate
+`sandbox_runtime` key. `ProjectConfigStore.getSandboxRuntime()` derives the
+`RuntimeId` from `sandbox` (`"podman"` → podman; anything else → docker; never
+throws), and `resolveContainerRuntime(projectConfigStore)` maps that id to an
+instance.
+
+**`sandbox_runtime` removed (no migration).** The earlier two-field design used a
+separate `sandbox_runtime` provider key. That key was **removed entirely**: it is
+never read, and a stale `sandbox_runtime` left in a `project.yaml` is silently
+ignored (no migration, no warning). A project that selected Podman via the old
+`sandbox: docker` + `sandbox_runtime: podman` combo falls back to Docker until
+`sandbox` is set to `"podman"`.
+
+**Settings UI.** Project Settings → **Container Sandbox** exposes a single
+**Sandbox Mode** select with options `none` / `docker` / `podman`, wired to
+`sandbox` via the existing `PUT /api/projects/:id/config` flow (no separate
+Container Runtime dropdown). The sandbox status display is runtime-aware:
+`GET /api/sandbox-status` returns a `runtime` field and the UI labels
+availability and the build-command hint with the selected runtime; when a
+Podman probe fails, `PodmanRuntime.availabilityHint()` enriches the error. See
+[internals.md → Container runtime abstraction](../internals.md#container-runtime-abstraction).
 
 ## 6. Migration plan (incremental, behind the interface)
 
@@ -257,14 +273,14 @@ real rootless podman host.
 - **Guard test** — no spawned-binary `"docker"` literal outside
   `docker-runtime.ts`.
 - **Real Podman** — dev server switched to this worktree (per below),
-  `sandbox_runtime: podman`, drive a full session: create → exec → run a
+  `sandbox: podman`, drive a full session: create → exec → run a
   command step → cleanup. This is the validation the first cut skipped.
 
 ### Dev-server-on-worktree testing (process note)
 Next time we validate sandboxing, point the running gateway at this feature
 worktree (`…/goal-podman-sandbox-b380d4b8`) rather than the primary worktree,
 so the live server runs the in-development code. Keep the pre-built
-`bobbit-agent` podman image and `sandbox_runtime: podman` in that project's
+`bobbit-agent` podman image and `sandbox: podman` in that project's
 config.
 
 ## 8. Open questions for review
@@ -278,7 +294,9 @@ config.
    (each runtime builds its own argv from `ContainerRunSpec`), or keep a shared
    builder that emits a neutral arg list the runtime post-processes? I lean
    "runtime builds its own" for clean Podman relabel/host-gateway handling.
-3. **Config key name** — keep `sandbox_runtime`, or rename to `sandbox_provider`?
+3. **Config key name** — *Resolved:* there is no separate provider key. The
+   provider is folded into the single `sandbox` mode (`none|docker|podman`);
+   `sandbox_runtime` was removed.
 4. **Module location** — `src/server/agent/container-runtime/` vs
    `src/server/agent/sandbox/runtime/`?
 5. **Scope of Podman run-arg parity now** — implement SELinux `:Z` relabel and
