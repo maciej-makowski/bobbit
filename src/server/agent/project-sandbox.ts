@@ -229,11 +229,14 @@ export class ProjectSandbox {
 		const containerId = await this.getContainerId();
 		const worktreePath = `/workspace-wt/${name}`;
 
-		// Ensure the parent directory exists (may need root if not created during init)
+		// Ensure the parent directory exists AND is writable by node. `mkdir -p`
+		// is a no-op exit-0 on an existing root-owned dir, so test writability
+		// explicitly — otherwise the root chown fallback never fires for a reused
+		// root-owned /workspace-wt named volume (rootless podman).
 		try {
-			await this._dockerExec(containerId, ["mkdir", "-p", "/workspace-wt"]);
+			await this._dockerExec(containerId, ["sh", "-c", "mkdir -p /workspace-wt && test -w /workspace-wt"]);
 		} catch {
-			// Permission denied — create as root and chown to node
+			// Not writable — create/chown to node as root
 			await this.runtime.exec(containerId, [
 				"sh", "-c", "mkdir -p /workspace-wt && chown node:node /workspace-wt",
 			], { user: "root", timeoutMs: 10_000 });
@@ -340,8 +343,11 @@ export class ProjectSandbox {
 		const containerId = await this.getContainerId();
 		const container = `/workspace-wt/${name}`;
 
+		// Test writability, not mere existence: `mkdir -p` is a no-op exit-0 on an
+		// existing root-owned dir, so the root chown fallback would never fire for a
+		// reused root-owned /workspace-wt named volume (rootless podman).
 		try {
-			await this._dockerExec(containerId, ["mkdir", "-p", container]);
+			await this._dockerExec(containerId, ["sh", "-c", `mkdir -p ${container} && test -w ${container}`]);
 		} catch {
 			await this.runtime.exec(containerId, [
 				"sh", "-c", `mkdir -p ${container} && chown node:node ${container}`,
@@ -659,11 +665,38 @@ export class ProjectSandbox {
 			await this._createContainer();
 		}
 
-		// 3. Always ensure the workspace is initialized. _runInitSequence() is
+		// 3. Ensure BOTH writable named volumes are node-owned on EVERY init path
+		// (fresh create AND reconnect/restart), BEFORE clone or worktree ops. This
+		// is the central guarantee for reused containers whose volumes are stale
+		// root-owned mounts under rootless podman.
+		await this._ensureWritableSandboxVolumes();
+
+		// 4. Always ensure the workspace is initialized. _runInitSequence() is
 		// idempotent: a no-op for healthy reconnects (`/workspace/.git` exists),
 		// and it completes the clone for a half-initialized reused container
 		// (e.g. a prior failed clone left /workspace empty) BEFORE any worktree op.
 		await this._runInitSequence();
+	}
+
+	/**
+	 * Make both writable named volumes node-owned. Rootless-podman named volumes
+	 * are root-owned, so the unprivileged `node` user can't clone into
+	 * `/workspace` nor create worktrees under `/workspace-wt`. chown the two mount
+	 * roots as root — idempotent and non-recursive (existing per-worktree subdirs
+	 * were created by node, so they're already node-owned). Runs on EVERY init
+	 * path so reused/reconnected containers get writable volumes too. Harmless on
+	 * Docker (volume copy-up already yields node-owned content). Non-fatal: the
+	 * createWorktree / clone guards retry root-chown on their own as a backstop.
+	 */
+	private async _ensureWritableSandboxVolumes(): Promise<void> {
+		if (!this.containerId) return;
+		try {
+			await this.runtime.exec(this.containerId, [
+				"sh", "-c", "mkdir -p /workspace /workspace-wt && chown node:node /workspace /workspace-wt",
+			], { user: "root", timeoutMs: 10_000 });
+		} catch (err: any) {
+			console.warn(`[project-sandbox] Failed to chown sandbox volumes to node (non-fatal):`, err?.message || err);
+		}
 	}
 
 	private async _createContainer(): Promise<void> {
@@ -801,13 +834,9 @@ export class ProjectSandbox {
 		// (`_runInitSequenceMultiRepo`) already orders this before its clones.
 		await this._dockerExec(this.containerId, ["git", "config", "--global", "--add", "safe.directory", "*"]);
 
-		// Named volumes under rootless podman are root-owned (no copy-up for a
-		// non-empty image dir, and copy-up only applies to empty volumes), so the
-		// unprivileged `node` user can't write `/workspace/.git`. chown /workspace
-		// to node as root before cloning. Docker is unaffected (its volume copy-up
-		// already yields node-owned content), so this is harmless there. Only
-		// reached when `/workspace/.git` is absent (i.e. about to clone) — cheap.
-		await this.runtime.exec(this.containerId, ["sh", "-c", "chown node:node /workspace"], { user: "root", timeoutMs: 10_000 });
+		// /workspace is already node-owned by `_ensureWritableSandboxVolumes()`,
+		// which ran in `_initContainer()` before this sequence — rootless-podman
+		// named volumes start root-owned, blocking the `node` clone otherwise.
 
 		// Clone the repo
 		console.log(`[project-sandbox] Cloning ${repoUrl} into /workspace...`);
@@ -877,11 +906,9 @@ export class ProjectSandbox {
 		// Mark all of /workspace as a safe directory for git
 		await this._dockerExec(this.containerId, ["git", "config", "--global", "--add", "safe.directory", "*"]);
 
-		// Named volumes under rootless podman are root-owned, so the unprivileged
-		// `node` user can't `mkdir -p /workspace/<repo>` or clone into it. chown
-		// /workspace to node as root before the per-repo clone loop. Harmless on
-		// Docker (volume copy-up already yields node-owned content).
-		await this.runtime.exec(this.containerId, ["sh", "-c", "chown node:node /workspace"], { user: "root", timeoutMs: 10_000 });
+		// /workspace is already node-owned by `_ensureWritableSandboxVolumes()`
+		// (ran in `_initContainer()` before this sequence), so the `node` user can
+		// `mkdir -p /workspace/<repo>` and clone into it.
 
 		for (const repo of repoNames) {
 			if (repo === ".") continue;  // sanity

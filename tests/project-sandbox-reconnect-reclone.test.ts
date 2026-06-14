@@ -62,10 +62,15 @@ function clonedInto(execCalls: string[][], dest: string): boolean {
 	return execCalls.some(a => a[0] === "git" && a[1] === "clone" && a[a.length - 1] === dest);
 }
 
-/** Index of the first root `chown node:node /workspace` exec (sh -c form). */
-function chownWorkspaceIndex(execCalls: string[][]): number {
+/**
+ * Index of the central `_ensureWritableSandboxVolumes()` exec: a single root
+ * `chown node:node /workspace /workspace-wt` covering BOTH writable named
+ * volumes. Runs on every init path so reused root-owned podman volumes become
+ * node-writable before clone/worktree ops.
+ */
+function chownBothVolumesIndex(execCalls: string[][]): number {
 	return execCalls.findIndex(
-		a => a[0] === "sh" && a[1] === "-c" && /chown node:node \/workspace(\s|$)/.test(a[2] ?? ""),
+		a => a[0] === "sh" && a[1] === "-c" && /chown node:node \/workspace \/workspace-wt/.test(a[2] ?? ""),
 	);
 }
 
@@ -94,17 +99,20 @@ describe("ProjectSandbox._initContainer reconnect always ensures the workspace i
 			`expected a 'git clone … .' into /workspace for an uninitialized reused container; calls: ${JSON.stringify(execCalls)}`,
 		);
 
-		// Rootless-podman fix: a root `chown node:node /workspace` must precede the
-		// clone so the unprivileged `node` user can write /workspace/.git.
-		const chownIdx = chownWorkspaceIndex(execCalls);
+		// Rootless-podman fix: the central `_ensureWritableSandboxVolumes()` issues a
+		// single root `chown node:node /workspace /workspace-wt` on the reconnect
+		// path, BEFORE the clone, so the unprivileged `node` user can write
+		// /workspace/.git AND create worktrees under the (otherwise root-owned)
+		// /workspace-wt named volume.
+		const chownIdx = chownBothVolumesIndex(execCalls);
 		const cloneIdx = cloneIntoWorkspaceIndex(execCalls);
 		assert.ok(
 			chownIdx >= 0,
-			`expected a root 'chown node:node /workspace' during init; calls: ${JSON.stringify(execCalls)}`,
+			`expected a root 'chown node:node /workspace /workspace-wt' during init; calls: ${JSON.stringify(execCalls)}`,
 		);
 		assert.ok(
 			chownIdx < cloneIdx,
-			`expected chown /workspace (idx ${chownIdx}) BEFORE git clone (idx ${cloneIdx}); calls: ${JSON.stringify(execCalls)}`,
+			`expected chown of both volumes (idx ${chownIdx}) BEFORE git clone (idx ${cloneIdx}); calls: ${JSON.stringify(execCalls)}`,
 		);
 	});
 
@@ -126,11 +134,13 @@ describe("ProjectSandbox._initContainer reconnect always ensures the workspace i
 			!clonedInto(execCalls, "."),
 			`expected NO clone for a healthy reused container (/workspace/.git present); calls: ${JSON.stringify(execCalls)}`,
 		);
-		// No clone → no need to chown /workspace either (the chown is gated behind
-		// the about-to-clone path, keeping healthy reconnects a pure no-op).
+		// Even for a healthy reconnect (clone skipped), the central
+		// `_ensureWritableSandboxVolumes()` still chowns BOTH writable named volumes
+		// to node — reused podman volumes can be stale root-owned mounts, and the
+		// subsequent worktree ops need /workspace-wt writable.
 		assert.ok(
-			chownWorkspaceIndex(execCalls) < 0,
-			`expected NO chown /workspace for a healthy reused container; calls: ${JSON.stringify(execCalls)}`,
+			chownBothVolumesIndex(execCalls) >= 0,
+			`expected a root 'chown node:node /workspace /workspace-wt' even for a healthy reconnect; calls: ${JSON.stringify(execCalls)}`,
 		);
 	});
 });
