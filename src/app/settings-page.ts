@@ -354,7 +354,7 @@ async function resetProjectScopeField(projectId: string, key: string): Promise<v
 }
 
 // ── Sandbox section state ──
-let sandboxStatusLocal: { available: boolean; error?: string; runtime?: "docker" | "podman"; dockerVersion?: string; imageExists?: boolean; dockerfileExists?: boolean; buildCommand?: string; configured: boolean } | null = null;
+let sandboxStatusLocal: { available: boolean; error?: string; runtime?: "docker" | "podman"; dockerVersion?: string; imageExists?: boolean; dockerfileExists?: boolean; buildCommand?: string; configured: boolean; clone?: { origin: string | null; kind: "remote" | "mounted" | "local-error"; containerCloneUrl: string | null; rewritten: boolean; error?: string } } | null = null;
 let sandboxStatusLoaded = false;
 let sandboxBuildInProgress = false;
 let sandboxBuildError = "";
@@ -537,6 +537,57 @@ function syncTokenEntries(
 	pendingChanges.sandbox_tokens = arr.length > 0 ? arr : null;
 }
 
+/**
+ * Render the small note explaining how the project's git remote is used to
+ * clone the repo INSIDE the sandbox container. The HOST repo's remote is never
+ * modified — only the in-container clone URL is derived (see
+ * `sandbox-clone-source.ts`). Surfacing this here keeps the HTTPS-rewrite from
+ * being a surprise.
+ */
+function renderSandboxCloneNote(clone: {
+	origin: string | null;
+	kind: "remote" | "mounted" | "local-error";
+	containerCloneUrl: string | null;
+	rewritten: boolean;
+	error?: string;
+}) {
+	const codeClass = "bg-secondary px-1 py-0.5 rounded font-mono text-[11px] break-all";
+	if (clone.kind === "local-error") {
+		return html`
+			<p class="text-xs text-orange-500 -mt-1 flex gap-1.5">
+				<span>⚠</span>
+				<span>origin <code class="${codeClass}">${clone.origin}</code> is a local path and can't be
+				cloned into a sandbox container. Configure a network remote (https/ssh) or remove
+				origin.${clone.error ? html` <span class="text-muted-foreground">(${clone.error})</span>` : ""}</span>
+			</p>`;
+	}
+	if (clone.kind === "mounted") {
+		return html`
+			<p class="text-xs text-muted-foreground -mt-1 flex gap-1.5">
+				<span>ℹ</span>
+				<span>No <code class="${codeClass}">origin</code> remote — the project repo is bind-mounted
+				read-only and cloned via <code class="${codeClass}">file://</code> inside the container.</span>
+			</p>`;
+	}
+	// kind === "remote"
+	if (clone.rewritten) {
+		return html`
+			<p class="text-xs text-muted-foreground -mt-1 flex gap-1.5">
+				<span>ℹ</span>
+				<span>Sandbox containers clone over HTTPS. Your origin
+				<code class="${codeClass}">${clone.origin}</code> is used inside the container as
+				<code class="${codeClass}">${clone.containerCloneUrl}</code>; your host remote is left
+				unchanged.</span>
+			</p>`;
+	}
+	return html`
+		<p class="text-xs text-muted-foreground -mt-1 flex gap-1.5">
+			<span>ℹ</span>
+			<span>Sandbox containers clone <code class="${codeClass}">${clone.origin}</code> over HTTPS
+			(auth via a scoped token).</span>
+		</p>`;
+}
+
 function renderSandboxSection(
 	projectId: string,
 	resolved: Record<string, { value: any; source: string }>,
@@ -648,6 +699,11 @@ function renderSandboxSection(
 					>${icon(RotateCcw, "xs")}</button>
 				</div>
 			</div>
+
+			<!-- Container clone-source note: how the project's git remote is used INSIDE the container -->
+			${sandboxMode !== "none" && sandboxStatusLocal?.clone
+				? renderSandboxCloneNote(sandboxStatusLocal.clone)
+				: ""}
 
 			<!-- Image Name -->
 			<div class="flex items-center gap-3">

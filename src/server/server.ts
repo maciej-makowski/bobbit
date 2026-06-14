@@ -234,7 +234,7 @@ import { getAllConfigDirectories, removeBuiltinDirectory, resetConfigDirectories
 import { checkDockerAvailability, buildSandboxImage, isBuildingImage, ensureImageAgentVersion } from "./agent/sandbox-status.js";
 import { resolveContainerRuntime, createContainerRuntime, runtimeForContainerId, runtimeForContainerIdOrDocker } from "./agent/container-runtime/index.js";
 import { SandboxManager, type SandboxBootstrap } from "./agent/sandbox-manager.js";
-import { resolveSandboxCloneSource, type SandboxCloneSource } from "./agent/sandbox-clone-source.js";
+import { resolveSandboxCloneSource, toHttpsCloneUrl, type SandboxCloneSource } from "./agent/sandbox-clone-source.js";
 import { validateSandboxMounts } from "./agent/sandbox-mounts.js";
 import { SandboxTokenStore, type SandboxScope } from "./auth/sandbox-token.js";
 import { CookieStore, issueIfMissing as issueCookieIfMissing, tryAuth as cookieTryAuth } from "./auth/cookie.js";
@@ -2971,7 +2971,67 @@ async function handleApiRoute(
 			runtime = resolveContainerRuntime(projectConfigStore);
 		}
 		const status = await checkDockerAvailability(configured ? imageName : undefined, runtime);
-		json({ ...status, configured });
+
+		// When sandboxing is enabled, also resolve how the project's git remote
+		// will be used to clone the repo INSIDE the container. This is
+		// runtime-agnostic (docker + podman alike) and best-effort — any failure
+		// omits `clone` rather than failing the whole status request.
+		let clone:
+			| {
+					origin: string | null;
+					kind: "remote" | "mounted" | "local-error";
+					containerCloneUrl: string | null;
+					rewritten: boolean;
+					error?: string;
+			  }
+			| undefined;
+		if (configured) {
+			try {
+				const projectDir = config.defaultCwd;
+				if (await isGitRepo(projectDir)) {
+					const repoPath = await getRepoRoot(projectDir);
+					const origin = await (async (): Promise<string | null> => {
+						try {
+							const { stdout } = await execFileAsync("git", ["remote", "get-url", "origin"], { cwd: repoPath, timeout: 5000 });
+							return stdout.trim() || null;
+						} catch {
+							return null;
+						}
+					})();
+					const mountSourcePath = await resolveSandboxMountRoot(repoPath);
+					try {
+						const src = resolveSandboxCloneSource({ originUrl: origin, mountSourcePath });
+						if (src.kind === "remote") {
+							clone = {
+								origin: origin ? stripTokenFromGitUrl(origin) : null,
+								kind: "remote",
+								containerCloneUrl: src.cloneUrl,
+								rewritten: !!origin && toHttpsCloneUrl(origin) !== origin,
+							};
+						} else {
+							clone = {
+								origin: origin ? stripTokenFromGitUrl(origin) : null,
+								kind: "mounted",
+								containerCloneUrl: src.cloneUrl,
+								rewritten: false,
+							};
+						}
+					} catch (err) {
+						clone = {
+							origin: origin ? stripTokenFromGitUrl(origin) : null,
+							kind: "local-error",
+							containerCloneUrl: null,
+							rewritten: false,
+							error: (err as Error).message,
+						};
+					}
+				}
+			} catch {
+				clone = undefined;
+			}
+		}
+
+		json({ ...status, configured, ...(clone ? { clone } : {}) });
 		return;
 	}
 
