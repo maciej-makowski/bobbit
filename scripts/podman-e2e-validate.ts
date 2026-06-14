@@ -503,6 +503,135 @@ async function validateCrossUsernsMigration(runtime: PodmanRuntime, cloneSource:
 	}
 }
 
+/**
+ * Scenario G — the EXACT user state THIS round: a HEALTHY keep-id container on a
+ * STALE workspace volume (`0d7470ce`).
+ *
+ * Unlike Scenario F (which started from a NON-keep-id container, so the bind-mount
+ * write-probe FAILS and triggers recreate), this scenario starts from a container
+ * that is ALREADY keep-id — so it PASSES the bind-mount probe and is NOT recreated
+ * by that path. But its persisted `/workspace` clone was made under an INCOMPATIBLE
+ * (pre-keep-id) userns: `/workspace/.git` is foreign-owned, so `node` can't write
+ * refs and `git worktree add` fails with
+ *   `cannot lock ref 'refs/heads/…': Unable to create '/workspace/.git/refs/heads/….lock': Permission denied`.
+ * Before the new workspace-git write-probe, the bind-mount probe passed → NO reset →
+ * worktree add failed.
+ *
+ * This scenario:
+ *   1. Builds the user state: a KEEP-ID labelled container (production run spec) with
+ *      a clone whose `/workspace/.git` is forced foreign-owned (chown -R 999:999).
+ *      Proves `touch /workspace/.git/x` as node FAILS and `git worktree add -b` fails
+ *      with the `cannot lock ref … Permission denied` error.
+ *   2. Drives the REAL ProjectSandbox.init() (reconnect to the keep-id container):
+ *      bind-mount probe PASSES, the NEW workspace-git write-probe FAILS → reset
+ *      volumes → recreate → fresh node-owned clone → createWorktree exit 0,
+ *      `/workspace/.git` owner=node:node.
+ *   3. Drives the ACTUAL agent exec in the worktree and confirms it reaches the RPC
+ *      loop (no `cannot lock ref`, no `invalid reference`, no EACCES, no spawn docker).
+ */
+async function validateKeepIdStaleVolume(runtime: PodmanRuntime, cloneSource: ReturnType<typeof resolveSandboxCloneSource>): Promise<void> {
+	const { buildAgentArgs } = await import("../src/server/agent/rpc-bridge.js");
+	const { buildContainerRunSpec } = await import("../src/server/agent/docker-args.js");
+	const projectId = `podman-keepstale-${process.pid}`;
+	const wsVolume = `bobbit-workspace-${projectId}`;
+	const wtVolume = `bobbit-worktrees-${projectId}`;
+	const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "podman-keepstale-proj-"));
+	const stateDir = path.join(projectDir, ".bobbit", "state");
+	const hostSessions = path.join(stateDir, "sessions");
+	fs.mkdirSync(hostSessions, { recursive: true });
+	const SESSIONS = "/home/node/.bobbit/agent/sessions";
+	const STAFF_NAME = "session/staff-keepstale";
+	const STAFF_BRANCH = "staff-keepstale";
+	let keepidC = "";
+	try {
+		// 1a. Build the user state: a KEEP-ID labelled container (production run spec,
+		// which emits --userns=keep-id) with BOTH named volumes + the sessions mount.
+		log("keepstale-setup", `KEEP-ID labelled container (production run spec); clone /workspace into ${wsVolume}`);
+		const spec = buildContainerRunSpec({
+			image: IMAGE, workspaceDir: "", label: projectId, labelPrefix: "bobbit-project",
+			projectId, stateDir, memoryLimit: "2g", cpuLimit: "2", pidsLimit: "0",
+		});
+		keepidC = (await runtime.createContainer(spec)).trim();
+
+		// Make the volumes node-writable and clone /workspace as node (so the clone
+		// is initially node-owned), then FORCE /workspace/.git foreign-owned to
+		// reproduce a clone made under an incompatible pre-keep-id userns.
+		await podman(["exec", "--user", "root", keepidC, "chown", "node:node", "/workspace", "/workspace-wt"]);
+		await podman(["exec", "-w", "/workspace", keepidC, "sh", "-c",
+			'git config --global --add safe.directory "*"; git clone ' + cloneSource.cloneUrl + ' .']);
+		await podman(["exec", "--user", "root", keepidC, "chown", "-R", "999:999", "/workspace/.git"]);
+		const gitOwnerBefore = await podman(["exec", keepidC, "sh", "-c", "stat -c '%u:%g' /workspace/.git"]);
+		log("keepstale-setup", `/workspace/.git owner BEFORE init (must be foreign 999:999): ${gitOwnerBefore}`);
+		if (!/^999:999/.test(gitOwnerBefore)) throw new Error("failed to simulate a foreign-owned /workspace/.git");
+
+		// 1b. Prove the keep-id bind-mount probe PASSES (host sessions writable) —
+		// this is what makes the bind-mount-probe path NOT fire (unlike Scenario F).
+		const sessWrite = await podman(["exec", keepidC, "sh", "-c", `touch ${SESSIONS}/x && rm -f ${SESSIONS}/x && echo WRITABLE`]);
+		log("keepstale-repro", `keep-id sessions bind-mount write (expect WRITABLE — bind-mount probe PASSES): ${sessWrite}`);
+		if (!/WRITABLE/.test(sessWrite)) throw new Error("expected keep-id container to write the sessions mount (bind-mount probe should pass)");
+
+		// 1c. Prove the EXACT user symptom: node can't write inside /workspace/.git,
+		// and `git worktree add -b` fails with `cannot lock ref … Permission denied`.
+		const gitTouch = await podman(["exec", keepidC, "sh", "-c", `touch /workspace/.git/.bobbit-write-probe 2>&1; echo EXIT=$?`]);
+		log("keepstale-repro", `touch /workspace/.git/.bobbit-write-probe as node (expect Permission denied + EXIT=1):\n${gitTouch}`);
+		if (!/Permission denied|EXIT=1/.test(gitTouch)) throw new Error("expected node to be UNABLE to write inside the foreign-owned /workspace/.git");
+		const wtFail = await podman(["exec", "-w", "/workspace", keepidC, "sh", "-c",
+			`git worktree add /workspace-wt/${STAFF_NAME} -b ${STAFF_BRANCH} origin/master 2>&1; echo EXIT=$?`]).catch((e: any) => `${e?.stdout || ""}${e?.stderr || ""}`);
+		log("keepstale-repro", `raw \`git worktree add -b\` on the stale keep-id volume (expect "cannot lock ref … Permission denied"):\n${wtFail}`);
+		if (/EXIT=0/.test(wtFail)) throw new Error("expected `git worktree add -b` to FAIL on the foreign-owned /workspace/.git, but it succeeded");
+		if (!/cannot lock ref|Permission denied/.test(wtFail)) throw new Error("expected the `cannot lock ref … Permission denied` failure, got a different error");
+
+		// 2. Drive the REAL fix path. init() reconnects to the keep-id container
+		// (bind-mount probe PASSES, NOT recreated by that path), the NEW workspace-git
+		// write-probe FAILS → reset BOTH volumes → recreate → fresh node-owned clone.
+		log("keepstale-fix", "ProjectSandbox.init() — bind-mount probe passes, /workspace/.git write-probe fails → reset volumes + recreate + reclone");
+		const sb = new ProjectSandbox({ runtime, sandboxMode: "podman", projectId, projectDir, repoUrl: SSH_ORIGIN, cloneSource, image: IMAGE });
+		await sb.init();
+		const newId = await sb.getContainerId();
+		const recreated = newId.substring(0, 12) !== keepidC.substring(0, 12);
+		log("keepstale-fix", `original=${keepidC.substring(0, 12)} new=${newId.substring(0, 12)} recreated=${recreated}`);
+		if (!recreated) throw new Error("BUG: keep-id container on a stale volume was reused, not recreated");
+
+		const gitState = await podman(["exec", newId, "sh", "-c", "test -d /workspace/.git && echo HAS_GIT || echo NO_GIT"]);
+		const gitOwnerAfter = await podman(["exec", newId, "sh", "-c", "stat -c '%U:%G' /workspace/.git"]);
+		log("keepstale-fix", `after fix: /workspace state=${gitState}; /workspace/.git owner=${gitOwnerAfter} (must be node:node)`);
+		if (gitState !== "HAS_GIT") throw new Error("fresh clone did not populate /workspace/.git after volume reset");
+		if (gitOwnerAfter !== "node:node") throw new Error("fresh /workspace/.git is not node-owned after volume reset");
+
+		// The production createWorktree — the exact failing surface, now exit 0.
+		const wt = await sb.createWorktree(STAFF_NAME, STAFF_BRANCH, "origin/master");
+		const wtOk = await podman(["exec", newId, "sh", "-c", "git -C /workspace-wt/" + STAFF_NAME + " rev-parse --is-inside-work-tree >/dev/null 2>&1 && echo WT_OK || echo WT_MISSING"]);
+		const wtWritable = await podman(["exec", newId, "sh", "-c", "test -w /workspace-wt/" + STAFF_NAME + " && echo WRITABLE || echo READONLY"]);
+		log("keepstale-worktree", `createWorktree → ${wt}; worktree=${wtOk}; writable=${wtWritable}`);
+		if (wtOk !== "WT_OK") throw new Error("BLOCKER NOT FIXED: createWorktree failed after volume reset + recreate");
+		if (wtWritable !== "WRITABLE") throw new Error("worktree dir is not node-writable after the fix");
+
+		// 3. THE FULL CHAIN — drive the ACTUAL agent exec in the worktree.
+		const agentArgs = buildAgentArgs({ cwd: "/workspace-wt/" + STAFF_NAME });
+		log("keepstale-agent", `running ACTUAL agent exec in worktree: node … cli.js ${agentArgs.join(" ")}`);
+		const agentOut = await podman(["exec", "--user", "root", "-w", "/workspace-wt/" + STAFF_NAME, newId, "sh", "-c",
+			`timeout 15 sh -c 'echo "" | runuser -u node -- node --disable-warning=DEP0123 /node_modules/@earendil-works/pi-coding-agent/dist/cli.js ${agentArgs.join(" ")} 2>&1'; echo "AGENT_EXIT=$?"`,
+		]).catch((e: any) => `${e?.stdout || ""}${e?.stderr || ""}${e?.message || ""}`);
+		log("keepstale-agent", `agent output (truncated):\n${agentOut.slice(0, 2000)}`);
+		if (/cannot lock ref/.test(agentOut)) throw new Error("agent output still contains `cannot lock ref`");
+		if (/invalid reference/.test(agentOut)) throw new Error("agent output still contains `invalid reference`");
+		if (/EACCES[^\n]*mkdir '\/home\/node\/\.bobbit\/agent\/sessions/.test(agentOut)) throw new Error("agent still hit EACCES on the sessions mkdir");
+		if (/spawn docker/.test(agentOut)) throw new Error("agent attempted to `spawn docker` under podman");
+		const sessionDirs = await podman(["exec", newId, "sh", "-c", `ls -la ${SESSIONS} 2>&1`]);
+		log("keepstale-agent", `host sessions dir after agent start (should hold an agent-created session dir):\n${sessionDirs}`);
+
+		log("RESULT-G", "SUCCESS — keep-id + stale-volume: a HEALTHY keep-id container reusing a foreign-owned /workspace/.git made `git worktree add -b` FAIL with `cannot lock ref … Permission denied`; ProjectSandbox.init()'s bind-mount probe PASSED but the new /workspace/.git write-probe FAILED → reset both volumes → recreate → fresh node-owned clone → createWorktree exit 0 → agent exec reached the RPC loop (no cannot-lock-ref / invalid reference / EACCES / spawn docker).");
+	} finally {
+		try {
+			const sb = new ProjectSandbox({ runtime, sandboxMode: "podman", projectId, projectDir, repoUrl: SSH_ORIGIN, cloneSource, image: IMAGE });
+			await sb.destroy();
+			await podman(["volume", "rm", "-f", wtVolume]).catch(() => {});
+		} catch (e: any) { console.warn("keepstale cleanup failed:", e?.message || e); }
+		if (keepidC) await podman(["rm", "-f", keepidC]).catch(() => {});
+		try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch { /* ignore */ }
+	}
+}
+
 async function main(): Promise<void> {
 	if (!process.env.CONTAINER_HOST) {
 		throw new Error("CONTAINER_HOST not set — point it at the rootless podman socket");
@@ -599,8 +728,11 @@ async function main(): Promise<void> {
 		// Scenario E — auto-heal a stale non-keep-id container on reconnect.
 		await validateStaleContainerHeal(runtime, cloneSource);
 
-		// Scenario F — the cross-userns MIGRATION fallout (this round).
+		// Scenario F — the cross-userns MIGRATION fallout (prior round).
 		await validateCrossUsernsMigration(runtime, cloneSource);
+
+		// Scenario G — keep-id container on a STALE workspace volume (this round).
+		await validateKeepIdStaleVolume(runtime, cloneSource);
 	} finally {
 		// Cleanup: remove the test container + volume.
 		try {

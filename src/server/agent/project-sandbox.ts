@@ -640,33 +640,17 @@ export class ProjectSandbox {
 				// Validate with a simple exec
 				try {
 					await this._dockerExec(existingId, ["echo", "ok"]);
-					if (!(await this._bindMountWritable(existingId))) {
-						// Stale container created WITHOUT the rootless-podman userns
-						// mapping: its `node` can't write host bind mounts, so the agent
-						// would die on `mkdir /home/node/.bobbit/agent/sessions/…`.
-						// Recreate so the fresh-create path adds `--userns=keep-id`.
-						// The persisted named volumes were cloned under the OLD
-						// (non-keep-id) userns, so `/workspace/.git` is owned by a
-						// foreign uid that isn't `node` under keep-id and CANNOT be
-						// reliably re-owned (cross-userns `chown -R` is unreliable) —
-						// reset them so the fresh clone is node-owned. See
-						// `_resetWorkspaceVolumes`.
-						console.warn(`[project-sandbox] Container ${existingId.substring(0, 12)} can't write host bind mounts (pre-keep-id userns); recreating container AND resetting workspace volumes (old clone is owned by an incompatible userns)`);
-						await this._removeContainer(existingId);
-						await this._resetWorkspaceVolumes();
-					} else {
-						this.containerId = existingId;
-						// Audit worktree state on reconnect — helps debug disappearing worktrees
-						try {
-							const wtList = await this._dockerExec(existingId, ["sh", "-c", "ls -d /workspace-wt/session/* 2>/dev/null || echo '(none)'"]);
-							console.log(`[project-sandbox] Reconnected to running container ${existingId.substring(0, 12)} for project ${projectId} — worktrees: ${wtList.trim()}`);
-						} catch {
-							console.log(`[project-sandbox] Reconnected to running container ${existingId.substring(0, 12)} for project ${projectId}`);
-						}
+					this.containerId = existingId;
+					// Audit worktree state on reconnect — helps debug disappearing worktrees
+					try {
+						const wtList = await this._dockerExec(existingId, ["sh", "-c", "ls -d /workspace-wt/session/* 2>/dev/null || echo '(none)'"]);
+						console.log(`[project-sandbox] Reconnected to running container ${existingId.substring(0, 12)} for project ${projectId} — worktrees: ${wtList.trim()}`);
+					} catch {
+						console.log(`[project-sandbox] Reconnected to running container ${existingId.substring(0, 12)} for project ${projectId}`);
 					}
-					// Fall through to _runInitSequence() — idempotent, but ensures a
-					// half-initialized reused container (e.g. prior failed clone) is
-					// fully populated before any worktree op.
+					// Fall through to the reuse health gate + _runInitSequence() —
+					// idempotent, but ensures a half-initialized reused container
+					// (e.g. prior failed clone) is fully populated before any worktree op.
 				} catch {
 					// Container is in a bad state — remove and recreate
 					console.warn(`[project-sandbox] Container ${existingId.substring(0, 12)} failed health check, recreating`);
@@ -678,27 +662,42 @@ export class ProjectSandbox {
 					await this.runtime.startContainer(existingId, { timeoutMs: 30_000 });
 					// Validate after start
 					await this._dockerExec(existingId, ["echo", "ok"]);
-					if (!(await this._bindMountWritable(existingId))) {
-						// See running-branch note: recreate so keep-id is applied AND
-						// reset the volumes whose clone is owned by the incompatible
-						// pre-keep-id userns.
-						console.warn(`[project-sandbox] Restarted container ${existingId.substring(0, 12)} can't write host bind mounts (pre-keep-id userns); recreating container AND resetting workspace volumes (old clone is owned by an incompatible userns)`);
-						await this._removeContainer(existingId);
-						await this._resetWorkspaceVolumes();
-					} else {
-						this.containerId = existingId;
-						// Audit worktree state after restart — overlay FS data may have been lost
-						try {
-							const wtList = await this._dockerExec(existingId, ["sh", "-c", "ls -d /workspace-wt/session/* 2>/dev/null || echo '(none)'"]);
-							console.log(`[project-sandbox] Restarted stopped container ${existingId.substring(0, 12)} for project ${projectId} — worktrees: ${wtList.trim()}`);
-						} catch {
-							console.log(`[project-sandbox] Restarted stopped container ${existingId.substring(0, 12)} for project ${projectId}`);
-						}
+					this.containerId = existingId;
+					// Audit worktree state after restart — overlay FS data may have been lost
+					try {
+						const wtList = await this._dockerExec(existingId, ["sh", "-c", "ls -d /workspace-wt/session/* 2>/dev/null || echo '(none)'"]);
+						console.log(`[project-sandbox] Restarted stopped container ${existingId.substring(0, 12)} for project ${projectId} — worktrees: ${wtList.trim()}`);
+					} catch {
+						console.log(`[project-sandbox] Restarted stopped container ${existingId.substring(0, 12)} for project ${projectId}`);
 					}
-					// Fall through to _runInitSequence() — see note above.
+					// Fall through to the reuse health gate + _runInitSequence().
 				} catch {
 					console.warn(`[project-sandbox] Failed to restart container ${existingId.substring(0, 12)}, recreating`);
 					await this._removeContainer(existingId);
+				}
+			}
+
+			// Reuse health gate (runs at most once, only when we reconnected/restarted
+			// an existing container). Two INDEPENDENT failure signals both require the
+			// SAME recovery — remove container → reset workspace volumes → recreate →
+			// reclone — because in both cases the persisted `/workspace` clone was made
+			// under an incompatible (pre-keep-id) userns and is foreign-owned:
+			//   1. bind-mount write-probe fails → container predates `--userns=keep-id`.
+			//   2. `/workspace/.git` exists but `node` can't write into it → a HEALTHY
+			//      keep-id container reusing a clone that was created under the old
+			//      userns. Its `.git` is foreign-owned, so `git worktree add` fails with
+			//      `cannot lock ref … Permission denied`. The bind-mount probe PASSES
+			//      here (keep-id host mounts work), so this is the only signal that
+			//      catches it.
+			// Leaving `this.containerId` null routes to the create/init fall-through
+			// below; the fresh clone is node-owned so the probes then pass (no loop).
+			if (this.containerId) {
+				const resetReason = await this._reusedContainerNeedsReset(this.containerId);
+				if (resetReason) {
+					console.warn(`[project-sandbox] Container ${this.containerId.substring(0, 12)} ${resetReason}; recreating container AND resetting workspace volumes and re-cloning`);
+					await this._removeContainer(this.containerId);
+					await this._resetWorkspaceVolumes();
+					this.containerId = null;
 				}
 			}
 		}
@@ -754,6 +753,58 @@ export class ProjectSandbox {
 		} catch {
 			return false;
 		}
+	}
+
+	/**
+	 * When `/workspace/.git` exists, probe that the default (`node`) user can
+	 * WRITE inside it. A persisted clone made under an incompatible (pre-keep-id)
+	 * userns is foreign-owned, so `touch /workspace/.git/…` EACCESes even though
+	 * the bind-mount probe PASSES (keep-id host mounts work fine) — and a later
+	 * `git worktree add` fails with
+	 * `cannot lock ref 'refs/heads/…': Unable to create '/workspace/.git/refs/heads/….lock': Permission denied`.
+	 *
+	 * Returns true (nothing to validate) when there is no `/workspace/.git` yet —
+	 * a never-cloned volume's fresh clone will be node-owned. Best-effort: only a
+	 * failing write INSIDE an existing `.git` returns false. The `touch` runs as
+	 * the default (node) user via `_dockerExec`, mirroring the actual git writer.
+	 */
+	private async _workspaceGitWritable(containerId: string): Promise<boolean> {
+		// No clone yet → nothing to validate; the fresh clone will be node-owned.
+		try {
+			await this._dockerExec(containerId, ["test", "-d", "/workspace/.git"]);
+		} catch {
+			return true;
+		}
+		try {
+			await this._dockerExec(containerId, [
+				"sh", "-c",
+				"touch /workspace/.git/.bobbit-write-probe && rm -f /workspace/.git/.bobbit-write-probe",
+			]);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Decide whether a reconnected/reused container needs a FULL reset (remove
+	 * container → reset workspace volumes → recreate → reclone). Two independent
+	 * failure signals both require the same recovery (both mean the persisted
+	 * `/workspace` clone is foreign-owned under an incompatible userns):
+	 *   1. bind-mount write-probe fails → container predates `--userns=keep-id`.
+	 *   2. `/workspace/.git` exists but `node` can't write into it → a healthy
+	 *      keep-id container sitting on a clone made under the OLD userns.
+	 * Returns a human-readable reason string when reset is needed, else `null`.
+	 * Ordered cheap→specific: bind-mount first (also gates the worktree probe).
+	 */
+	private async _reusedContainerNeedsReset(containerId: string): Promise<string | null> {
+		if (!(await this._bindMountWritable(containerId))) {
+			return "can't write host bind mounts (pre-keep-id userns); old clone is owned by an incompatible userns";
+		}
+		if (!(await this._workspaceGitWritable(containerId))) {
+			return "/workspace clone is not writable by node (created under an incompatible userns)";
+		}
+		return null;
 	}
 
 	/**

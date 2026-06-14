@@ -24,9 +24,22 @@ const PROJECT_ID = "vol-reset-proj";
  * succeeds; `imageStale` forces the stale-image branch (different image ids).
  * Records every `removeVolume` call.
  */
-function makeFakeRuntime(opts: { probeWritable: boolean; imageStale?: boolean }) {
+function makeFakeRuntime(opts: {
+	probeWritable: boolean;
+	imageStale?: boolean;
+	/**
+	 * Workspace-git write-probe outcome (the keep-id + stale-volume case). When
+	 * `false`, `/workspace/.git` exists but the `node` write-probe EACCESes —
+	 * exactly the user's healthy-keep-id-container-on-a-stale-volume state.
+	 */
+	workspaceGitWritable?: boolean;
+	/** When `false`, `test -d /workspace/.git` fails (no clone yet → probe skipped). */
+	hasWorkspaceGit?: boolean;
+}) {
 	const removedVolumes: string[] = [];
 	const removed = new Set<string>();
+	const hasGit = opts.hasWorkspaceGit ?? true;
+	const gitWritable = opts.workspaceGitWritable ?? true;
 	const runtime: any = {
 		bin: "podman",
 		async findContainerByLabel() { return "existing-container-id"; },
@@ -39,8 +52,19 @@ function makeFakeRuntime(opts: { probeWritable: boolean; imageStale?: boolean })
 		async getResourceLimits() { return null; },
 		async removeVolume(name: string) { removedVolumes.push(name); },
 		async exec(_id: string, argv: string[]) {
+			// Bind-mount write-probe (host sessions dir).
 			if (argv[0] === "sh" && (argv[2] ?? "").includes(".bobbit-perm-probe")) {
 				if (!opts.probeWritable) throw new Error("EACCES: permission denied");
+				return { stdout: "", stderr: "" };
+			}
+			// `test -d /workspace/.git` — clone-present check.
+			if (argv[0] === "test" && argv[1] === "-d" && argv[2] === "/workspace/.git") {
+				if (!hasGit) throw new Error("no /workspace/.git");
+				return { stdout: "", stderr: "" };
+			}
+			// Workspace-git write-probe (the keep-id + stale-volume case).
+			if (argv[0] === "sh" && (argv[2] ?? "").includes(".bobbit-write-probe")) {
+				if (!gitWritable) throw new Error("EACCES: permission denied");
 				return { stdout: "", stderr: "" };
 			}
 			return { stdout: "", stderr: "" };
@@ -111,5 +135,60 @@ describe("ProjectSandbox._initContainer volume reset on bind-mount-probe failure
 		assert.deepEqual(removedVolumes, [], "stale-image recreate must NOT reset volumes");
 		assert.equal(calls.create, 1, "stale-image path recreates the container");
 		assert.equal(calls.init, 1);
+	});
+
+	// ── keep-id + stale-volume case (the user's 0d7470ce state) ──────────────
+	// A HEALTHY keep-id container PASSES the bind-mount write-probe (host mounts
+	// work) but REUSES a /workspace clone made under an incompatible pre-keep-id
+	// userns: `/workspace/.git` is foreign-owned, so `node` can't write refs and
+	// `git worktree add` fails with `cannot lock ref … Permission denied`. The
+	// new workspace-git write-probe must catch this and trigger the SAME reset.
+	it("RESETS both named volumes when bind-mount probe PASSES but the /workspace/.git write-probe FAILS, then recreates + reinits", async () => {
+		const { runtime, removedVolumes } = makeFakeRuntime({ probeWritable: true, workspaceGitWritable: false });
+		const sandbox = makeSandbox(runtime);
+		const calls = spyLifecycle(sandbox as any);
+
+		await (sandbox as any)._initContainer();
+
+		assert.deepEqual(
+			removedVolumes.sort(),
+			[`bobbit-workspace-${PROJECT_ID}`, `bobbit-worktrees-${PROJECT_ID}`].sort(),
+			"BOTH named volumes must be reset when the /workspace/.git write-probe fails",
+		);
+		assert.equal(calls.create, 1, "a fresh container must be created");
+		assert.equal(calls.init, 1, "init sequence runs on the fresh container (fresh, node-owned clone)");
+		assert.equal(await sandbox.getContainerId(), "fresh-container-id");
+	});
+
+	it("does NOT reset volumes when BOTH probes pass (healthy keep-id container, node-owned clone)", async () => {
+		const { runtime, removedVolumes } = makeFakeRuntime({ probeWritable: true, workspaceGitWritable: true });
+		const sandbox = makeSandbox(runtime);
+		const calls = spyLifecycle(sandbox as any);
+
+		await (sandbox as any)._initContainer();
+
+		assert.deepEqual(removedVolumes, [], "no reset when both probes pass");
+		assert.equal(calls.create, 0, "the healthy container is reused, not recreated");
+		assert.equal(await sandbox.getContainerId(), "existing-container-id");
+	});
+
+	it("does NOT probe or reset when /workspace/.git does not exist yet (never cloned)", async () => {
+		// No clone yet → the write-probe is skipped entirely; reuse and let
+		// _runInitSequence clone (the fresh clone is node-owned).
+		const { runtime, removedVolumes } = makeFakeRuntime({
+			probeWritable: true,
+			hasWorkspaceGit: false,
+			// Even if the write-probe WOULD fail, it must never run when there's no .git.
+			workspaceGitWritable: false,
+		});
+		const sandbox = makeSandbox(runtime);
+		const calls = spyLifecycle(sandbox as any);
+
+		await (sandbox as any)._initContainer();
+
+		assert.deepEqual(removedVolumes, [], "no reset when there is no /workspace/.git to probe");
+		assert.equal(calls.create, 0, "container is reused");
+		assert.equal(calls.init, 1, "init sequence runs to clone the empty workspace");
+		assert.equal(await sandbox.getContainerId(), "existing-container-id");
 	});
 });
