@@ -267,8 +267,13 @@ export class ProjectSandbox {
 		const args = ["git", "worktree", "add", worktreePath, "-b", branch, startPoint];
 		try {
 			await this._dockerExec(containerId, args, { cwd: "/workspace" });
-		} catch {
-			// Branch may already exist — try without -b
+		} catch (err1: any) {
+			// Branch may already exist — try without -b. Capture the first-attempt
+			// error: if the fallback ALSO fails, the no-`-b` error is usually a
+			// misleading "invalid reference" that masks the real first-attempt
+			// failure (e.g. EPERM / cannot-write-refs / dubious ownership from an
+			// incompatible-userns volume). Surface BOTH so failures are diagnosable.
+			const firstErr = (err1?.stderr || err1?.message || String(err1)).trim();
 			try {
 				await this._dockerExec(containerId, ["git", "worktree", "add", worktreePath, branch], { cwd: "/workspace" });
 			} catch (err2: any) {
@@ -277,7 +282,12 @@ export class ProjectSandbox {
 					console.log(`[project-sandbox] Worktree ${name} already exists, reusing`);
 					return worktreePath;
 				}
-				throw err2;
+				const secondErr = (err2?.stderr || err2?.message || String(err2)).trim();
+				throw new Error(
+					`[project-sandbox] git worktree add failed for ${name} (branch ${branch}).\n` +
+					`First attempt (\`-b ${branch} ${startPoint}\`): ${firstErr}\n` +
+					`Fallback attempt (no \`-b\`): ${secondErr}`,
+				);
 			}
 		}
 
@@ -378,12 +388,20 @@ export class ProjectSandbox {
 
 			try {
 				await this._dockerExec(containerId, ["git", "worktree", "add", wtPath, "-b", branch, startPoint], { cwd: repoSrc });
-			} catch {
+			} catch (err1: any) {
+				// Capture the first-attempt error so a failing fallback surfaces the
+				// real cause (not just the misleading no-`-b` "invalid reference").
+				const firstErr = (err1?.stderr || err1?.message || String(err1)).trim();
 				try {
 					await this._dockerExec(containerId, ["git", "worktree", "add", wtPath, branch], { cwd: repoSrc });
 				} catch (err2: any) {
 					if (!(err2?.message?.includes("already exists") || err2?.stderr?.includes("already exists"))) {
-						throw err2;
+						const secondErr = (err2?.stderr || err2?.message || String(err2)).trim();
+						throw new Error(
+							`[project-sandbox] git worktree add failed for ${name}/${repo} (branch ${branch}).\n` +
+							`First attempt (\`-b ${branch} ${startPoint}\`): ${firstErr}\n` +
+							`Fallback attempt (no \`-b\`): ${secondErr}`,
+						);
 					}
 					console.log(`[project-sandbox] Worktree ${name}/${repo} already exists, reusing`);
 				}
@@ -627,8 +645,15 @@ export class ProjectSandbox {
 						// mapping: its `node` can't write host bind mounts, so the agent
 						// would die on `mkdir /home/node/.bobbit/agent/sessions/…`.
 						// Recreate so the fresh-create path adds `--userns=keep-id`.
-						console.warn(`[project-sandbox] Container ${existingId.substring(0, 12)} cannot write host bind mounts (likely created before the rootless-podman userns fix); recreating`);
+						// The persisted named volumes were cloned under the OLD
+						// (non-keep-id) userns, so `/workspace/.git` is owned by a
+						// foreign uid that isn't `node` under keep-id and CANNOT be
+						// reliably re-owned (cross-userns `chown -R` is unreliable) —
+						// reset them so the fresh clone is node-owned. See
+						// `_resetWorkspaceVolumes`.
+						console.warn(`[project-sandbox] Container ${existingId.substring(0, 12)} can't write host bind mounts (pre-keep-id userns); recreating container AND resetting workspace volumes (old clone is owned by an incompatible userns)`);
 						await this._removeContainer(existingId);
+						await this._resetWorkspaceVolumes();
 					} else {
 						this.containerId = existingId;
 						// Audit worktree state on reconnect — helps debug disappearing worktrees
@@ -654,9 +679,12 @@ export class ProjectSandbox {
 					// Validate after start
 					await this._dockerExec(existingId, ["echo", "ok"]);
 					if (!(await this._bindMountWritable(existingId))) {
-						// See running-branch note: recreate so keep-id is applied.
-						console.warn(`[project-sandbox] Restarted container ${existingId.substring(0, 12)} cannot write host bind mounts (likely created before the rootless-podman userns fix); recreating`);
+						// See running-branch note: recreate so keep-id is applied AND
+						// reset the volumes whose clone is owned by the incompatible
+						// pre-keep-id userns.
+						console.warn(`[project-sandbox] Restarted container ${existingId.substring(0, 12)} can't write host bind mounts (pre-keep-id userns); recreating container AND resetting workspace volumes (old clone is owned by an incompatible userns)`);
 						await this._removeContainer(existingId);
+						await this._resetWorkspaceVolumes();
 					} else {
 						this.containerId = existingId;
 						// Audit worktree state after restart — overlay FS data may have been lost
@@ -685,6 +713,14 @@ export class ProjectSandbox {
 		// is the central guarantee for reused containers whose volumes are stale
 		// root-owned mounts under rootless podman.
 		await this._ensureWritableSandboxVolumes();
+
+		// 3b. Configure git safe.directory on EVERY init path (as the `node` user
+		// running git). `_runInitSequence` only configures it on the clone path,
+		// which is SKIPPED for persisted/reconnected volumes ("Workspace already
+		// initialized"). Without it, a reused volume whose `/workspace/.git` is
+		// owned by a foreign uid trips git's dubious-ownership guard, breaking
+		// `git worktree add`. Idempotent (`--add` of an existing `*` is harmless).
+		await this._ensureGitSafeDirectory();
 
 		// 4. Always ensure the workspace is initialized. _runInitSequence() is
 		// idempotent: a no-op for healthy reconnects (`/workspace/.git` exists),
@@ -738,6 +774,22 @@ export class ProjectSandbox {
 			], { user: "root", timeoutMs: 10_000 });
 		} catch (err: any) {
 			console.warn(`[project-sandbox] Failed to chown sandbox volumes to node (non-fatal):`, err?.message || err);
+		}
+	}
+
+	/**
+	 * Configure `safe.directory` for the `node` user (the one git runs as) on
+	 * every init path. Marks `*` globally so both `/workspace` and `/workspace-wt`
+	 * are trusted even when a persisted volume's `.git` is owned by a foreign uid
+	 * (e.g. a clone made under an older userns). Best-effort / non-fatal — the
+	 * clone path also sets this, this just covers the reconnect/persisted path.
+	 */
+	private async _ensureGitSafeDirectory(): Promise<void> {
+		if (!this.containerId) return;
+		try {
+			await this._dockerExec(this.containerId, ["git", "config", "--global", "--add", "safe.directory", "*"]);
+		} catch (err: any) {
+			console.warn(`[project-sandbox] Failed to configure git safe.directory (non-fatal):`, err?.message || err);
 		}
 	}
 
@@ -1068,5 +1120,35 @@ export class ProjectSandbox {
 
 	private _volumeName(): string {
 		return `bobbit-workspace-${this.options.projectId}`;
+	}
+
+	private _worktreesVolumeName(): string {
+		return `bobbit-worktrees-${this.options.projectId}`;
+	}
+
+	/**
+	 * Remove BOTH persisted named volumes (`bobbit-workspace-<id>` and
+	 * `bobbit-worktrees-<id>`, the same names `docker-args` builds) so the
+	 * recreated container clones fresh. Used ONLY by the bind-mount-probe-failure
+	 * path: when the probe fails the container predates `--userns=keep-id`, so the
+	 * volumes' clone is owned by the OLD userns mapping. Under keep-id those
+	 * subuids may fall outside the new namespace's mapped range, making
+	 * `chown -R` unreliable and leaving `/workspace/.git` un-writable by `node`
+	 * (→ `git worktree add` fails). Resetting yields empty volumes that
+	 * `_createContainer` + `_runInitSequence` repopulate with a node-owned clone.
+	 *
+	 * NOT called on the stale-IMAGE recreate path — there the volumes are
+	 * compatible and worktrees must survive. Best-effort: a missing volume throws
+	 * and is swallowed.
+	 */
+	private async _resetWorkspaceVolumes(): Promise<void> {
+		for (const name of [this._volumeName(), this._worktreesVolumeName()]) {
+			try {
+				await this.runtime.removeVolume(name, { force: true });
+				console.log(`[project-sandbox] Reset workspace volume ${name} (incompatible pre-keep-id userns clone)`);
+			} catch (err: any) {
+				console.warn(`[project-sandbox] Failed to remove volume ${name} (non-fatal):`, err?.message || err);
+			}
+		}
 	}
 }

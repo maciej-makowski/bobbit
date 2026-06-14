@@ -362,6 +362,147 @@ async function validateStaleContainerHeal(runtime: PodmanRuntime, cloneSource: R
 	}
 }
 
+/**
+ * Scenario F — the cross-userns MIGRATION (the EXACT user fallout this round).
+ *
+ * The user's stale NON-keep-id container (`402544fa2266`) is recreated WITH
+ * keep-id (`0d7470ce`) by the write-probe heal — but the recreate REUSES the
+ * persisted named volume `bobbit-workspace-<id>` whose clone was made under the
+ * OLD (non-keep-id) userns. So `/workspace/.git` is owned by a foreign uid that
+ * isn't `node` under keep-id; `_ensureWritableSandboxVolumes` chowns only the
+ * top dirs (non-recursive) and a cross-userns `chown -R` is unreliable. Result:
+ * `git worktree add /workspace-wt/staff-… -b staff-… <startPoint>` FAILS (the
+ * swallowed first-attempt error is hidden; the visible error is the misleading
+ * no-`-b` "invalid reference").
+ *
+ * This scenario:
+ *   1. Builds the EXACT user state: a NON-keep-id labelled container whose
+ *      named volume holds a clone owned by the old userns mapping; proves a
+ *      keep-id container reusing that volume → `git worktree add -b` FAILS with
+ *      the REAL first-attempt error (EPERM / cannot-write-refs / foreign owner),
+ *      NOT just "invalid reference".
+ *   2. Drives the REAL ProjectSandbox.init(): write-probe fails → container
+ *      recreated WITH keep-id AND volumes reset → fresh HTTPS clone →
+ *      `createWorktree` (`git worktree add -b <branch> <startPoint>`) exit 0,
+ *      worktree `.git` node-owned and writable.
+ *   3. Drives the ACTUAL agent exec (rpc-bridge form) in the worktree and
+ *      confirms it gets PAST the sessions mkdir AND runs in the worktree
+ *      (reaches the RPC loop) with NO invalid reference / EACCES / spawn docker.
+ */
+async function validateCrossUsernsMigration(runtime: PodmanRuntime, cloneSource: ReturnType<typeof resolveSandboxCloneSource>): Promise<void> {
+	const { buildAgentArgs } = await import("../src/server/agent/rpc-bridge.js");
+	const projectId = `podman-userns-${process.pid}`;
+	const wsVolume = `bobbit-workspace-${projectId}`;
+	const wtVolume = `bobbit-worktrees-${projectId}`;
+	const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "podman-userns-proj-"));
+	const stateDir = path.join(projectDir, ".bobbit", "state");
+	const hostSessions = path.join(stateDir, "sessions");
+	fs.mkdirSync(hostSessions, { recursive: true });
+	const SESSIONS = "/home/node/.bobbit/agent/sessions";
+	const STAFF_NAME = "session/staff-userns";
+	const STAFF_BRANCH = "staff-userns";
+	let staleC = "";
+	let keepidProbeC = "";
+	try {
+		// 1a. Build the user state: a NON-keep-id labelled container with BOTH named
+		// volumes + the sessions bind mount. Clone /workspace as node (so the clone
+		// is owned by THIS container's non-keep-id `node` → a host SUBUID).
+		log("userns-setup", `NON-keep-id labelled container; clone /workspace under the OLD userns into ${wsVolume}`);
+		staleC = await podman([
+			"run", "-d", "--label", `bobbit-project=${projectId}`,
+			"-v", `${wsVolume}:/workspace`,
+			"-v", `${wtVolume}:/workspace-wt`,
+			"-v", `${hostSessions}:${SESSIONS}:Z`,
+			IMAGE, "sleep", "infinity",
+		]);
+		await podman(["exec", "--user", "root", staleC, "chown", "node:node", "/workspace", "/workspace-wt"]);
+		await podman(["exec", "-w", "/workspace", staleC, "sh", "-c",
+			'git config --global --add safe.directory "*"; git clone ' + cloneSource.cloneUrl + ' .']);
+		const ownNonKeep = await podman(["exec", staleC, "sh", "-c", "stat -c '%u:%g' /workspace/.git"]);
+		log("userns-setup", `/workspace/.git owner (container view, NON-keep-id): ${ownNonKeep}`);
+
+		// 1b. Prove the migration symptom: a SEPARATE keep-id container reusing the
+		// SAME volume can't own /workspace/.git, so `git worktree add -b` fails.
+		// Record the REAL first-attempt error (with -b) vs the misleading fallback.
+		log("userns-repro", "keep-id container reusing the old-userns volume — capture REAL `git worktree add -b` error");
+		const { buildContainerRunSpec } = await import("../src/server/agent/docker-args.js");
+		const { serializeContainerRunSpec } = await import("../src/server/agent/container-runtime/base-cli-runtime.js");
+		const { PODMAN_RUN_ARG_HOOKS } = await import("../src/server/agent/container-runtime/podman-runtime.js");
+		const probeSpec = buildContainerRunSpec({
+			image: IMAGE, workspaceDir: "", label: `${projectId}-probe`, labelPrefix: "bobbit-project-probe",
+			projectId, stateDir, memoryLimit: "2g", cpuLimit: "2", pidsLimit: "0",
+		});
+		// Force the SAME reused volumes onto the probe container (buildContainerRunSpec
+		// already adds bobbit-workspace-<id>/bobbit-worktrees-<id> for this projectId).
+		const probeArgv = serializeContainerRunSpec(probeSpec, PODMAN_RUN_ARG_HOOKS); // starts with "run"
+		keepidProbeC = (await podman(probeArgv)).trim();
+		await podman(["exec", "--user", "root", keepidProbeC, "sh", "-c", 'git config --global --add safe.directory "*"']);
+		const ownKeepView = await podman(["exec", keepidProbeC, "sh", "-c", "stat -c '%u:%g' /workspace/.git 2>&1 || true"]);
+		log("userns-repro", `/workspace/.git owner (keep-id container view — foreign uid, not node): ${ownKeepView}`);
+		const firstAttempt = await podman(["exec", "-w", "/workspace", keepidProbeC, "sh", "-c",
+			`git worktree add /workspace-wt/${STAFF_NAME} -b ${STAFF_BRANCH} origin/master 2>&1; echo EXIT=$?`]).catch((e: any) => `${e?.stdout || ""}${e?.stderr || ""}`);
+		log("userns-repro", `REAL first-attempt error (\`git worktree add -b\` under keep-id on old-userns volume):\n${firstAttempt}`);
+		const fallbackAttempt = await podman(["exec", "-w", "/workspace", keepidProbeC, "sh", "-c",
+			`git worktree add /workspace-wt/${STAFF_NAME} ${STAFF_BRANCH} 2>&1; echo EXIT=$?`]).catch((e: any) => `${e?.stdout || ""}${e?.stderr || ""}`);
+		log("userns-repro", `misleading no-\`-b\` fallback error (what the user actually saw):\n${fallbackAttempt}`);
+		if (/EXIT=0/.test(firstAttempt)) {
+			throw new Error("expected the keep-id container reusing the old-userns volume to FAIL `git worktree add -b`, but it succeeded");
+		}
+		await podman(["rm", "-f", keepidProbeC]).catch(() => {}); keepidProbeC = "";
+
+		// 2. Drive the REAL fix path. init() finds the NON-keep-id stale container,
+		// write-probe FAILS → recreate WITH keep-id AND reset BOTH volumes → fresh
+		// HTTPS clone (node-owned) → createWorktree exit 0.
+		log("userns-fix", "ProjectSandbox.init() — write-probe fails → recreate keep-id + reset volumes + fresh clone");
+		const sb = new ProjectSandbox({ runtime, sandboxMode: "podman", projectId, projectDir, repoUrl: SSH_ORIGIN, cloneSource, image: IMAGE });
+		await sb.init();
+		const newId = await sb.getContainerId();
+		const recreated = newId.substring(0, 12) !== staleC.substring(0, 12);
+		log("userns-fix", `original=${staleC.substring(0, 12)} new=${newId.substring(0, 12)} recreated=${recreated}`);
+		if (!recreated) throw new Error("BUG: stale non-keep-id container was reused, not recreated");
+
+		const gitState = await podman(["exec", newId, "sh", "-c", "test -d /workspace/.git && echo HAS_GIT || echo NO_GIT"]);
+		const gitOwner = await podman(["exec", newId, "sh", "-c", "stat -c '%U:%G' /workspace/.git"]);
+		log("userns-fix", `after fix: /workspace state=${gitState}; /workspace/.git owner=${gitOwner} (must be node:node)`);
+		if (gitState !== "HAS_GIT") throw new Error("fresh clone did not populate /workspace/.git after volume reset");
+		if (gitOwner !== "node:node") throw new Error("fresh /workspace/.git is not node-owned after volume reset");
+
+		// The production createWorktree — the exact failing surface, now exit 0.
+		const wt = await sb.createWorktree(STAFF_NAME, STAFF_BRANCH, "origin/master");
+		const wtOk = await podman(["exec", newId, "sh", "-c", "git -C /workspace-wt/" + STAFF_NAME + " rev-parse --is-inside-work-tree >/dev/null 2>&1 && echo WT_OK || echo WT_MISSING"]);
+		const wtGitOwner = await podman(["exec", newId, "sh", "-c", "stat -c '%U:%G' /workspace-wt/" + STAFF_NAME + "/.git 2>/dev/null || stat -c '%U:%G' /workspace-wt/" + STAFF_NAME]);
+		const wtWritable = await podman(["exec", newId, "sh", "-c", "test -w /workspace-wt/" + STAFF_NAME + " && echo WRITABLE || echo READONLY"]);
+		log("userns-worktree", `createWorktree → ${wt}; worktree=${wtOk}; .git owner=${wtGitOwner}; writable=${wtWritable}`);
+		if (wtOk !== "WT_OK") throw new Error("BLOCKER NOT FIXED: createWorktree failed after volume reset + keep-id recreate");
+		if (wtWritable !== "WRITABLE") throw new Error("worktree dir is not node-writable after the fix");
+
+		// 3. THE FULL CHAIN — drive the ACTUAL agent exec the gateway runs in the
+		// worktree and confirm it reaches the RPC loop: PAST the sessions mkdir AND
+		// running in the worktree. A later auth/LLM failure (no tokens) is OK.
+		const agentArgs = buildAgentArgs({ cwd: "/workspace-wt/" + STAFF_NAME });
+		log("userns-agent", `running ACTUAL agent exec in worktree: node … cli.js ${agentArgs.join(" ")}`);
+		const agentOut = await podman(["exec", "--user", "root", "-w", "/workspace-wt/" + STAFF_NAME, newId, "sh", "-c",
+			`timeout 15 sh -c 'echo "" | runuser -u node -- node --disable-warning=DEP0123 /node_modules/@earendil-works/pi-coding-agent/dist/cli.js ${agentArgs.join(" ")} 2>&1'; echo "AGENT_EXIT=$?"`,
+		]).catch((e: any) => `${e?.stdout || ""}${e?.stderr || ""}${e?.message || ""}`);
+		log("userns-agent", `agent output (truncated):\n${agentOut.slice(0, 2000)}`);
+		if (/invalid reference/.test(agentOut)) throw new Error("agent output still contains `invalid reference`");
+		if (/EACCES[^\n]*mkdir '\/home\/node\/\.bobbit\/agent\/sessions/.test(agentOut)) throw new Error("agent still hit EACCES on the sessions mkdir");
+		if (/spawn docker/.test(agentOut)) throw new Error("agent attempted to `spawn docker` under podman");
+		const sessionDirs = await podman(["exec", newId, "sh", "-c", `ls -la ${SESSIONS} 2>&1`]);
+		log("userns-agent", `host sessions dir after agent start (should hold an agent-created session dir):\n${sessionDirs}`);
+
+		log("RESULT-F", "SUCCESS — cross-userns migration: NON-keep-id volume's clone made `git worktree add -b` FAIL under a reused keep-id container; ProjectSandbox.init() recreated WITH keep-id, RESET both volumes, fresh node-owned clone → createWorktree exit 0 → agent exec reached the RPC loop in the worktree (no invalid reference / EACCES / spawn docker).");
+	} finally {
+		try {
+			const sb = new ProjectSandbox({ runtime, sandboxMode: "podman", projectId, projectDir, repoUrl: SSH_ORIGIN, cloneSource, image: IMAGE });
+			await sb.destroy();
+			await podman(["volume", "rm", "-f", wtVolume]).catch(() => {});
+		} catch (e: any) { console.warn("userns cleanup failed:", e?.message || e); }
+		if (keepidProbeC) await podman(["rm", "-f", keepidProbeC]).catch(() => {});
+		try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch { /* ignore */ }
+	}
+}
+
 async function main(): Promise<void> {
 	if (!process.env.CONTAINER_HOST) {
 		throw new Error("CONTAINER_HOST not set — point it at the rootless podman socket");
@@ -457,6 +598,9 @@ async function main(): Promise<void> {
 
 		// Scenario E — auto-heal a stale non-keep-id container on reconnect.
 		await validateStaleContainerHeal(runtime, cloneSource);
+
+		// Scenario F — the cross-userns MIGRATION fallout (this round).
+		await validateCrossUsernsMigration(runtime, cloneSource);
 	} finally {
 		// Cleanup: remove the test container + volume.
 		try {
