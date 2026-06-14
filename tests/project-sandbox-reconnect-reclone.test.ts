@@ -62,6 +62,18 @@ function clonedInto(execCalls: string[][], dest: string): boolean {
 	return execCalls.some(a => a[0] === "git" && a[1] === "clone" && a[a.length - 1] === dest);
 }
 
+/** Index of the first root `chown node:node /workspace` exec (sh -c form). */
+function chownWorkspaceIndex(execCalls: string[][]): number {
+	return execCalls.findIndex(
+		a => a[0] === "sh" && a[1] === "-c" && /chown node:node \/workspace(\s|$)/.test(a[2] ?? ""),
+	);
+}
+
+/** Index of the `git clone … .` into /workspace. */
+function cloneIntoWorkspaceIndex(execCalls: string[][]): number {
+	return execCalls.findIndex(a => a[0] === "git" && a[1] === "clone" && a[a.length - 1] === ".");
+}
+
 describe("ProjectSandbox._initContainer reconnect always ensures the workspace is initialized", () => {
 	it("RE-CLONES when reconnecting to a running container whose /workspace has no .git", async () => {
 		const { runtime, execCalls } = makeFakeRuntime({ workspaceHasGit: false });
@@ -80,6 +92,19 @@ describe("ProjectSandbox._initContainer reconnect always ensures the workspace i
 		assert.ok(
 			clonedInto(execCalls, "."),
 			`expected a 'git clone … .' into /workspace for an uninitialized reused container; calls: ${JSON.stringify(execCalls)}`,
+		);
+
+		// Rootless-podman fix: a root `chown node:node /workspace` must precede the
+		// clone so the unprivileged `node` user can write /workspace/.git.
+		const chownIdx = chownWorkspaceIndex(execCalls);
+		const cloneIdx = cloneIntoWorkspaceIndex(execCalls);
+		assert.ok(
+			chownIdx >= 0,
+			`expected a root 'chown node:node /workspace' during init; calls: ${JSON.stringify(execCalls)}`,
+		);
+		assert.ok(
+			chownIdx < cloneIdx,
+			`expected chown /workspace (idx ${chownIdx}) BEFORE git clone (idx ${cloneIdx}); calls: ${JSON.stringify(execCalls)}`,
 		);
 	});
 
@@ -100,6 +125,12 @@ describe("ProjectSandbox._initContainer reconnect always ensures the workspace i
 		assert.ok(
 			!clonedInto(execCalls, "."),
 			`expected NO clone for a healthy reused container (/workspace/.git present); calls: ${JSON.stringify(execCalls)}`,
+		);
+		// No clone → no need to chown /workspace either (the chown is gated behind
+		// the about-to-clone path, keeping healthy reconnects a pure no-op).
+		assert.ok(
+			chownWorkspaceIndex(execCalls) < 0,
+			`expected NO chown /workspace for a healthy reused container; calls: ${JSON.stringify(execCalls)}`,
 		);
 	});
 });

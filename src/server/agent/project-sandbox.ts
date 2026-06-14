@@ -733,10 +733,13 @@ export class ProjectSandbox {
 
 		this.containerId = containerId;
 
-		// Create /workspace-wt for agent worktrees (needs root since / is root-owned)
+		// Create /workspace-wt for agent worktrees (needs root since / is root-owned).
+		// Also chown /workspace itself: rootless podman named volumes are root-owned,
+		// so the `node` user can't write /workspace/.git when cloning. Defense-in-depth
+		// for fresh containers — the init sequence re-chowns before cloning regardless.
 		try {
 			await this.runtime.exec(containerId, [
-				"sh", "-c", "mkdir -p /workspace-wt && chown node:node /workspace-wt",
+				"sh", "-c", "mkdir -p /workspace /workspace-wt && chown node:node /workspace /workspace-wt",
 			], { user: "root", timeoutMs: 10_000 });
 		} catch {
 			// Non-fatal — createWorktree will retry
@@ -797,6 +800,14 @@ export class ProjectSandbox {
 		// unless safe.directory is configured first. The multi-repo init path
 		// (`_runInitSequenceMultiRepo`) already orders this before its clones.
 		await this._dockerExec(this.containerId, ["git", "config", "--global", "--add", "safe.directory", "*"]);
+
+		// Named volumes under rootless podman are root-owned (no copy-up for a
+		// non-empty image dir, and copy-up only applies to empty volumes), so the
+		// unprivileged `node` user can't write `/workspace/.git`. chown /workspace
+		// to node as root before cloning. Docker is unaffected (its volume copy-up
+		// already yields node-owned content), so this is harmless there. Only
+		// reached when `/workspace/.git` is absent (i.e. about to clone) — cheap.
+		await this.runtime.exec(this.containerId, ["sh", "-c", "chown node:node /workspace"], { user: "root", timeoutMs: 10_000 });
 
 		// Clone the repo
 		console.log(`[project-sandbox] Cloning ${repoUrl} into /workspace...`);
@@ -865,6 +876,12 @@ export class ProjectSandbox {
 
 		// Mark all of /workspace as a safe directory for git
 		await this._dockerExec(this.containerId, ["git", "config", "--global", "--add", "safe.directory", "*"]);
+
+		// Named volumes under rootless podman are root-owned, so the unprivileged
+		// `node` user can't `mkdir -p /workspace/<repo>` or clone into it. chown
+		// /workspace to node as root before the per-repo clone loop. Harmless on
+		// Docker (volume copy-up already yields node-owned content).
+		await this.runtime.exec(this.containerId, ["sh", "-c", "chown node:node /workspace"], { user: "root", timeoutMs: 10_000 });
 
 		for (const repo of repoNames) {
 			if (repo === ".") continue;  // sanity

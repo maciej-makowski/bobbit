@@ -111,6 +111,13 @@ LABEL bobbit.pi-ai-bedrock-ua-patch=1
 # Must run as root (before USER node) to write to /usr/local/lib/node_modules/.
 RUN npm install -g typescript --no-audit --no-fund 2>/dev/null
 
+# Pre-create /workspace owned by node BEFORE dropping privileges. Under rootless
+# podman a fresh named volume's copy-up inherits the mountpoint's ownership, so
+# making it node-owned here lets the unprivileged `node` user clone into
+# /workspace/.git without a runtime chown. (Existing/non-empty volumes still rely
+# on the runtime chown in ProjectSandbox since copy-up only applies to empty ones.)
+RUN mkdir -p /workspace && chown node:node /workspace
+
 # Run as non-root user. node:22-slim includes a 'node' user (uid=1000).
 # This ensures files created in /workspace via bind mount are owned by uid=1000
 # on the host, matching typical developer user IDs.

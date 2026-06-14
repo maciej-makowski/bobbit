@@ -39,6 +39,79 @@ async function podman(args: string[]): Promise<string> {
 	return stdout.trim();
 }
 
+/**
+ * Scenario B — the rootless-podman root-owned /workspace blocker.
+ *
+ * Reproduces the user's exact failure: a REUSED container whose `/workspace`
+ * named volume is root-owned (as happens for volumes created before the
+ * node-owned /workspace fix) makes the unprivileged `node` user unable to
+ * write `/workspace/.git`, so `git clone … .` fails with
+ * `/workspace/.git: Permission denied`.
+ *
+ * We podman-run a container with the project label and force `/workspace`
+ * root-owned (simulating the user's pre-existing volume), then drive the REAL
+ * ProjectSandbox.init() → reconnect path → _runInitSequence. The fix issues a
+ * root `chown node:node /workspace` before the clone, so the clone now
+ * succeeds and /workspace/.git exists, node-owned. Then createWorktree adds a
+ * worktree (git worktree add exit 0).
+ */
+async function validateRootOwnedWorkspaceChown(runtime: PodmanRuntime, cloneSource: ReturnType<typeof resolveSandboxCloneSource>): Promise<void> {
+	const projectId = `podman-chown-${process.pid}`;
+	const volume = `bobbit-workspace-${projectId}`;
+	const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "podman-chown-proj-"));
+	let containerId = "";
+	try {
+		// Pre-create a container with the project label + a root-owned /workspace
+		// named volume, simulating the user's existing (pre-fix) container/volume.
+		log("chown-setup", `podman run labelled container with root-owned ${volume}:/workspace`);
+		containerId = await podman([
+			"run", "-d", "--label", `bobbit-project=${projectId}`,
+			"-v", `${volume}:/workspace`,
+			IMAGE, "sleep", "infinity",
+		]);
+		await podman(["exec", "--user", "root", containerId, "chown", "root:root", "/workspace"]);
+		const ownBefore = await podman(["exec", containerId, "sh", "-c", "stat -c '%U:%G' /workspace"]);
+		log("chown-setup", `/workspace owner BEFORE init (must be root:root): ${ownBefore}`);
+		if (ownBefore !== "root:root") throw new Error("failed to simulate a root-owned /workspace volume");
+
+		// Prove the raw clone-as-node fails on the root-owned /workspace (the user's
+		// exact symptom) BEFORE letting ProjectSandbox.init() apply the fix.
+		const rawFail = await podman(["exec", "-w", "/workspace", containerId, "sh", "-c",
+			'git config --global --add safe.directory "*"; git clone ' + cloneSource.cloneUrl + ' . 2>&1; echo EXIT=$?']);
+		log("chown-repro", `raw clone as node on root-owned /workspace (expect Permission denied + EXIT=1):\n${rawFail}`);
+		if (!/Permission denied/.test(rawFail)) throw new Error("expected the root-owned /workspace to reject the clone, but it did not");
+
+		// Drive the REAL production path. init() finds the labelled container,
+		// reconnects (so _createContainer is NOT run), and _runInitSequence must
+		// chown /workspace before cloning.
+		log("chown-init", "ProjectSandbox.init() (reconnect path) — must chown /workspace then clone");
+		const sb = new ProjectSandbox({ runtime, sandboxMode: "podman", projectId, projectDir, repoUrl: SSH_ORIGIN, cloneSource, image: IMAGE });
+		await sb.init();
+		const reconnId = await sb.getContainerId();
+		if (reconnId.substring(0, 12) !== containerId.substring(0, 12)) throw new Error("expected reconnect to the SAME container, not recreate");
+
+		const ownAfter = await podman(["exec", containerId, "sh", "-c", "stat -c '%U:%G' /workspace"]);
+		const gitState = await podman(["exec", containerId, "sh", "-c", "test -d /workspace/.git && echo HAS_GIT || echo NO_GIT"]);
+		log("chown-init", `/workspace owner AFTER init: ${ownAfter}; .git state: ${gitState}`);
+		if (gitState !== "HAS_GIT") throw new Error("BLOCKER NOT FIXED: clone into root-owned /workspace failed (no .git after init)");
+		const gitLs = await podman(["exec", containerId, "ls", "-lad", "/workspace/.git"]);
+		log("chown-init", `ls -lad /workspace/.git (must be node-owned):\n${gitLs}`);
+
+		const wt = await sb.createWorktree(WORKTREE_NAME, BRANCH);
+		const wtOk = await podman(["exec", containerId, "sh", "-c", "git -C /workspace-wt/" + WORKTREE_NAME + " rev-parse --is-inside-work-tree >/dev/null 2>&1 && echo WT_OK || echo WT_MISSING"]);
+		log("chown-worktree", `createWorktree → ${wt}; worktree exists: ${wtOk}`);
+		if (wtOk !== "WT_OK") throw new Error("createWorktree did not produce a worktree on the chowned /workspace");
+
+		log("RESULT-B", "SUCCESS — root-owned /workspace reconnect: clone-as-node failed BEFORE fix, then init chowned /workspace → HTTPS clone exit 0 → /workspace/.git node-owned → git worktree add exit 0.");
+	} finally {
+		try {
+			const sb = new ProjectSandbox({ runtime, sandboxMode: "podman", projectId, projectDir, repoUrl: SSH_ORIGIN, cloneSource, image: IMAGE });
+			await sb.destroy();
+		} catch (e: any) { console.warn("chown cleanup failed:", e?.message || e); }
+		try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch { /* ignore */ }
+	}
+}
+
 async function main(): Promise<void> {
 	if (!process.env.CONTAINER_HOST) {
 		throw new Error("CONTAINER_HOST not set — point it at the rootless podman socket");
@@ -122,6 +195,9 @@ async function main(): Promise<void> {
 		if (rawExists !== "WT_OK") throw new Error("raw git worktree add did not produce a worktree");
 
 		log("RESULT", "SUCCESS — full chain: podman container → HTTPS clone (from SSH origin) → stale reuse → re-clone → git worktree add returned 0 and the worktree exists.");
+
+		// Scenario B — the root-owned /workspace chown blocker.
+		await validateRootOwnedWorkspaceChown(runtime, cloneSource);
 	} finally {
 		// Cleanup: remove the test container + volume.
 		try {
