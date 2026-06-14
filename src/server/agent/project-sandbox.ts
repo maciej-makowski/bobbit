@@ -622,13 +622,22 @@ export class ProjectSandbox {
 				// Validate with a simple exec
 				try {
 					await this._dockerExec(existingId, ["echo", "ok"]);
-					this.containerId = existingId;
-					// Audit worktree state on reconnect — helps debug disappearing worktrees
-					try {
-						const wtList = await this._dockerExec(existingId, ["sh", "-c", "ls -d /workspace-wt/session/* 2>/dev/null || echo '(none)'"]);
-						console.log(`[project-sandbox] Reconnected to running container ${existingId.substring(0, 12)} for project ${projectId} — worktrees: ${wtList.trim()}`);
-					} catch {
-						console.log(`[project-sandbox] Reconnected to running container ${existingId.substring(0, 12)} for project ${projectId}`);
+					if (!(await this._bindMountWritable(existingId))) {
+						// Stale container created WITHOUT the rootless-podman userns
+						// mapping: its `node` can't write host bind mounts, so the agent
+						// would die on `mkdir /home/node/.bobbit/agent/sessions/…`.
+						// Recreate so the fresh-create path adds `--userns=keep-id`.
+						console.warn(`[project-sandbox] Container ${existingId.substring(0, 12)} cannot write host bind mounts (likely created before the rootless-podman userns fix); recreating`);
+						await this._removeContainer(existingId);
+					} else {
+						this.containerId = existingId;
+						// Audit worktree state on reconnect — helps debug disappearing worktrees
+						try {
+							const wtList = await this._dockerExec(existingId, ["sh", "-c", "ls -d /workspace-wt/session/* 2>/dev/null || echo '(none)'"]);
+							console.log(`[project-sandbox] Reconnected to running container ${existingId.substring(0, 12)} for project ${projectId} — worktrees: ${wtList.trim()}`);
+						} catch {
+							console.log(`[project-sandbox] Reconnected to running container ${existingId.substring(0, 12)} for project ${projectId}`);
+						}
 					}
 					// Fall through to _runInitSequence() — idempotent, but ensures a
 					// half-initialized reused container (e.g. prior failed clone) is
@@ -644,13 +653,19 @@ export class ProjectSandbox {
 					await this.runtime.startContainer(existingId, { timeoutMs: 30_000 });
 					// Validate after start
 					await this._dockerExec(existingId, ["echo", "ok"]);
-					this.containerId = existingId;
-					// Audit worktree state after restart — overlay FS data may have been lost
-					try {
-						const wtList = await this._dockerExec(existingId, ["sh", "-c", "ls -d /workspace-wt/session/* 2>/dev/null || echo '(none)'"]);
-						console.log(`[project-sandbox] Restarted stopped container ${existingId.substring(0, 12)} for project ${projectId} — worktrees: ${wtList.trim()}`);
-					} catch {
-						console.log(`[project-sandbox] Restarted stopped container ${existingId.substring(0, 12)} for project ${projectId}`);
+					if (!(await this._bindMountWritable(existingId))) {
+						// See running-branch note: recreate so keep-id is applied.
+						console.warn(`[project-sandbox] Restarted container ${existingId.substring(0, 12)} cannot write host bind mounts (likely created before the rootless-podman userns fix); recreating`);
+						await this._removeContainer(existingId);
+					} else {
+						this.containerId = existingId;
+						// Audit worktree state after restart — overlay FS data may have been lost
+						try {
+							const wtList = await this._dockerExec(existingId, ["sh", "-c", "ls -d /workspace-wt/session/* 2>/dev/null || echo '(none)'"]);
+							console.log(`[project-sandbox] Restarted stopped container ${existingId.substring(0, 12)} for project ${projectId} — worktrees: ${wtList.trim()}`);
+						} catch {
+							console.log(`[project-sandbox] Restarted stopped container ${existingId.substring(0, 12)} for project ${projectId}`);
+						}
 					}
 					// Fall through to _runInitSequence() — see note above.
 				} catch {
@@ -676,6 +691,33 @@ export class ProjectSandbox {
 		// and it completes the clone for a half-initialized reused container
 		// (e.g. a prior failed clone left /workspace empty) BEFORE any worktree op.
 		await this._runInitSequence();
+	}
+
+	/**
+	 * Write-probe a host bind mount as the default (`node`) user. Under rootless
+	 * podman a container created WITHOUT `--userns=keep-id` maps `node` to a host
+	 * SUBUID that doesn't own the host-owned bind mounts, so writes EACCES and the
+	 * agent dies on `mkdir '/home/node/.bobbit/agent/sessions/…'`. A failing probe
+	 * means the container predates the userns fix → caller recreates it (the
+	 * fresh-create path adds keep-id). Best-effort: any throw → not writable →
+	 * recreate, which is always safe because named volumes persist worktrees.
+	 *
+	 * The `mkdir -p` first isolates the EACCES signal: an un-writable root-owned
+	 * bind mount already exists so the mkdir no-ops, then the `touch` EACCEes.
+	 * It also avoids a false negative if the dir is simply absent (ENOENT) — in
+	 * production the sessions dir is always a bind mount, but defensively a
+	 * missing dir is not the keep-id problem.
+	 */
+	private async _bindMountWritable(containerId: string): Promise<boolean> {
+		try {
+			await this._dockerExec(containerId, [
+				"sh", "-c",
+				"mkdir -p /home/node/.bobbit/agent/sessions && touch /home/node/.bobbit/agent/sessions/.bobbit-perm-probe && rm -f /home/node/.bobbit/agent/sessions/.bobbit-perm-probe",
+			]);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	/**

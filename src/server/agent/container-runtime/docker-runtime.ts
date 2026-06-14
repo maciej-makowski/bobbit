@@ -12,6 +12,11 @@ export const DOCKER_HOST_GATEWAY = "host.docker.internal";
 
 /** The run-arg hooks Docker uses — exported so the pinning test can assert parity. */
 export const DOCKER_RUN_ARG_HOOKS: RunArgHooks = {
+	// Docker needs no extra run flags — its serialized output is byte-pinned by
+	// tests/container-runtime-run-args.test.ts, so this MUST stay empty.
+	extraRunArgs(): string[] {
+		return [];
+	},
 	hostGatewayArgs(): string[] {
 		return [`--add-host=${DOCKER_HOST_GATEWAY}:host-gateway`];
 	},

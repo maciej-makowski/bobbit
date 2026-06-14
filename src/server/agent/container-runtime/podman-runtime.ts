@@ -24,6 +24,20 @@ import type { RuntimeId, VolumeMount } from "./types.js";
 export const PODMAN_HOST_GATEWAY = "host.containers.internal";
 
 export const PODMAN_RUN_ARG_HOOKS: RunArgHooks = {
+	// Rootless podman maps the container's `node` (uid 1000) to a host SUBUID,
+	// NOT the host user who owns the writable host bind mounts
+	// (`/home/node/.bobbit/agent/sessions`, `/bobbit-state/*`, `/bobbit/preview*`,
+	// `/tmp/session-prompts`). That mismatch makes those mounts EACCES for the
+	// agent — the pi-coding-agent dies on `mkdir '/home/node/.bobbit/agent/
+	// sessions/…'`. `--userns=keep-id:uid=1000,gid=1000` maps the HOST user to
+	// container uid/gid 1000 (the image's `node`), so the container `node` and the
+	// host user are the same identity: host bind mounts (owned by the host user)
+	// are read/write inside the container AND the host gateway still owns/reads
+	// them — no host chown, no `:U`. The explicit uid=1000/gid=1000 pins the
+	// mapping to the image's `node` uid regardless of the host user's own uid.
+	extraRunArgs(): string[] {
+		return ["--userns=keep-id:uid=1000,gid=1000"];
+	},
 	hostGatewayArgs(): string[] {
 		// Podman auto-provides host.containers.internal; the `:host-gateway`
 		// special value lets us also expose the Docker-compatible name so agent

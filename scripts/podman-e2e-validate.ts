@@ -205,6 +205,163 @@ async function validateRootOwnedWorktreesChown(runtime: PodmanRuntime, cloneSour
 	}
 }
 
+/**
+ * Scenario D — the rootless-podman BIND-MOUNT permission blocker (this round).
+ *
+ * The agent dies immediately with
+ *   `EACCES: permission denied, mkdir '/home/node/.bobbit/agent/sessions/…'`
+ * because `/home/node/.bobbit/agent/sessions` is a HOST bind mount and, without
+ * `--userns=keep-id`, the container's `node` (uid 1000) maps to a host SUBUID
+ * that does not own the host-owned dir. The fix: PodmanRuntime now emits
+ * `--userns=keep-id:uid=1000,gid=1000`, mapping the HOST user to container uid
+ * 1000 so host bind mounts are read/write by `node`.
+ *
+ * Proves on REAL podman:
+ *   1. A NON-keep-id container EACCEes on the sessions bind mount (repro), and a
+ *      keep-id container can write it (fix).
+ *   2. The ACTUAL agent exec the gateway runs (rpc-bridge form) against the
+ *      keep-id container gets PAST the sessions mkdir — NO EACCES on
+ *      /home/node/.bobbit/agent/sessions (later auth/RPC failure is acceptable).
+ *   3. The host user can still read/write the sessions dir (keep-id ≠ chown).
+ *   4. Stale-container heal: a pre-existing NON-keep-id labelled container is
+ *      detected by ProjectSandbox.init()'s write-probe and recreated with
+ *      keep-id, after which the agent sessions mkdir succeeds.
+ */
+async function validateBindMountKeepId(runtime: PodmanRuntime): Promise<void> {
+	const { buildContainerRunSpec } = await import("../src/server/agent/docker-args.js");
+	const { serializeContainerRunSpec } = await import("../src/server/agent/container-runtime/base-cli-runtime.js");
+	const { PODMAN_RUN_ARG_HOOKS } = await import("../src/server/agent/container-runtime/podman-runtime.js");
+	const { buildAgentArgs } = await import("../src/server/agent/rpc-bridge.js");
+
+	const projectId = `podman-keepid-${process.pid}`;
+	const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "podman-keepid-proj-"));
+	const stateDir = path.join(projectDir, ".bobbit", "state");
+	const hostSessions = path.join(stateDir, "sessions");
+	fs.mkdirSync(hostSessions, { recursive: true });
+	const SESSIONS = "/home/node/.bobbit/agent/sessions";
+	let bugC = "";
+	let fixC = "";
+	try {
+		// 1a. Reproduce the bug: NON-keep-id container with the sessions bind mount.
+		log("keepid-repro", `NON-keep-id container, -v ${hostSessions}:${SESSIONS}:Z (expect EACCES)`);
+		bugC = await podman(["run", "-d", "-v", `${hostSessions}:${SESSIONS}:Z`, IMAGE, "sleep", "infinity"]);
+		const bugWrite = await podman(["exec", bugC, "sh", "-c", `touch ${SESSIONS}/x 2>&1; echo EXIT=$?`]);
+		log("keepid-repro", `write as node (expect Permission denied + EXIT=1):\n${bugWrite}`);
+		if (!/Permission denied|EXIT=1/.test(bugWrite)) throw new Error("expected NON-keep-id sessions mount to EACCES, but it did not");
+
+		// 1b. The fix: build the PRODUCTION run spec and confirm it carries keep-id
+		// + :Z, then create the container and write the sessions dir successfully.
+		const spec = buildContainerRunSpec({
+			image: IMAGE, workspaceDir: "", label: projectId, labelPrefix: "bobbit-project-keepid",
+			projectId, stateDir, memoryLimit: "2g", cpuLimit: "2", pidsLimit: "0",
+		});
+		const runArgv = serializeContainerRunSpec(spec, PODMAN_RUN_ARG_HOOKS);
+		log("keepid-fix", `production podman run argv[0..3]: ${JSON.stringify(runArgv.slice(0, 3))}`);
+		if (runArgv[2] !== "--userns=keep-id:uid=1000,gid=1000") throw new Error("production run spec missing keep-id right after `run -d`");
+		const sessionsMount = runArgv.find((a) => a.includes(`:${SESSIONS}`));
+		log("keepid-fix", `sessions bind mount arg: ${sessionsMount}`);
+		if (!sessionsMount || !/:Z$/.test(sessionsMount)) throw new Error("sessions bind mount missing :Z relabel");
+		fixC = (await runtime.createContainer(spec)).trim();
+		const fixWrite = await podman(["exec", fixC, "sh", "-c", `touch ${SESSIONS}/y && echo WRITABLE`]);
+		log("keepid-fix", `keep-id container write as node: ${fixWrite}; container sees owner ${await podman(["exec", fixC, "stat", "-c", "%u:%g", SESSIONS])}`);
+		if (!/WRITABLE/.test(fixWrite)) throw new Error("keep-id container could not write the sessions bind mount");
+
+		// 2. THE KEY ONE — drive the ACTUAL agent exec the gateway runs and confirm
+		// it gets PAST the sessions mkdir. We feed an empty stdin and a short
+		// timeout; the agent may later fail on auth/RPC (acceptable) — what must be
+		// GONE is `EACCES … mkdir '/home/node/.bobbit/agent/sessions…'`.
+		const agentArgs = buildAgentArgs({ cwd: "/workspace-wt/session-keepid" });
+		const execArgv = [
+			"exec", "-i", "-w", "/workspace-wt/session-keepid",
+			"-e", "NODE_TLS_REJECT_UNAUTHORIZED=0",
+			fixC,
+			"node", "--disable-warning=DEP0123", "/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+			...agentArgs,
+		];
+		// Pre-create the cwd so the agent doesn't fail on a missing workdir first.
+		await podman(["exec", "--user", "root", fixC, "sh", "-c", "mkdir -p /workspace-wt/session-keepid && chown node:node /workspace-wt/session-keepid"]);
+		log("keepid-agent", `running ACTUAL agent exec: podman ${execArgv.slice(0, 3).join(" ")} … cli.js ${agentArgs.join(" ")}`);
+		const agentOut = await podman(["exec", "--user", "root", fixC, "sh", "-c",
+			// run the agent as node with empty stdin + 12s cap; capture all output.
+			`timeout 12 sh -c 'echo "" | runuser -u node -- node --disable-warning=DEP0123 /node_modules/@earendil-works/pi-coding-agent/dist/cli.js ${agentArgs.join(" ")} 2>&1'; echo "AGENT_EXIT=$?"`,
+		]).catch((e: any) => `${e?.stdout || ""}${e?.stderr || ""}${e?.message || ""}`);
+		const sessionsEacces = /EACCES[^\n]*mkdir '\/home\/node\/\.bobbit\/agent\/sessions/.test(agentOut);
+		log("keepid-agent", `agent output (truncated):\n${agentOut.slice(0, 1500)}`);
+		if (sessionsEacces) throw new Error("BUG NOT FIXED: agent still hit EACCES on the sessions mkdir under keep-id");
+		// Positive evidence: the agent actually created its session dir on the host mount.
+		const sessionDirs = await podman(["exec", fixC, "sh", "-c", `ls -la ${SESSIONS} 2>&1`]);
+		log("keepid-agent", `host sessions dir contents after agent start (should include an agent-created session dir):\n${sessionDirs}`);
+
+		// 3. Host can still read/write the sessions dir (keep-id does NOT chown it).
+		const probe = path.join(hostSessions, ".host-probe");
+		fs.writeFileSync(probe, "ok");
+		const hostReadback = fs.readFileSync(probe, "utf8");
+		fs.rmSync(probe);
+		log("keepid-host", `host wrote+read ${probe}: "${hostReadback}"; host owner of sessions: ${fs.statSync(hostSessions).uid}:${fs.statSync(hostSessions).gid}`);
+		if (hostReadback !== "ok") throw new Error("host could not read/write the sessions dir");
+
+		log("RESULT-D", "SUCCESS — bind-mount keep-id: NON-keep-id sessions mount EACCEd, keep-id mount is node-writable, the ACTUAL agent exec got PAST the /home/node/.bobbit/agent/sessions mkdir (no EACCES), and the host still owns/reads the dir.");
+	} finally {
+		for (const c of [bugC, fixC]) { if (c) await podman(["rm", "-f", c]).catch(() => {}); }
+		try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch { /* ignore */ }
+	}
+}
+
+/**
+ * Scenario E — auto-heal a stale container created WITHOUT keep-id.
+ *
+ * Pre-create a labelled container WITHOUT keep-id (the user's `402544fa2266`
+ * situation) wired with the sessions bind mount. ProjectSandbox.init() must
+ * detect the un-writable bind mount via its write-probe, REMOVE the stale
+ * container and recreate it WITH keep-id, after which the agent sessions mkdir
+ * succeeds.
+ */
+async function validateStaleContainerHeal(runtime: PodmanRuntime, cloneSource: ReturnType<typeof resolveSandboxCloneSource>): Promise<void> {
+	const projectId = `podman-heal-${process.pid}`;
+	const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "podman-heal-proj-"));
+	const stateDir = path.join(projectDir, ".bobbit", "state");
+	const hostSessions = path.join(stateDir, "sessions");
+	fs.mkdirSync(hostSessions, { recursive: true });
+	const SESSIONS = "/home/node/.bobbit/agent/sessions";
+	let staleC = "";
+	try {
+		// Pre-create a NON-keep-id labelled container with the sessions bind mount.
+		log("heal-setup", `NON-keep-id labelled container with ${hostSessions}:${SESSIONS}:Z`);
+		staleC = await podman([
+			"run", "-d", "--label", `bobbit-project=${projectId}`,
+			"-v", `bobbit-workspace-${projectId}:/workspace`,
+			"-v", `bobbit-worktrees-${projectId}:/workspace-wt`,
+			"-v", `${hostSessions}:${SESSIONS}:Z`,
+			IMAGE, "sleep", "infinity",
+		]);
+		const staleWrite = await podman(["exec", staleC, "sh", "-c", `touch ${SESSIONS}/x 2>&1; echo EXIT=$?`]);
+		log("heal-setup", `stale container sessions write (expect EACCES):\n${staleWrite}`);
+		if (!/Permission denied|EXIT=1/.test(staleWrite)) throw new Error("stale container sessions mount unexpectedly writable");
+
+		// Drive the REAL init() — must detect the un-writable bind mount and recreate.
+		log("heal-init", "ProjectSandbox.init() — write-probe should fail → recreate WITH keep-id");
+		const sb = new ProjectSandbox({ runtime, sandboxMode: "podman", projectId, projectDir, repoUrl: SSH_ORIGIN, cloneSource, image: IMAGE });
+		await sb.init();
+		const newId = await sb.getContainerId();
+		const recreated = newId.substring(0, 12) !== staleC.substring(0, 12);
+		log("heal-init", `original=${staleC.substring(0, 12)} new=${newId.substring(0, 12)} recreated=${recreated}`);
+		if (!recreated) throw new Error("BUG: stale non-keep-id container was reused, not recreated");
+
+		// The recreated container must be able to write the sessions bind mount.
+		const healWrite = await podman(["exec", newId, "sh", "-c", `touch ${SESSIONS}/healed && echo WRITABLE`]);
+		log("heal-verify", `recreated container sessions write: ${healWrite}`);
+		if (!/WRITABLE/.test(healWrite)) throw new Error("recreated container still cannot write the sessions bind mount");
+
+		log("RESULT-E", "SUCCESS — stale-heal: a pre-existing NON-keep-id container EACCEd on the sessions mount, ProjectSandbox.init() detected it via the write-probe and recreated it WITH keep-id, and the sessions mount is now node-writable.");
+	} finally {
+		try {
+			const sb = new ProjectSandbox({ runtime, sandboxMode: "podman", projectId, projectDir, repoUrl: SSH_ORIGIN, cloneSource, image: IMAGE });
+			await sb.destroy();
+		} catch (e: any) { console.warn("heal cleanup failed:", e?.message || e); }
+		try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch { /* ignore */ }
+	}
+}
+
 async function main(): Promise<void> {
 	if (!process.env.CONTAINER_HOST) {
 		throw new Error("CONTAINER_HOST not set — point it at the rootless podman socket");
@@ -292,8 +449,14 @@ async function main(): Promise<void> {
 		// Scenario B — the root-owned /workspace chown blocker.
 		await validateRootOwnedWorkspaceChown(runtime, cloneSource);
 
-		// Scenario C — the root-owned /workspace-wt chown blocker (this round).
+		// Scenario C — the root-owned /workspace-wt chown blocker (prior round).
 		await validateRootOwnedWorktreesChown(runtime, cloneSource);
+
+		// Scenario D — the rootless-podman BIND-MOUNT (sessions) keep-id fix.
+		await validateBindMountKeepId(runtime);
+
+		// Scenario E — auto-heal a stale non-keep-id container on reconnect.
+		await validateStaleContainerHeal(runtime, cloneSource);
 	} finally {
 		// Cleanup: remove the test container + volume.
 		try {

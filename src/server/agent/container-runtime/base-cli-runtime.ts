@@ -51,6 +51,12 @@ export type ExecFileFn = (
 
 /** Per-runtime hooks for the otherwise-shared `run` arg builder. */
 export interface RunArgHooks {
+	/**
+	 * Engine-specific flags emitted immediately after `run -d`, before anything
+	 * else. Docker returns `[]` (its output is byte-pinned); Podman returns
+	 * `--userns=keep-id:…` so host bind mounts are writable by the container.
+	 */
+	extraRunArgs(): string[];
 	/** Args emitted for each `addHosts` entry whose value is `"host-gateway"`. */
 	hostGatewayArgs(): string[];
 	/** Extra `-v` options (beyond `ro`) for a bind mount — e.g. Podman `["Z"]`. */
@@ -71,6 +77,7 @@ export interface RunArgHooks {
  */
 export function serializeContainerRunSpec(spec: ContainerRunSpec, hooks: RunArgHooks): string[] {
 	const args: string[] = ["run", "-d"];
+	args.push(...hooks.extraRunArgs());
 	if (spec.restart) args.push(`--restart=${spec.restart}`);
 
 	const addHosts = spec.addHosts ?? {};

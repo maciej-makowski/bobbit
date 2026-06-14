@@ -17,6 +17,7 @@ import {
 	resolveContainerRuntime,
 	serializeContainerRunSpec,
 	DOCKER_RUN_ARG_HOOKS,
+	PODMAN_RUN_ARG_HOOKS,
 	type ContainerRuntime,
 	type ContainerRunSpec,
 } from "../src/server/agent/container-runtime/index.ts";
@@ -332,6 +333,7 @@ describe("DockerRuntime run-args parity with buildDockerRunArgs (no Docker behav
 	it("podman run-args differ from docker only in host-gateway + relabel", () => {
 		const docker = buildDockerRunArgs(config);
 		const podman = serializeContainerRunSpec(buildContainerRunSpec(config), {
+			extraRunArgs: () => [],
 			hostGatewayArgs: () => ["--add-host=host.containers.internal:host-gateway", "--add-host=host.docker.internal:host-gateway"],
 			volumeOptions: (m) => (m.relabel ? ["Z"] : []),
 		});
@@ -343,6 +345,20 @@ describe("DockerRuntime run-args parity with buildDockerRunArgs (no Docker behav
 		// Podman relabels the bind mount of /tools (named volumes untouched).
 		assert.ok(podman.some((a) => a.endsWith(":/tools:ro,Z")));
 		assert.ok(podman.includes(`bobbit-workspace-${config.projectId}:/workspace`));
+	});
+
+	it("PODMAN_RUN_ARG_HOOKS injects --userns=keep-id:uid=1000,gid=1000 immediately after `run -d`", () => {
+		const podman = serializeContainerRunSpec(buildContainerRunSpec(config), PODMAN_RUN_ARG_HOOKS);
+		// keep-id must be the very first flag after `run -d` so the userns mapping
+		// applies to every host bind mount.
+		assert.deepEqual(podman.slice(0, 3), ["run", "-d", "--userns=keep-id:uid=1000,gid=1000"]);
+	});
+
+	it("DOCKER_RUN_ARG_HOOKS does NOT inject any --userns flag", () => {
+		const docker = serializeContainerRunSpec(buildContainerRunSpec(config), DOCKER_RUN_ARG_HOOKS);
+		assert.ok(!docker.some((a) => a.startsWith("--userns")));
+		// Docker output stays byte-identical to the legacy builder.
+		assert.deepEqual(docker, buildDockerRunArgs(config));
 	});
 });
 

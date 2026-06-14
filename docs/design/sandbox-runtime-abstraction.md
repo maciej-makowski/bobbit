@@ -170,10 +170,13 @@ literal.
   bind mounts, `toDockerPath` rewriting (Docker Desktop on Win/macOS).
 - `podman-runtime.ts` — `class PodmanRuntime extends BaseCliRuntime`.
   Overrides: info templates (`.Version.Version`, `.Host.CPUs`/`.Host.MemTotal`),
-  and (as we validate) any run-arg differences — `:Z` volume relabel under
-  SELinux, `host.containers.internal` vs `host.docker.internal`, `--userns`.
-  Starts minimal (matching Docker) and grows as real-Podman testing surfaces
-  needs — but the changes are confined to this file.
+  and the validated run-arg differences via `RunArgHooks` — `:Z` volume relabel
+  under SELinux, `host.containers.internal` vs `host.docker.internal`, and
+  `extraRunArgs()` emitting `--userns=keep-id:uid=1000,gid=1000` so the host
+  user maps to the container's `node` (uid 1000) and writable HOST bind mounts
+  (`/home/node/.bobbit/agent/sessions`, `/bobbit-state/*`, …) are node-writable
+  without a host chown. Docker's `extraRunArgs()` is `[]` (byte-pinned output).
+  The changes are confined to this file.
 
 `container/inspect` templates (`.State.Running`, `.Image`, `.Id`,
 `Config.Labels`) are Docker-API-compatible in Podman, so they live in the base
