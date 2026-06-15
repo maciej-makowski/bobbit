@@ -234,9 +234,13 @@ export class MessageEditor extends LitElement {
 			}
 			this._slashTokenStart = cursorPos - match[2].length - 1; // position of "/"
 			const query = match[2].toLowerCase();
+			// Pack entrypoints reconcile asynchronously after session/project changes.
+			// Re-merge them at filter time so the slash menu never shows stale launcher ids
+			// (or misses newly-registered launchers) because the base skill list loaded early.
+			const slashSkills = this._withPackEntrypoints(this._slashSkills.filter((s) => s.source !== "pack"));
 			this._slashFilteredSkills = query
-				? this._slashSkills.filter((s) => s.name.toLowerCase().includes(query))
-				: this._slashSkills;
+				? slashSkills.filter((s) => s.name.toLowerCase().includes(query))
+				: slashSkills;
 			this._slashMenuOpen = this._slashFilteredSkills.length > 0;
 			this._slashSelectedIndex = 0;
 		} else {
@@ -266,12 +270,37 @@ export class MessageEditor extends LitElement {
 		}
 	}
 
+	private _clearSlashToken(): void {
+		const textarea = this.textareaRef.value;
+		if (!textarea) return;
+		const cursorPos = textarea.selectionStart;
+		const before = this.value.substring(0, this._slashTokenStart);
+		const after = this.value.substring(cursorPos);
+		this.value = before + after;
+		this.onInput?.(this.value);
+		textarea.value = this.value;
+		const newPos = before.length;
+		textarea.focus();
+		textarea.setSelectionRange(newPos, newPos);
+	}
+
+	private _showLauncherError(message: string): void {
+		void import("../../app/render.js")
+			.then((m) => m.showHeaderToast(message))
+			.catch(() => { /* best-effort */ });
+	}
+
 	private _selectSlashSkill(skill: SlashSkillInfo) {
 		// Slice C1 — a pack composer-slash ENTRYPOINT runs its launcher (open panel /
 		// navigate) on selection (the user gesture) instead of inserting text.
 		if (skill.entrypointId) {
 			this._slashMenuOpen = false;
-			try { runLauncherEntrypoint(skill.entrypointId); } catch { /* non-fatal */ }
+			this._clearSlashToken();
+			try {
+				runLauncherEntrypoint(skill.entrypointId, (r) => {
+					if (!r.ok) this._showLauncherError(r.error || "Could not start the PR walkthrough.");
+				});
+			} catch { /* non-fatal */ }
 			return;
 		}
 		const textarea = this.textareaRef.value;
@@ -288,6 +317,27 @@ export class MessageEditor extends LitElement {
 			textarea.focus();
 			textarea.setSelectionRange(newPos, newPos);
 		}
+	}
+
+	private _packSlashLaunchFromText(text: string): { entrypointId: string; body: Record<string, unknown> } | undefined {
+		const trimmed = text.trim();
+		const match = trimmed.match(/^\/([A-Za-z0-9_.-]+)(?:\s+([\s\S]+))?$/);
+		if (!match) return undefined;
+
+		const name = match[1];
+		const launcher = listLauncherEntrypoints("composer-slash").find((l) => l.id === name);
+		if (!launcher) return undefined;
+
+		const arg = (match[2] ?? "").trim();
+		if (!arg) return { entrypointId: launcher.key, body: {} };
+
+		// PR walkthrough's run route already accepts these argument fields.
+		if (launcher.packId === "pr-walkthrough" || launcher.id === "pr-walkthrough") {
+			if (/^\d+$/.test(arg)) return { entrypointId: launcher.key, body: { prNumber: Number(arg) } };
+			return { entrypointId: launcher.key, body: { prUrl: arg } };
+		}
+
+		return { entrypointId: launcher.key, body: { input: arg } };
 	}
 
 	/** Fetch the file list for the current `@` query from the server (debounced).
@@ -667,6 +717,26 @@ export class MessageEditor extends LitElement {
 			}
 		}
 		this._sendSizeError = "";
+		const packSlashLaunch = this.attachments.length === 0 ? this._packSlashLaunchFromText(text) : undefined;
+		if (packSlashLaunch) {
+			this._slashMenuOpen = false;
+			this.dispatchEvent(new CustomEvent("message-send", { bubbles: true, composed: true }));
+			this.value = "";
+			this.onInput?.(this.value);
+			const textarea = this.textareaRef.value;
+			if (textarea) {
+				textarea.value = this.value;
+				textarea.focus();
+			}
+			this._historyIndex = -1;
+			this._savedDraft = "";
+			void this.addToHistory(text);
+
+			runLauncherEntrypoint(packSlashLaunch.entrypointId, (r) => {
+				if (!r.ok) this._showLauncherError(r.error || "Could not start the PR walkthrough.");
+			}, { body: packSlashLaunch.body });
+			return;
+		}
 		// Dispatch a composed event that escapes shadow DOM — used by
 		// session-manager for draft cleanup without monkey-patching.
 		this.dispatchEvent(new CustomEvent("message-send", { bubbles: true, composed: true }));

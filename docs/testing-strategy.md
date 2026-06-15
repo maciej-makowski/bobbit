@@ -521,6 +521,19 @@ fast-failing `GIT_EDITOR=false` (never a blocking editor) and asserts the fixtur
 creates the tag promptly without invoking an editor. It is RED against a
 non-hermetic helper and GREEN after the fix, so the trap cannot silently return.
 
+### Temp dirs used as project / pack / worktree roots
+
+Use `makeTmpDir(prefix)` from [`tests/helpers/tmp.ts`](../tests/helpers/tmp.ts)
+(not a raw `fs.mkdtempSync`) for any temp directory a test passes to production as
+a project, pack, or worktree root; use its `canonical(p)` to compare such paths.
+The helper `fs.realpathSync`-canonicalizes the directory. This matters because
+production canonicalizes project/pack roots, and on macOS `os.tmpdir()` resolves
+under the `/var → /private/var` symlink — a non-canonical temp root then trips
+`SymlinkProjectRootError` and produces false extension-host confinement
+"escapes". Canonicalizing in the helper keeps these tests green on macOS, Linux,
+and Windows alike. (This is distinct from the E2E scratch-space relocation under
+[Windows temp root](#windows-temp-root).)
+
 ### UI E2E page-object helpers
 
 Reusable helpers in `tests/e2e/ui/ui-helpers.ts`. Import from `./ui-helpers.js`:

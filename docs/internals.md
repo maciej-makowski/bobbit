@@ -1301,7 +1301,7 @@ Resolution order is unchanged (first non-null wins):
 
 MCP server groups behave identically to built-in tool groups: with no override anywhere, they fall through to the system `allow` fallback. `defaults/tool-group-policies.yaml` deliberately ships **no** `mcp__*` entries.
 
-Why no MCP-specific builtin denials: the Tools page renders the cascaded effective policy but cannot show its origin, so a builtin `mcp__<server>: never` would display as "Allow (default)" while silently blocking every agent call — the UI must be honest. A user who wants to block a server does so explicitly via the Tools page (or `.bobbit/config/tool-group-policies.yaml`), and the dropdown then reflects reality.
+Why no MCP-specific builtin denials: MCP servers should have the same baseline as other tool groups, and any restriction should come from an explicit user/project or role decision. The Tools page now mirrors the MCP cascade for display: a sub-namespace row with no stored `mcp__<server>__<sub>` key shows an explicit parent `mcp__<server>` policy as inherited while keeping the sub-key unset.
 
 Disruptive servers (e.g. headed Chromium from `@playwright/mcp`) are opted out at the **role** layer instead — see `defaults/roles/qa-tester.yaml`, which sets `toolPolicies: { mcp__playwright: never }`. Roles that need the tool inherit the `allow` default; roles that shouldn't have it block it locally.
 
@@ -1571,12 +1571,11 @@ The search flush-on-close path is **fully awaitable** end to end. This matters b
 - **`ProjectContextManager.closeAll()`** (`project-context-manager.ts`) is `async` and `await`s `Promise.allSettled(...)` over every context's `close()` before clearing the map. `remove(projectId)` stays fire-and-forget (`void ctx.close().catch(...)`) on purpose — it runs during normal operation, not teardown, so it must not block but must not throw.
 - **`server.ts` shutdown** `await`s `projectContextManager.closeAll()`.
 
-`SearchService.close()` (`search-service.ts`) coordinates with a possibly in-flight `open()`. Without this, `_doOpen()` could resume *after* `close()` returned and re-establish the store, indexer, and rebuild timer — leaking live search resources past shutdown. The two guards together close the race:
+`SearchService.close()` (`search-service.ts`) coordinates with two async paths: a possibly in-flight `open()` and an already-fired startup/background rebuild. Without the open guard, `_doOpen()` could resume *after* `close()` returned and re-establish the store, indexer, and rebuild timer — leaking live search resources past shutdown. Without rebuild tracking, a timer callback that already passed its closed-state guard could keep using the FlexSearch store while close closes it, surfacing `FlexSearchStore: already closed`. The shutdown guards are:
 
-1. `close()` first `await`s any in-flight `_openPromise`, then sets `_state = "closed"`, clears the startup `_rebuildTimer`, re-reads `_store` (in case `_doOpen` just assigned it), closes it, and nulls `_indexer`.
+1. `close()` first `await`s any in-flight `_openPromise`, then sets `_state = "closed"` and clears the startup `_rebuildTimer`.
 2. `_doOpen()` re-checks `_state` after the `FlexSearchStore.open()` await *and* after the meta-read awaits. If state went `"closed"` mid-open it `await store.close()` and returns **without** assigning `_store`/`_indexer`, scheduling the rebuild timer, or flipping to `"ready"`.
-
-The startup rebuild timer is `unref()`'d (never keeps the process alive) and cancelled on close; its callback also re-checks `_state === "closed" || !_indexer` before rebuilding, because an already-scheduled timer can still fire during teardown.
+3. The startup rebuild timer is `unref()`'d and cancelled on close; its callback also re-checks `_state === "closed" || !_indexer` before rebuilding. Once a rebuild starts, the callback stores `_backgroundRebuildPromise`, and `close()` awaits it before re-reading `_store`, closing it, and nulling `_indexer`.
 
 `FlexSearchStore` (`flex-store.ts`) is the belt-and-braces layer for any flush that still loses the race (a debounced timer or concurrent project-delete):
 
@@ -2291,9 +2290,17 @@ Agent process → message_update (full content)
 
 ---
 
+## Server-backed side-panel workspace
+
+Every session persists a `sidePanelWorkspace` record with the open right-panel tabs, active tab, tab order, and size mode. The server is the authority so the same workspace survives refreshes/restarts and converges across browser contexts. Closed tabs are authoritative absence: render/content caches and localStorage must not recreate them. Full behavior, REST routes, popout links, and migration rules live in [docs/side-panel-workspace.md](side-panel-workspace.md).
+
+This invariant matters because many panel kinds have content that can outlive the tab: proposal drafts on disk, review documents with annotations, preview mounts/artifacts, inbox entries, and pack-panel params. Those content caches are reopen sources only when an explicit UI/tool event calls the workspace open API; they are never the render-time source of truth.
+
+---
+
 ## Preview snapshots & reopening
 
-The `preview_open` tool drives one live server mount per session, rendered through the dynamic side-panel workspace. Each new call updates the live preview tab through SSE, and past `preview_open` widgets render an **Open** button that restores a source-derived historical preview tab from an **immutable preview artifact** captured at the original mount time. Reopening an older card therefore shows the bytes that were live then — not whatever happens to be in the source file now. New `preview_open` calls always select the unversioned filename tab; older differing artifacts open a versioned tab (`file.html (vN)`). Full tab semantics live in [docs/design/side-panel-tab-contract.md](design/side-panel-tab-contract.md).
+The `preview_open` tool drives one live server mount per session, rendered through the server-backed side-panel workspace. Explicit preview open events select or update the live preview tab, and past `preview_open` widgets render an **Open** button that restores a source-derived historical preview tab from an **immutable preview artifact** captured at the original mount time. Reopening an older card therefore shows the bytes that were live then — not whatever happens to be in the source file now. New `preview_open` calls always select the unversioned filename tab; older differing artifacts open a versioned tab (`file.html (vN)`). Full workspace semantics live in [docs/side-panel-workspace.md](side-panel-workspace.md).
 
 ### Why
 
@@ -2343,7 +2350,7 @@ explicit `sweepOrphanArtifacts(knownIds)` maintenance helper.
 
 ### Key design decisions
 
-- **Dynamic side-panel workspace** - regular and assistant sessions share the same tab model for chat, previews, proposals, reviews, and inbox. The live preview tab tracks SSE updates; historical `preview_open` cards create/select distinct preview tabs while still rendering through the one live server mount per session.
+- **Server-backed side-panel workspace** - regular and assistant sessions share the same durable tab model for previews, proposals, reviews, inbox, and pack panels. Chat stays outside the tab strip. The live preview tab tracks explicit preview open/update events; bootstrap/SSE metadata patches only already-open tabs so closed tabs do not resurrect.
 - **Constant-size snapshots (≤ 250 bytes)** - tool_result holds only `{kind:"preview", url, path}` wrapped in the v3 marker, so iteration cost is independent of HTML size. The `path` field is the host-invariant `<sessionId>/<entry>` form (forward slashes on all OSes) rather than the host-absolute path — keeping block size bounded by content shape, not install location. The agent can refresh a 5000-line report 50 times without the bytes ever entering its context.
 - **Bytes never re-enter agent context** - the content origin serves files from `<stateDir>/preview/<sid>/` on disk; tool_result holds only the URL/path. This is the structural fix to the v1 token-bloat problem.
 - **v1/v2 markers preserved in renderer-only code paths** - archived sessions still parse and reopen via the same mount endpoint (with `{html}` or `{file}` payloads recovered from the legacy block). New code emits only v3.
@@ -2364,8 +2371,11 @@ explicit `sweepOrphanArtifacts(knownIds)` maintenance helper.
 | `defaults/tools/html/extension.ts` | Tool extension emits `[status, v3-snapshot]` tool_result after PATCH + POST mount |
 | `src/server/agent/truncate-large-content.ts` | Recognises v1/v2/v3 markers (via `PREVIEW_SNAPSHOT_MARKERS`); v3 blocks always small so lazy-load only fires on legacy archived sessions |
 | `src/ui/tools/renderers/PreviewRenderer.ts` | Open button dispatch; creates/selects source-derived preview tabs; remounts v1/v2 and restorable v3 inline/file snapshots |
-| `src/app/panel-workspace.ts` | Per-session tab IDs/source metadata for chat, preview, proposal, review, and inbox tabs |
-| `src/app/preview-panel.ts` | EventSource SSE subscription, bootstrap GET, and workspace tab selection helpers |
+| `src/shared/side-panel-workspace.ts` | Shared server/client workspace types (`preview`, `proposal`, `review`, `inbox`, `pack`) |
+| `src/server/side-panel-workspace*.ts` | Server canonicalization, validation, revisioned mutations, persistence, and WS broadcast |
+| `src/app/side-panel-workspace.ts` | Client hydrate/mutate controller, in-memory optimistic state, popout URL helper, localStorage migration |
+| `src/app/panel-workspace.ts` | Tab id helpers and preview version ledger; legacy localStorage only for migration/file fixtures |
+| `src/app/preview-panel.ts` | EventSource SSE subscription, bootstrap GET, explicit preview tab open/update helpers |
 | `src/app/render.ts` | Shared side-panel dispatcher, desktop tab strip, mobile tab bar/slider |
 | `tests/preview-{mount,cookie,content-route,extension,renderer}*`, `tests/e2e/preview-{mount-route,token-cost}.spec.ts`, `tests/e2e/ui/preview-{happy-path,new-tab,archived-snapshot}.spec.ts` | Unit, API E2E, browser E2E coverage |
 
