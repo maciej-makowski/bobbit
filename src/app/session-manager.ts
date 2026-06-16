@@ -1,7 +1,7 @@
 import { ChatPanel } from "../ui/index.js";
 import { removePanelWorkspaceTabs, selectPanelWorkspaceTab, selectProposalWorkspaceTab, startPreviewPolling, stopPreviewPolling } from "./preview-panel.js";
 import { startInboxSubscription, stopInboxSubscription } from "./inbox-panel.js";
-import type { ConnectionStatus } from "./remote-agent.js";
+import type { ConnectionStatus, ProposalSource } from "./remote-agent.js";
 import { RemoteAgent } from "./remote-agent.js";
 import {
 	state,
@@ -18,6 +18,7 @@ import { gatewayFetch, saveDraftToServer, loadDraftFromServer, deleteDraftFromSe
 import { formatProjectAssistantAutoPrompt } from "./project-assistant-autoprompt.js";
 import { reconcilePackRenderersForProject } from "./pack-renderers.js";
 import { reconcilePackPanelsForProject, setSessionSwitcher } from "./pack-panels.js";
+import { hydrateSidePanelWorkspace } from "./side-panel-workspace.js";
 import { reconcilePackEntrypointsForProject } from "./pack-entrypoints.js";
 import { errorDetails } from "./error-helpers.js";
 import { runGitStatusRefresh, abortableSleep } from "./git-status-refresh.js";
@@ -199,6 +200,10 @@ function isAssistantProposalType(type: ProposalType): boolean {
 	return state.assistantType === type || (type === "project" && state.assistantType === "project-scaffolding");
 }
 
+function shouldRevealProposalForSource(source: ProposalSource | undefined): boolean {
+	return source === "tool" || source === "legacy" || source === "seed" || source === "restore";
+}
+
 function revealActiveProposalPanel(type: ProposalType, sessionId: string): void {
 	const isMatchingAssistant = isAssistantProposalType(type);
 	revealProposalPanel(type, { sessionId }, {
@@ -209,6 +214,21 @@ function revealActiveProposalPanel(type: ProposalType, sessionId: string): void 
 		state.assistantHasProposal = true;
 		if (!isDesktop()) state.assistantTab = "preview";
 	}
+}
+
+function openAssistantProposalWorkspaceTab(type: ProposalType, sessionId: string): void {
+	const title = type === "project" ? "Project Proposal"
+		: type === "staff" ? "Staff Proposal"
+		: `${type.charAt(0).toUpperCase()}${type.slice(1)} Proposal`;
+	selectPanelWorkspaceTab({
+		id: proposalPanelTabId(type),
+		kind: "proposal",
+		title,
+		label: title.replace(/ Proposal$/, ""),
+		legacyTab: type as any,
+		source: { type: "proposal", proposalType: type, sessionId },
+		state: {},
+	}, { sessionId, select: true, setAssistantTab: true });
 }
 
 function liveProposalSlotForSession(type: ProposalType, sessionId: string): ProposalSlot | undefined {
@@ -984,8 +1004,12 @@ export function selectSession(sessionId: string, replaceHistory?: boolean): void
 	state.chatPanel = null;
 	state.cwdDropdownOpen = false;
 
-	// Update hash route synchronously
-	setHashRoute("session", sessionId, replaceHistory);
+	// Update hash route synchronously. Preserve an existing standalone
+	// side-panel route for this same session while the connection hydrates it.
+	const currentRoute = getRouteFromHash();
+	if (!(currentRoute.view === "session" && currentRoute.sessionId === sessionId && currentRoute.panelTabId)) {
+		setHashRoute("session", sessionId, replaceHistory);
+	}
 
 	// Update hue rotation synchronously
 	document.documentElement.style.setProperty("--bobbit-hue-rotate", `${sessionHueRotation(sessionId)}deg`);
@@ -1251,6 +1275,8 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 
 		await remote.connect(url, token, sessionId);
 		if (isStale()) { remote.disconnect(); return; }
+		await hydrateSidePanelWorkspace(sessionId);
+		if (isStale()) { remote.disconnect(); return; }
 
 		// ── Fire the transcript snapshot request the INSTANT the WS is
 		// authenticated — before the refreshSessions()/setAgent() awaits below.
@@ -1490,8 +1516,10 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 			// Targeted PR status refresh — bypasses the 60s poll throttle
 			(async () => {
 				try {
-					const res = await gatewayFetch(`/api/goals/${goalId}/pr-status`);
-					if (res.ok) {
+					const res = await gatewayFetch(`/api/goals/${goalId}/pr-status?optional=1`);
+					if (res.status === 204) {
+						state.prStatusCache.delete(goalId);
+					} else if (res.ok) {
 						const data = await res.json();
 						state.prStatusCache.set(goalId, data);
 					} else if (res.status === 404) {
@@ -1655,15 +1683,15 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 
 		// Slice E gap-closure: unified onProposal callback. Runs IN ADDITION to
 		// the legacy onXProposal callbacks above so:
-		//   • `proposal_update` from edit_proposal broadcasts hits the UI.
-		//   • `proposal_update {source: "rehydrate"}` on WS attach restores the panel
-		//     across server restarts.
+		//   • `proposal_update` from edit_proposal broadcasts hits the UI content.
+		//   • `proposal_update {source: "rehydrate"}` on WS attach restores cached
+		//     proposal content without recreating closed workspace tabs.
 		//   • `proposal_cleared` after DELETE clears the in-memory slot.
 		// The legacy callbacks still own the bespoke side-effects (project mode
 		// resolution, goal title summarisation, workflow JSON parse → populateFromProposal,
 		// per-type form-mirror state). The plugin.mergeFields shallow-merge guarantees
 		// the second invocation per propose_* tool-use is idempotent.
-		remote.onProposal = (type, fields, streaming, serverRev?: number) => {
+		remote.onProposal = (type, fields, streaming, serverRev?: number, source?: ProposalSource) => {
 			if (activeSessionId() !== sessionId) return;
 			if (fields === null) {
 				// proposal_cleared event from DELETE / accept
@@ -1773,20 +1801,22 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 				if (typeof gf.workflow === "string" && gf.workflow) setSelectedWorkflowId(gf.workflow);
 			}
 			const isMatchingAssistant = isAssistantProposalType(type);
+			const shouldRevealProposal = shouldRevealProposalForSource(source);
 			if (isFirstEmit) {
-				plugin.onFirstEmit(slot, {
-					isAssistant: isMatchingAssistant,
-					isMobile: !isDesktop(),
-				});
-				if (state.assistantType && !isMatchingAssistant && !isDesktop()) {
-					state.assistantTab = "preview";
+				if (shouldRevealProposal) {
+					plugin.onFirstEmit(slot, {
+						isAssistant: isMatchingAssistant,
+						isMobile: !isDesktop(),
+					});
+					if (state.assistantType && !isMatchingAssistant && !isDesktop()) {
+						state.assistantTab = "preview";
+					}
 				}
-			} else {
-				// Side-panel tab contract: "Agent-driven events may create/update a
-				// tab and make it active." When a proposal is updated (not just
-				// created), re-focus its existing side-pane tab in place. The id
-				// upsert merges into the existing tab row without reordering, so
-				// preview/review tabs keep their visible positions.
+			} else if (shouldRevealProposal) {
+				// Only fresh explicit proposal outputs may create/focus workspace tabs.
+				// Content-only sources (`rehydrate`, ordinary `edit`) still update the
+				// active proposal slot above, so already-open panels refresh naturally
+				// without resurrecting tabs the user closed.
 				revealProposalPanel(type, { sessionId }, {
 					isAssistant: isMatchingAssistant,
 					isMobile: !isDesktop(),
@@ -1842,7 +1872,7 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 				const cb = callbackMap[type];
 				if (cb) cb(liveFields, /* streaming */ false);
 				if (remote.onProposal) {
-					remote.onProposal(type, liveFields, false, liveRev);
+					remote.onProposal(type, liveFields, false, liveRev, "tool");
 				}
 			};
 
@@ -2259,6 +2289,7 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 			} else if (state.assistantType === "staff") {
 				state.assistantTab = "chat";
 				resetStaffProposalPreview(sessionId);
+				if (options?.isStaffAssistant && !isExisting) openAssistantProposalWorkspaceTab("staff", sessionId);
 			} else if (state.assistantType === "project" || state.assistantType === "project-scaffolding") {
 				const restored = await restoreProjectDraft(sessionId);
 				if (isStale()) return;
@@ -2643,6 +2674,7 @@ async function acceptProvisionalProjectProposal(): Promise<void> {
 	invalidateProjectScopeConfig(projectId);
 	delete state.activeProposals.project;
 	state.assistantHasProposal = false;
+	removePanelWorkspaceTabs([proposalPanelTabId("project")], { sessionId: propSessionId, select: false, clearCollapse: false });
 	if (proposal.sessionId) {
 		deleteProjectDraft(proposal.sessionId);
 		// Slice E: drop the on-disk proposal file once accepted.
@@ -2749,6 +2781,9 @@ async function acceptRegisteredProjectProposal(): Promise<void> {
 	state.projectProposalAcceptedBySessionId[propSessionId] = true;
 	delete state.activeProposals.project;
 	state.assistantHasProposal = false;
+	// Apply/Accept is a proposal-specific close path: the server workspace's
+	// absence is authoritative, so accepted saved-state must not reopen the tab.
+	removePanelWorkspaceTabs([proposalPanelTabId("project")], { sessionId: propSessionId, select: false, clearCollapse: false });
 	// Persist the accepted flag in the on-disk draft so it survives reload.
 	saveProjectDraft(propSessionId);
 	// Slice E: drop the on-disk proposal file once accepted.
@@ -2907,7 +2942,7 @@ async function rehydrateProposalsForSession(sessionId: string): Promise<void> {
 		for (const p of body.proposals) {
 			if (p.proposalType === "goal" || p.proposalType === "role" || p.proposalType === "staff"
 				|| p.proposalType === "project" || p.proposalType === "tool") {
-				onProposal(p.proposalType, p.fields, false, p.rev);
+				onProposal(p.proposalType, p.fields, false, p.rev, "rehydrate");
 			}
 		}
 	} catch { /* best-effort */ }
@@ -3057,15 +3092,15 @@ async function refreshPrStatusForSession(sessionId: string): Promise<void> {
 
 	// Build the URL: goal-scoped if available, otherwise session-scoped
 	const prStatusUrl = goalId
-		? `/api/goals/${goalId}/pr-status`
-		: `/api/sessions/${sessionId}/pr-status`;
+		? `/api/goals/${goalId}/pr-status?optional=1`
+		: `/api/sessions/${sessionId}/pr-status?optional=1`;
 
 	const ai = state.chatPanel?.agentInterface;
 	if (!ai) return;
 
 	try {
 		const res = await gatewayFetch(prStatusUrl).catch(() => null);
-		if (!res || !res.ok) {
+		if (!res || res.status === 204 || !res.ok) {
 			if (activeSessionId() === sessionId) {
 				ai.prState = undefined;
 				ai.prUrl = undefined;

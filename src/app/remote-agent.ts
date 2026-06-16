@@ -30,12 +30,22 @@ const PLACEHOLDER_DEFAULT_MODEL: Model<"anthropic-messages"> = {
 };
 
 import { isProposalType, type ProposalType } from "./proposal-registry.js";
+
+export type ProposalSource = "tool" | "legacy" | "edit" | "seed" | "rehydrate" | "restore";
+const SERVER_PROPOSAL_SOURCES = new Set<ProposalSource>(["edit", "seed", "rehydrate", "restore"]);
+
+function normalizeServerProposalSource(source: unknown): ProposalSource {
+	return typeof source === "string" && SERVER_PROPOSAL_SOURCES.has(source as ProposalSource)
+		? source as ProposalSource
+		: "edit";
+}
 import { state, renderApp, setProjectsIfChanged } from "./state.js";
 import { closeReviewWorkspaceTabs, selectReviewWorkspaceTab, selectSensiblePanelWorkspaceTab } from "./preview-panel.js";
 import { clearPersistedReviewDocuments, openMarkdownReviewDocument, removePersistedReviewDocument, restorePersistedReviewDocuments } from "./review-sources.js";
 import { showFaviconBadge } from "./favicon-badge.js";
 import { needsHumanAttentionOnIdleTransition, needsImmediateHumanAttention } from "./notification-policy.js";
 import { scheduleGateStatusRefreshForGoal, refreshSessions, scheduleSessionListRefreshFromPush } from "./api.js";
+import { applySidePanelWorkspaceFromServer, getSidePanelWorkspace, hydrateSidePanelWorkspace } from "./side-panel-workspace.js";
 import { shouldRefreshGateStatusForEvent } from "./gate-status-events.js";
 import { publishClientMessage, publishClientStatus } from "./session-event-bus.js";
 import { registerSessionPoster, unregisterSessionPoster, type SessionPostRequest } from "./session-write-bridge.js";
@@ -506,12 +516,14 @@ export class RemoteAgent {
 		fields: Record<string, unknown> | null,
 		streaming: boolean,
 		rev?: number,
+		source?: ProposalSource,
 	) => void;
 	private _bufferedProposalEvents: Array<{
 		type: ProposalType;
 		fields: Record<string, unknown> | null;
 		streaming: boolean;
 		rev?: number;
+		source?: ProposalSource;
 	}> = [];
 	get onProposal(): typeof this._onProposal {
 		return this._onProposal;
@@ -522,7 +534,7 @@ export class RemoteAgent {
 			const pending = this._bufferedProposalEvents;
 			this._bufferedProposalEvents = [];
 			for (const ev of pending) {
-				try { fn(ev.type, ev.fields, ev.streaming, ev.rev); }
+				try { fn(ev.type, ev.fields, ev.streaming, ev.rev, ev.source); }
 				catch (err) { console.warn("[remote-agent] buffered onProposal replay threw:", err); }
 			}
 		}
@@ -756,6 +768,7 @@ export class RemoteAgent {
 						this._reconnectAttempt = 0;
 						this._setConnectionStatus("connected");
 						resolve();
+						void hydrateSidePanelWorkspace(this._sessionId);
 						// S2: deliver any prompts/steers/retries the user issued while
 						// the socket was reconnecting, before resume/snapshot traffic.
 						this._flushOutbox();
@@ -1627,6 +1640,8 @@ export class RemoteAgent {
 						for (const m of this._state.messages) {
 							this._checkReviewToolResult(m);
 						}
+					} else {
+						closeReviewWorkspaceTabs(undefined, { sessionId: this._sessionId || "", select: false });
 					}
 					restorePersistedReviewDocuments(this._sessionId || "", { select: true });
 					// Re-add compacting placeholder if compaction is still in progress
@@ -1782,6 +1797,10 @@ export class RemoteAgent {
 				this.onQueueUpdate?.(this.getQueue());
 				break;
 
+			case "side_panel_workspace":
+				if ((msg as any).workspace) applySidePanelWorkspaceFromServer((msg as any).workspace, { source: "ws" });
+				break;
+
 			case "goal_setup_complete":
 			case "goal_setup_error":
 				this.onGoalSetupEvent?.();
@@ -1923,11 +1942,12 @@ export class RemoteAgent {
 				const pType = (msg as any).proposalType;
 				const fields = (msg as any).fields;
 				const rev = typeof (msg as any).rev === "number" ? (msg as any).rev as number : undefined;
+				const source = normalizeServerProposalSource((msg as any).source);
 				if (isProposalType(pType) && fields && typeof fields === "object") {
 					if (this._onProposal) {
-						this._onProposal(pType, fields as Record<string, unknown>, false, rev);
+						this._onProposal(pType, fields as Record<string, unknown>, false, rev, source);
 					} else {
-						this._bufferedProposalEvents.push({ type: pType, fields: fields as Record<string, unknown>, streaming: false, rev });
+						this._bufferedProposalEvents.push({ type: pType, fields: fields as Record<string, unknown>, streaming: false, rev, source });
 					}
 				}
 				break;
@@ -2096,7 +2116,7 @@ export class RemoteAgent {
 			// which would leave nothing for mergeFields to preserve if onProposal
 			// ran second.
 			if (this.onProposal && isProposalType(proposalType)) {
-				this.onProposal(proposalType, input, streaming);
+				this.onProposal(proposalType, input, streaming, undefined, "tool");
 			}
 			if (callback) callback(input, streaming);
 
@@ -2203,7 +2223,7 @@ export class RemoteAgent {
 
 				console.warn(`[proposal] Detected legacy XML <${parser.tag}> block — this format is deprecated, use propose_* tools instead`);
 				if (this.onProposal && proposalType) {
-					this.onProposal(proposalType, normalized, false);
+					this.onProposal(proposalType, normalized, false, undefined, "legacy");
 				}
 				if (callback) callback(normalized);
 			}
@@ -2251,6 +2271,16 @@ export class RemoteAgent {
 			try { data = JSON.parse(trimmed); } catch { continue; }
 
 			if (data.action === "review_open" && data.title && data.markdown) {
+				if (this._sessionId) {
+					const title = String(data.title);
+					const hasOpenWorkspaceTab = getSidePanelWorkspace(this._sessionId).tabs.some((tab) => {
+						if (tab.kind !== "review") return false;
+						const source = tab.source as Record<string, unknown> | undefined;
+						const tabTitle = typeof source?.title === "string" ? source.title : tab.title.replace(/^Review:\s*/, "");
+						return tabTitle === title;
+					});
+					if (!hasOpenWorkspaceTab && (!isLive || isReviewSubmitted(this._sessionId))) return;
+				}
 				// If the user already submitted this review, suppress reopening it on
 				// REPLAY paths (snapshot loop / non-live message_end). The submitted
 				// flag is per-session and persisted server-side; without this gate, a

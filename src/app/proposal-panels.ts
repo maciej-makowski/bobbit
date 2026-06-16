@@ -7,12 +7,6 @@
 // shared `renderGoalForm` builder live here. Loaded on first proposal-panel
 // view via `proposal-panels-lazy.ts`.
 //
-// IMPORTANT: this module pulls in render.ts via the three workspace helpers
-// below (`unifiedPanelTabs`, `setUnifiedActiveTab`, `workspaceSessionId`).
-// That's only safe because this module is itself dynamic-imported — render.ts
-// never statically references this file. Don't add a static import from
-// render.ts to here or you'll re-bloat the entry chunk.
-
 import { html, nothing, type TemplateResult } from "lit";
 import { ref, createRef } from "lit/directives/ref.js";
 import { icon } from "@mariozechner/mini-lit";
@@ -71,24 +65,18 @@ import { cwdCombobox } from "./cwd-combobox.js";
 import { ACCESSORY_IDS, getAccessory, statusBobbit } from "./session-colors.js";
 import { reloadStaffList } from "./sidebar.js";
 import {
-	activeSidePanelTabIdForSession,
-	findPanelTab,
 	isHistoricalProposalTab,
 	proposalPanelTabId,
 	proposalRevisionFromPanelTab,
-	setActivePanelTabIdForSession,
 	type PanelWorkspaceTab,
 } from "./panel-workspace.js";
+import { closeSidePanelTab } from "./side-panel-workspace.js";
 import "../ui/components/CommentableMarkdown.js";
 import type {
 	ViewMode as ProjectViewMode,
 	ProposalComponent,
 	ProposalWorkflow,
 } from "./project-proposal-views.js";
-// Workspace helpers that still live in render.ts. Importing them back is safe
-// because proposal-panels.ts is itself only dynamic-imported from render.ts —
-// the static graph never resolves this edge.
-import { unifiedPanelTabs, setUnifiedActiveTab, workspaceSessionId } from "./render.js";
 // Triggers editor (lazy). Only the `TriggerDef` type is needed here; the
 // runtime module is dynamic-imported below.
 import type { TriggerDef as _TriggerDef } from "./render-triggers.js";
@@ -406,14 +394,12 @@ function clearProposalReviewState(sessionId: string | null | undefined, type: Pr
 	}
 }
 
-function clampUnifiedTabsAfterProposalRemoved(type: ProposalType): void {
-	const tabs = unifiedPanelTabs();
-	const removedId = proposalPanelTabId(type);
-	const activeId = activeSidePanelTabIdForSession(state, workspaceSessionId());
-	if (activeId === removedId || !findPanelTab(tabs, activeId)) {
-		const fallback = tabs[0];
-		if (fallback) setUnifiedActiveTab(fallback);
-		else setActivePanelTabIdForSession(state, workspaceSessionId(), "");
+async function closeCurrentProposalPanel(type: ProposalType, sessionId: string | null | undefined): Promise<void> {
+	if (!sessionId) return;
+	try {
+		await closeSidePanelTab(proposalPanelTabId(type), { sessionId });
+	} catch (err) {
+		console.warn("[proposal] failed to close workspace tab", { type, sessionId, err });
 	}
 }
 
@@ -430,7 +416,7 @@ function dismissTypedProposal(type: ProposalType): void {
 	if (sessionId && slot?.fields) markProposalDismissed(sessionId, type, slot.fields);
 	delete state.activeProposals[type];
 	recomputeAssistantHasProposal();
-	clampUnifiedTabsAfterProposalRemoved(type);
+	void closeCurrentProposalPanel(type, sessionId);
 	if (sessionId) void deleteProposalFile(sessionId, type);
 	renderApp();
 }
@@ -722,9 +708,9 @@ function renderSubgoalsToggle(config: GoalFormConfig): TemplateResult | string {
 	`;
 }
 
-/** Whether the dedicated Sub-goals tab should be shown for this proposal. */
+/** Whether the dedicated Sub-goals tab should be shown: it tracks only the system Subgoals (Experimental) preference. */
 function showSubgoalsTab(config: GoalFormConfig): boolean {
-	return !!(config.subgoalsEnabled || config.parentGoalId);
+	return !!config.subgoalsEnabled;
 }
 
 /** Walk parentGoalId links up to the top-level (root) goal of the tree. */
@@ -915,7 +901,7 @@ function renderGoalForm(config: GoalFormConfig) {
 					</div>
 				` : ""}
 			</div>
-			${!tabbed && (config.subgoalsEnabled || config.parentGoalId) ? renderParentPickerRow(config, lblCls) : ""}
+			${!tabbed && config.subgoalsEnabled ? renderParentPickerRow(config, lblCls) : ""}
 			${!tabbed ? renderSubgoalBreadcrumb(config) : ""}
 			${linkedProject ? html`
 				<div class="flex items-center gap-2 text-[11px] text-muted-foreground min-w-0">
@@ -1428,6 +1414,8 @@ function goalPreviewPanel() {
 			return;
 		}
 
+		const closeProposalTab = closeCurrentProposalPanel("goal", sessionId);
+
 		// --- Success path: now tear down the assistant. ---
 		if (state.remoteAgent) {
 			state.remoteAgent.disconnect();
@@ -1438,6 +1426,7 @@ function goalPreviewPanel() {
 		if (sessionId) clearProposalAnnotations(sessionId, "goal");
 		resetProposalAnnCount("goal");
 		delete state.activeProposals.goal;
+		recomputeAssistantHasProposal();
 		state.previewProjectId = "";
 		_selectedWorkflowId = "";
 		_goalSandboxed = false;
@@ -1449,7 +1438,9 @@ function goalPreviewPanel() {
 		localStorage.removeItem("gateway.sessionId");
 		state.appView = "authenticated";
 
-		// Slice E: drop the on-disk proposal file once accepted.
+		// Slice E: close the workspace tab before deleting/navigating the source
+		// assistant session, then drop the on-disk proposal file once accepted.
+		await closeProposalTab;
 		if (sessionId) void deleteProposalFile(sessionId, "goal");
 
 		// If this is a re-attempt, archive the old goal and link the new one
@@ -1601,7 +1592,7 @@ function rolePreviewPanel() {
 		clearProposalReviewState(proposalSessionId, "role");
 		delete state.activeProposals.role;
 		recomputeAssistantHasProposal();
-		clampUnifiedTabsAfterProposalRemoved("role");
+		void closeCurrentProposalPanel("role", proposalSessionId);
 		if (proposalSessionId) {
 			deleteRoleDraft(proposalSessionId);
 			void deleteProposalFile(proposalSessionId, "role");
@@ -2070,7 +2061,7 @@ function staffPreviewPanel() {
 			clearProposalReviewState(proposalSessionId, "staff");
 			delete state.activeProposals.staff;
 			recomputeAssistantHasProposal();
-			clampUnifiedTabsAfterProposalRemoved("staff");
+			void closeCurrentProposalPanel("staff", proposalSessionId);
 			if (proposalSessionId) void deleteProposalFile(proposalSessionId, "staff");
 
 			if (isStaffAssistant) {
@@ -2986,8 +2977,13 @@ function goalProposalPanel() {
 			}
 			if (!goal) return;
 
+			const proposalSessionId = state.activeProposals.goal?.sessionId ?? activeSessionId();
+
 			// --- Success: clear the proposal and navigate. ---
+			if (proposalSessionId) clearProposalAnnotations(proposalSessionId, "goal");
+			resetProposalAnnCount("goal");
 			delete state.activeProposals.goal;
+			recomputeAssistantHasProposal();
 			_proposalEnabledOptionalSteps = [];
 			_proposalInitializedFrom = null;
 			_proposalSandboxed = false;
@@ -2998,6 +2994,8 @@ function goalProposalPanel() {
 			_proposalDivergencePolicy = null;
 			_proposalMaxConcurrentChildren = null;
 			resetProposalTabsState();
+			await closeCurrentProposalPanel("goal", proposalSessionId);
+			if (proposalSessionId) void deleteProposalFile(proposalSessionId, "goal");
 			setHashRoute("goal-dashboard", goal.id, true);
 		} finally {
 			_proposalSaving = false;
@@ -3013,13 +3011,14 @@ function goalProposalPanel() {
 	};
 
 	const handleDismiss = () => {
+		const proposalSessionId = state.activeProposals.goal?.sessionId ?? activeSessionId();
 		const dismissed = state.activeProposals.goal?.fields as undefined | { title: string; spec: string; cwd?: string; workflow?: string; options?: string };
 		// Suppress the in-flight streaming block so later deltas don't re-open
 		// the just-dismissed goal proposal (see dismissStreamingProposal).
 		if (isProposalStreaming("goal_proposal")) {
 			state.remoteAgent?.dismissStreamingProposal("goal_proposal");
 		}
-		const sidEarly = activeSessionId();
+		const sidEarly = proposalSessionId;
 		if (sidEarly) clearProposalAnnotations(sidEarly, "goal");
 		resetProposalAnnCount("goal");
 		delete state.activeProposals.goal;
@@ -3033,12 +3032,13 @@ function goalProposalPanel() {
 		_proposalMaxConcurrentChildren = null;
 		resetProposalTabsState();
 		// Persist dismiss so it survives reconnect
-		const sid = activeSessionId();
+		const sid = proposalSessionId;
 		if (sid && dismissed) {
 			markProposalDismissed(sid, dismissed);
 			void deleteProposalFile(sid, "goal");
 		}
 		recomputeAssistantHasProposal();
+		void closeCurrentProposalPanel("goal", sid);
 		// If preview tab still available, switch to it; otherwise back to chat
 		if (state.isPreviewSession) {
 			state.previewPanelActiveTab = "preview";
