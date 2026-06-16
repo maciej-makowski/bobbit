@@ -1042,6 +1042,14 @@ export function proxyRequest(
 // ── Public API ─────────────────────────────────────────────────────
 
 /**
+/**
+ * Get the currently configured aigw URL (if any).
+ */
+export function getAigwUrl(prefs: PreferencesStore): string | undefined {
+	return prefs.get("aigw.url") as string | undefined;
+}
+
+/**
  * Fetch the model list from a gateway endpoint and return structured model info.
  * Hits GET {baseUrl}/v1/models (or {baseUrl}/models if baseUrl already ends with /v1).
  * Returns raw ids (no prefix stripping) — the type-driven writers/registry decide

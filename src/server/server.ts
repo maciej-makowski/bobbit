@@ -56,6 +56,7 @@ import { loadPackContributions } from "./agent/pack-contributions.js";
 import { isPackPathWithinRoot } from "./extension-host/path-guard.js";
 import { buildGateStatusSummary } from "./gate-status-summary.js";
 import { buildGateVerificationSnapshot, UnknownVerificationStepError } from "./gate-verification-snapshot.js";
+import { handleSidePanelWorkspaceRoute, openSidePanelWorkspaceTab } from "./side-panel-workspace-routes.js";
 import {
 	TextSelectionError,
 	selectText,
@@ -159,6 +160,15 @@ async function detectedRefExistsInAllComponents(
 	} catch {
 		return false;
 	}
+}
+
+async function resolveBaseRefDetectRepoPath(rootPath: string, comps: Array<{ repo: string }>): Promise<string | null> {
+	const isMultiRepo = comps.some(c => c.repo !== ".");
+	const primaryRepoPath = isMultiRepo
+		? path.join(rootPath, comps.find(c => c.repo !== ".")?.repo ?? ".")
+		: rootPath;
+	if (!(await isGitRepo(primaryRepoPath).catch(() => false))) return null;
+	return isMultiRepo ? primaryRepoPath : await getRepoRoot(primaryRepoPath);
 }
 
 function normalizeApiRouteLabel(method: string | undefined, pathname: string): string {
@@ -2566,6 +2576,10 @@ async function handleApiRoute(
 		res.writeHead(status, { "Content-Type": "application/json" });
 		res.end(JSON.stringify(data));
 	};
+	const noContent = () => {
+		res.writeHead(204);
+		res.end();
+	};
 	const jsonError = (status: number, err: unknown, extra?: Record<string, unknown>) => {
 		const e = err instanceof Error ? err : new Error(String(err));
 		// Log stack trace server-side only; do not send it to clients to avoid
@@ -2581,6 +2595,13 @@ async function handleApiRoute(
 		json({ error: "Subgoals are disabled", code: "SUBGOALS_DISABLED" }, 403);
 		return false;
 	}
+
+	if (await handleSidePanelWorkspaceRoute(url, req, res, {
+		sessionManager,
+		readBody,
+		broadcastToSession: _broadcastToSession,
+		packContributionRegistry,
+	})) return;
 
 	if (await handlePrWalkthroughApiRoute(url, req, res, {
 		defaultCwd: config.defaultCwd,
@@ -3575,10 +3596,12 @@ async function handleApiRoute(
 		try {
 			const cfg = ctx.projectConfigStore;
 			const comps = cfg.getComponents();
-			const isMultiRepo = comps.some(c => c.repo !== ".");
-			const primaryRepoPath = isMultiRepo
-				? path.join(rootPath, comps.find(c => c.repo !== ".")?.repo ?? ".")
-				: await getRepoRoot(rootPath);
+			const primaryRepoPath = await resolveBaseRefDetectRepoPath(rootPath, comps);
+			if (!primaryRepoPath) {
+				const parsed = parseBaseRef(cfg.get("base_ref") || "");
+				json({ resolved: parsed.ref || "", detected: null });
+				return;
+			}
 			const resolved = (await resolveBaseRef(primaryRepoPath, cfg.get("base_ref"))).ref;
 			// `detected` must be SAVEABLE — null it out unless it passes the same
 			// checks add-time pinning applies (grammar + cross-component existence).
@@ -5601,7 +5624,13 @@ async function handleApiRoute(
 		const packs = packContributionRegistry.list(contribProjectId).map((p) => ({
 			packId: p.packId,
 			packName: p.packName,
-			panels: p.panels.map((panel) => (panel.title !== undefined ? { id: panel.id, title: panel.title } : { id: panel.id })),
+			panels: p.panels.map((panel) => {
+				const out: Record<string, unknown> = { id: panel.id };
+				if (panel.title !== undefined) out.title = panel.title;
+				if (panel.instanceMode !== undefined) out.instanceMode = panel.instanceMode;
+				if (panel.instanceParam !== undefined) out.instanceParam = panel.instanceParam;
+				return out;
+			}),
 			entrypoints: p.entrypoints.map((e) => {
 				const out: Record<string, unknown> = { id: e.id, kind: e.kind, listName: e.listName };
 				if (e.label !== undefined) out.label = e.label;
@@ -8309,7 +8338,12 @@ async function handleApiRoute(
 		).catch(err => console.error("[verification] Gate signal error:", err));
 
 		const verifySteps = (gateDef.verify || []).map((s: any) => ({ name: s.name, type: s.type }));
-		json({ signal: { id: signal.id, gateId, goalId, status: "running", steps: verifySteps } }, 201);
+		const signalResponse = { id: signal.id, gateId, goalId, status: "running", steps: verifySteps };
+		const response: { signal: typeof signalResponse; agentReminder?: string } = { signal: signalResponse };
+		if (verificationHarness.getActiveVerification(signal.id)?.overallStatus === "running") {
+			response.agentReminder = "Gate signal accepted. Verification is running asynchronously. Do not poll with `gate_status` or `gate_inspect`. Go idle now and wait for the server to deliver verification results or further instructions.";
+		}
+		json(response, 201);
 		return;
 	}
 
@@ -8885,8 +8919,9 @@ async function handleApiRoute(
 		if (!fs.existsSync(cwd)) { json({ error: "Working directory not found" }, 404); return; }
 		// Pass process.cwd() as fallback — if the goal's worktree has a broken git link
 		// (e.g. pruned worktree), gh can still query by branch name from the main repo.
+		const optional = url.searchParams.get("optional") === "1";
 		const pr = await getCachedPrStatus(cwd, goal.branch, process.cwd());
-		if (pr) { prStatusStore.set(goalId, pr); json(pr); } else { json({ error: "No PR found" }, 404); }
+		if (pr) { prStatusStore.set(goalId, pr); json(pr); } else if (optional) { noContent(); } else { json({ error: "No PR found" }, 404); }
 		return;
 	}
 
@@ -10288,14 +10323,27 @@ async function handleApiRoute(
 				json({ ok: false, code: "INVALID_BODY", message: "args must be an object" }, 400);
 				return;
 			}
-			// Auto-inject parentGoalId for team-lead sessions proposing a goal
+			// Auto-inject parentGoalId for team-lead sessions proposing a goal,
+			// but only when the current goal is actually allowed to spawn a child.
+			// If subgoals are disabled globally or for this parent, an omitted
+			// parentGoalId must remain omitted so accepting the proposal creates a
+			// top-level goal instead of a hidden invalid child proposal.
 			let enrichedArgs = args as Record<string, unknown>;
 			if (proposalType === "goal") {
 				const sess = sessionManager.getSession(sessionId);
 				if (sess?.role === "team-lead" && sess.teamGoalId) {
 					const existingParent = enrichedArgs.parentGoalId;
 					if (!existingParent || (typeof existingParent === "string" && existingParent.trim() === "")) {
-						enrichedArgs = { ...enrichedArgs, parentGoalId: sess.teamGoalId };
+						const parent = getGoalAcrossProjects(sess.teamGoalId);
+						const prefs = readSubgoalNestingPrefs((k) => preferencesStore.get(k));
+						const canSpawnImplicitChild = !!parent && checkCanSpawnChild(
+							parent,
+							prefs,
+							(id) => getGoalAcrossProjects(id),
+						).ok;
+						if (canSpawnImplicitChild) {
+							enrichedArgs = { ...enrichedArgs, parentGoalId: sess.teamGoalId };
+						}
 					}
 				}
 			}
@@ -10323,6 +10371,22 @@ async function handleApiRoute(
 					json(parsed, 400);
 					return;
 				}
+				const proposalLabel = proposalType.charAt(0).toUpperCase() + proposalType.slice(1);
+				await openSidePanelWorkspaceTab({
+					sessionManager,
+					readBody,
+					broadcastToSession: _broadcastToSession,
+					packContributionRegistry,
+				}, sessionId, {
+					id: `proposal:${proposalType}`,
+					kind: "proposal",
+					title: `${proposalLabel} Proposal`,
+					label: proposalLabel,
+					source: { type: "proposal", sessionId, proposalType },
+					updatedAt: Date.now(),
+				}, { focus: true, placeAfterActive: true }).catch((err) => {
+					console.warn(`[proposal/seed] failed to open side-panel workspace tab for ${sessionId}/${proposalType}:`, err);
+				});
 				if (_broadcastToSession) {
 					_broadcastToSession(sessionId, {
 						type: "proposal_update",
@@ -10360,6 +10424,22 @@ async function handleApiRoute(
 					json(result, status);
 					return;
 				}
+				const proposalLabel = proposalType.charAt(0).toUpperCase() + proposalType.slice(1);
+				await openSidePanelWorkspaceTab({
+					sessionManager,
+					readBody,
+					broadcastToSession: _broadcastToSession,
+					packContributionRegistry,
+				}, sessionId, {
+					id: `proposal:${proposalType}`,
+					kind: "proposal",
+					title: `${proposalLabel} Proposal`,
+					label: proposalLabel,
+					source: { type: "proposal", sessionId, proposalType },
+					updatedAt: Date.now(),
+				}, { focus: true, placeAfterActive: true }).catch((err) => {
+					console.warn(`[proposal/restore] failed to open side-panel workspace tab for ${sessionId}/${proposalType}:`, err);
+				});
 				if (_broadcastToSession) {
 					_broadcastToSession(sessionId, {
 						type: "proposal_update",
@@ -11010,12 +11090,13 @@ async function handleApiRoute(
 		}
 		// PR status uses `gh` CLI which needs host filesystem — use worktreePath for sandboxed sessions
 		const prCwd = cid ? (session.worktreePath || process.cwd()) : cwd;
+		const optional = url.searchParams.get("optional") === "1";
 		const pr = await getCachedPrStatus(prCwd, sessionBranch, process.cwd());
 		if (pr) {
 			const goalId = session.goalId;
 			if (goalId) prStatusStore.set(goalId, pr);
 			json(pr);
-		} else { json({ error: "No PR found" }, 404); }
+		} else if (optional) { noContent(); } else { json({ error: "No PR found" }, 404); }
 		return;
 	}
 
@@ -11588,6 +11669,57 @@ async function handleApiRoute(
 	// ── Preview mount endpoints ──────────────────────────────────────
 	const VALID_SESSION_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 
+	const previewEntryLabelForWorkspace = (entry: string | undefined | null): string => {
+		const clean = (entry || "inline.html").split(/[?#]/, 1)[0]?.replace(/\\/g, "/").replace(/\/+$/, "") ?? "inline.html";
+		return clean.split("/").filter(Boolean).pop() || clean || "inline.html";
+	};
+
+	const openPreviewMountWorkspaceTab = async (sessionId: string, result: {
+		entry?: string;
+		mtime?: number;
+		url?: string;
+		path?: string;
+		contentHash?: string;
+		artifactId?: string;
+	}): Promise<void> => {
+		const entry = previewEntryLabelForWorkspace(result.entry);
+		try {
+			await openSidePanelWorkspaceTab({
+				sessionManager,
+				readBody,
+				broadcastToSession: _broadcastToSession,
+				packContributionRegistry,
+			}, sessionId, {
+				id: `preview:entry:${encodeURIComponent(entry)}`,
+				kind: "preview",
+				title: entry,
+				label: entry,
+				source: {
+					type: "preview",
+					sessionId,
+					entry,
+					live: true,
+					...(typeof result.contentHash === "string" && result.contentHash ? { contentHash: result.contentHash } : {}),
+					...(typeof result.path === "string" && result.path ? { path: result.path } : {}),
+					...(typeof result.url === "string" && result.url ? { url: result.url } : {}),
+					...(typeof result.artifactId === "string" && result.artifactId ? { artifactId: result.artifactId } : {}),
+				},
+				state: {
+					entry,
+					origin: "preview-mount",
+					...(typeof result.mtime === "number" ? { mtime: result.mtime } : {}),
+					...(typeof result.url === "string" && result.url ? { url: result.url } : {}),
+					...(typeof result.path === "string" && result.path ? { path: result.path } : {}),
+					...(typeof result.contentHash === "string" && result.contentHash ? { contentHash: result.contentHash } : {}),
+					...(typeof result.artifactId === "string" && result.artifactId ? { artifactId: result.artifactId } : {}),
+				},
+				updatedAt: Date.now(),
+			}, { focus: true, placeAfterActive: true });
+		} catch (err) {
+			console.warn(`[preview/mount] failed to open side-panel workspace tab for ${sessionId}:`, err);
+		}
+	};
+
 	// POST /api/preview/mount?sessionId=<sid> — v3 per-session preview mount.
 	// Accepts {html} (with optional {entry}) or {file: absolutePath}. Returns
 	// {url, path, entry, mtime, contentHash}. See docs/design/embedded-html-preview-rewrite.md §6.
@@ -11602,6 +11734,10 @@ async function handleApiRoute(
 			return;
 		}
 		const body = await readBody(req).catch(() => ({}));
+		const shouldOpenWorkspaceTab = body?.workspaceTab !== false
+			&& body?.openWorkspaceTab !== false
+			&& body?.internalRestore !== true
+			&& url.searchParams.get("workspaceTab") !== "false";
 		const hasArtifact = typeof body?.artifactId === "string" && body.artifactId.length > 0;
 		const hasHtml = typeof body?.html === "string";
 		const hasFile = typeof body?.file === "string" && body.file.length > 0;
@@ -11623,6 +11759,7 @@ async function handleApiRoute(
 			let result: previewMount.MountResult | previewMount.MountFileResult | previewArtifacts.PreviewArtifactMountResult;
 			if (hasArtifact) {
 				const restored = previewArtifacts.restorePreviewArtifact(sessionId, body.artifactId as string);
+				if (shouldOpenWorkspaceTab) await openPreviewMountWorkspaceTab(sessionId, restored);
 				broadcastPreviewChanged(sessionId, {
 					entry: restored.entry,
 					mtime: restored.mtime,
@@ -11725,6 +11862,7 @@ async function handleApiRoute(
 			}
 			const artifact = previewArtifacts.persistPreviewArtifact(sessionId, result);
 			const resultWithArtifact = { ...result, artifactId: artifact.artifactId };
+			if (shouldOpenWorkspaceTab) await openPreviewMountWorkspaceTab(sessionId, resultWithArtifact);
 			broadcastPreviewChanged(sessionId, {
 				entry: result.entry,
 				mtime: result.mtime,
@@ -12109,6 +12247,7 @@ async function handleApiRoute(
 			// Check if session exists at all
 			const session = sessionManager.getSession(id);
 			if (!session) { json({ error: "Session not found" }, 404); return; }
+			if (url.searchParams.get("optional") === "1") { noContent(); return; }
 			json({ error: "Draft not found" }, 404);
 			return;
 		}

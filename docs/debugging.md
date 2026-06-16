@@ -112,6 +112,14 @@ The pill strip above the composer (`AgentInterface._renderPillStrip`, `_measureP
 - **Invariant**: every timer that writes `_blobState` must be stored in a field, cleared on any transition back to `active`/`entering`, and its callback must re-check `this.isStreaming` and the expected source state before writing.
 - **Pinning test**: `tests/streaming-blob-state.spec.ts` — drives `isStreaming` false→true within the exit window and asserts the blob ends up `active`, not `idle`. Must fail on pre-fix master.
 
+## Assistant reply generated + persisted but never reaches an attached client after the session hibernated/woke
+
+- **Symptom**: a session goes idle/hibernated (chat blob shows the sleep `z` marker), the user sends a follow-up, the server **runs the turn and persists the assistant reply to the agent `.jsonl`** (`lastTurnErrored:false`, transcript grows), but the already-attached browser tab never renders the reply — even after reload — and the session re-hibernates. The user cannot tell "ignored" from "answered but not delivered".
+- **Root cause (doc-04 F2e — dormant-revive split-brain)**: `addClient()`'s terminated-session branch used to call `restoreSession()` with no per-session mutex. The dormant entry stayed in the map for the whole restore window, so a second attach/revive — or a follow-up prompt — could start *another* full restore. Each `restoreSession()` builds a fresh `SessionInfo` with empty `clients` and a fresh `EventBuffer`, then replaces the map entry at the end. Client A ends up attached to the loser `SessionInfo`; the running bridge and `enqueuePrompt()`/`emitSessionEvent()` only ever touch the canonical (map) object, so client A's socket never receives the assistant `message_end`. The adjacent F7 leg: a prompt sent during the revive window queued on the stale object and was never drained. Full analysis: [docs/design/comms-stack/missing-live-messages-rootcause.md](design/comms-stack/missing-live-messages-rootcause.md).
+- **Fix (CS-R2 subset — restore coordinator)**: all restore/respawn entry points now coalesce through a per-session coordinator so at most one restore is ever in flight, and only the current-generation canonical `SessionInfo` may broadcast/dispatch/mutate the queue. Key symbols in `src/server/agent/session-manager.ts`: `_restoreCoordinators` + `lifecycleGeneration` (the mutex + monotonic generation); `_coalesceRestore`/`_restoreSessionCoalesced` (join-or-start); `_fenceReplacedSession` (neutralises the replaced object — terminated, clients cleared, auto-retry cancelled, stale generation stamped); `_sessionWriterIsCurrent` (the no-op guard that `drainQueue`/`recoverPromptDispatch`/the auto-retry timer check); the `enqueuePrompt` revive-window join (a dormant/fenced/restore-in-flight prompt joins the coalesced restore and dispatches against the canonical object); and the single post-restore drain in `_restoreSessionCoalesced`. Contract: [docs/design/comms-stack/missing-live-messages-rootcause.md#implemented-fix--restore-coordinator-contract](design/comms-stack/missing-live-messages-rootcause.md#implemented-fix--restore-coordinator-contract).
+- **If seen again**: confirm every restore-like caller routes through `_coalesceRestore`/`_restoreSessionCoalesced` (a stray direct `restoreSession()`/`_respawnAgentInPlace()` call re-opens the split-brain window), and confirm the four old-object writers still gate on `_sessionWriterIsCurrent` / the captured `lifecycleGeneration`. A client attached to a `lifecycleFenced` object is the tell.
+- **Pinning tests**: `tests/missing-live-messages-repro.test.ts` (real `SessionManager`: concurrent dormant `addClient` revives join one restore and every attached client gets the post-revive frame; stale-generation writers no-op without bumping status or dispatching), `tests/e2e/ui/dormant-revive-live-reply.spec.ts` (browser: attach → hibernate → send → reply renders live with no reload).
+
 ## Streaming dedup / reorder
 
 - **Symptoms**: during live streaming (not reload-replay), assistant or toolResult messages appear twice, or parallel tool results appear in the wrong order. Most often observed right after a mid-turn WS reconnect (dev-server restart, tab sleep/resume, flaky network) or during rapid parallel tool-call bursts.
@@ -332,27 +340,21 @@ See [docs/archived-proposal-reopen.md](archived-proposal-reopen.md) for the full
 - Regression test: [`tests/e2e/ui/goal-empty-workflows-banner.spec.ts`](../tests/e2e/ui/goal-empty-workflows-banner.spec.ts).
 - Full convention: [docs/goals-workflows-tasks.md — Goal creation in a zero-workflow project](goals-workflows-tasks.md#goal-creation-in-a-zero-workflow-project).
 
-## Goal proposal dismissed but reappears
+## Closed proposal tab reappears after navigation / reload / reconnect
 
-- Proposals now use `propose_*` tool calls (e.g. `propose_goal`), which persist in message history as tool result blocks. Each completed proposal block includes an "Open proposal" button for re-access — proposals are no longer lost on reconnect or cache eviction.
-- localStorage key: `bobbit-goal-proposal-dismissed-<sessionId>` stores djb2 hash of `title + "\n" + spec`
-- Check: (1) key exists for session, (2) hash matches, (3) session is not goal-assistant type (those use IndexedDB)
-- Cleanup: `clearDismissedProposal()` in `terminateSession()`
-- Legacy XML proposal parsing (`proposal-parsers.ts`) still works as a deprecated fallback — check console for `[proposal] Detected legacy XML proposal block` warnings
+**Symptom:** A current proposal tab (`goal`, `project`, `role`, `tool`, or `staff`) is closed by the tab X, Dismiss, Create/Accept, or registered-project Apply Changes. After navigating away/back, reloading, reconnecting, or rehydrating, the same proposal tab reappears without the user clicking Open Proposal, Resubmit Proposal, or another explicit reopen action.
 
-## Dismissed proposal restored on reload
+**First check the server workspace.** Query `GET /api/sessions/:id/side-panel-workspace`. A closed proposal must be absent from `tabs`; it is not enough for the client to hide it locally. If `proposal:<type>` is still present after close, the close path failed to commit the workspace delete. Inspect the tab close handler plus the proposal-specific close path that was used (`Dismiss`, accept/save, or registered-project apply).
 
-**Symptom:** User dismisses a goal/role/project proposal panel. Reload the page (or trigger a WS reconnect/rehydrate) without any further agent activity. The panel reappears with the same content. The dismissal fingerprint check (`isProposalDismissedTyped`) works for fresh `proposal_update` events but is bypassed when the slot is rehydrated from the persisted server-side draft.
+**If the workspace is correct but the tab renders anyway**, the UI is deriving tabs from content/cache state. Rendered side-panel tabs must come from the server workspace, not from `state.activeProposals`, draft files, legacy `previewPanelTab` mirrors, localStorage, or transcript rescans. `state.activeProposals[type]` is content only.
 
-**Root cause:** The draft `restore` callbacks in `src/app/session-manager.ts` (`goalDraft`, `roleDraft`, `projectDraft`) used to unconditionally write `state.activeProposals.<type> = { fields: draft.active<Type>Proposal, ... }` whenever the draft contained a serialized proposal. The dismissal fingerprint stored in localStorage by `markProposalDismissed` was never consulted at restore time, so the slot was rebuilt and the panel re-opened. Dismiss only deletes the in-memory slot — it intentionally does NOT delete the on-disk draft (see below) — which made the persisted draft a silent re-open path on every reload.
+**If rehydrate resurrects it**, the proposal source gate is wrong. `proposal_update {source:"rehydrate"}` and `GET /api/sessions/:id/proposals` hydrate content slots only. They may refresh an already-open tab, but must not create or focus `proposal:<type>`.
 
-**Fix location:** `src/app/session-manager.ts` — each draft's `restore` callback now calls `isProposalDismissedTyped(sessionId, type, fields)` before populating `state.activeProposals.<type>`. When the fingerprint matches, the slot is left undefined and the proposal-mirror preview fields (`previewTitle`, `previewSpec`, etc.) are zeroed so the form doesn't flash dismissed content. The same gate is applied in three places: `goalDraft.restore`, `roleDraft.restore`, `projectDraft.restore`. First-emit dismissal short-circuits were also added to the legacy `onGoalProposal` / `onRoleProposal` callbacks fired during the post-attach message rescan, so the rescan can't re-fill the form fields after restore correctly zeroed them.
+**If `edit_proposal` resurrects it**, treat it the same way: `/proposal/:type/edit` is content-only. It writes the draft, bumps the content rev, and broadcasts `source:"edit"`; it must not open the workspace tab.
 
-**Why we don't delete the draft on dismiss:** The draft is more than just the proposal — it carries the form-mirror state (edited flags, `previewTitle`, in-progress edits) and is the rehydration source if the agent later calls `edit_proposal` or the user clicks "Open proposal" on a tool card. Deleting on dismiss would lose that work. Gating at the restore path keeps the draft intact while honouring the dismissal until content actually changes (fingerprint mismatch) or the user explicitly re-opens the panel.
+**Expected reopen paths:** fresh `propose_*` output (`seed`), explicit snapshot `restore`, legacy live proposal discovery, Open Proposal / Resubmit Proposal renderers, and historical revision open buttons may create or focus proposal tabs. Those are user- or tool-explicit opens, not cache-derived rehydrates.
 
-**Affected proposal types:** Only `goal`, `role`, and `project` have `createDraftManager` / restore paths. `staff`, `tool`, and `workflow` have no draft persistence — their slots are transient and cleared unconditionally on session attach, so they were never affected.
-
-**Regression test:** `tests/e2e/ui/goal-proposal-dismiss-reload.spec.ts` (browser E2E) — emits a `propose_goal`, dismisses the panel, reloads, asserts panel stays closed, then emits a fresh `propose_goal` with different content and asserts the panel reopens.
+See [docs/side-panel-workspace.md — Proposal lifecycle](side-panel-workspace.md#proposal-lifecycle) and [docs/internals.md — Panel routing and tabs](internals.md#panel-routing-and-tabs).
 
 ## Re-attempt project binding
 
@@ -810,7 +812,8 @@ Lesson for extension authors: never read tool params from the first `execute()` 
 ## Phased verification
 
 - Steps are grouped by `phase` (integer, default 0) and phases execute sequentially
-- Within each phase, steps run in parallel
+- Within each phase, command steps serialize; non-command steps still run in parallel
+- Component-linked `command: unit` steps default to a 1200s timeout when `timeout` is omitted; other command steps default to 300s
 - If any step in a phase fails, remaining phases are skipped (status: `"skipped"`)
 - Skipped steps carry `skipped: true` on `GateSignalStep`, persisted in `gates.json` — this lets the UI show the correct dash icon after reload (without it, skipped steps would appear as passed or failed based on the `passed` field alone)
 - `gate_verification_phase_started` WebSocket event fires before each phase

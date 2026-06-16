@@ -6,7 +6,7 @@ import { customElement, property, state } from "lit/decorators.js";
 import { createRef, ref } from "lit/directives/ref.js";
 import { live } from "lit/directives/live.js";
 import { GripVertical, Loader2, Mic, MicOff, Paperclip, Pencil, Send, Square, Zap, X } from "lucide";
-import { type Attachment, loadAttachment } from "../utils/attachment-utils.js";
+import type { Attachment } from "../utils/attachment-utils.js";
 import { i18n } from "../utils/i18n.js";
 import { getAppStorage } from "../storage/app-storage.js";
 import { gatewayFetch } from "../../app/api.js";
@@ -15,14 +15,19 @@ import "./AttachmentTile.js";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 
 /** Slash skill metadata from the server */
+async function loadAttachmentLazy(source: string | File | Blob | ArrayBuffer, fileName?: string): Promise<Attachment> {
+	const mod = await import("../utils/attachment-utils.js");
+	return mod.loadAttachment(source, fileName);
+}
+
 interface SlashSkillInfo {
 	name: string;
 	description: string;
 	argumentHint?: string;
 	source: "project" | "personal" | "legacy" | "built-in" | "pack";
 	/** Slice C1 — set when this slash entry is a pack `composer-slash` ENTRYPOINT.
-	 *  Selecting it RUNS the launcher (openPanel/navigate) instead of inserting text
-	 *  (the launch is the user gesture — no auto-invoke on mount). */
+	 *  Selecting it only inserts the completed command; send-time dispatch runs the
+	 *  launcher once the user has supplied any required arguments. */
 	entrypointId?: string;
 }
 
@@ -234,9 +239,13 @@ export class MessageEditor extends LitElement {
 			}
 			this._slashTokenStart = cursorPos - match[2].length - 1; // position of "/"
 			const query = match[2].toLowerCase();
+			// Pack entrypoints reconcile asynchronously after session/project changes.
+			// Re-merge them at filter time so the slash menu never shows stale launcher ids
+			// (or misses newly-registered launchers) because the base skill list loaded early.
+			const slashSkills = this._withPackEntrypoints(this._slashSkills.filter((s) => s.source !== "pack"));
 			this._slashFilteredSkills = query
-				? this._slashSkills.filter((s) => s.name.toLowerCase().includes(query))
-				: this._slashSkills;
+				? slashSkills.filter((s) => s.name.toLowerCase().includes(query))
+				: slashSkills;
 			this._slashMenuOpen = this._slashFilteredSkills.length > 0;
 			this._slashSelectedIndex = 0;
 		} else {
@@ -246,9 +255,10 @@ export class MessageEditor extends LitElement {
 
 	/** Slice C1 — append the registered pack `composer-slash` ENTRYPOINTS (from the
 	 *  reconciled client pack-entrypoints registry) to the slash list as synthetic
-	 *  entries. The trigger name is the entrypoint id; selecting one runs the
-	 *  launcher (see `_selectSlashSkill`). Best-effort + synchronous — the registry
-	 *  is already populated by the project reconcile; a load failure is non-fatal. */
+	 *  entries. The trigger name is the entrypoint id; selecting one completes the
+	 *  token and send-time dispatch runs the launcher. Best-effort + synchronous —
+	 *  the registry is already populated by the project reconcile; a load failure is
+	 *  non-fatal. */
 	private _withPackEntrypoints(skills: SlashSkillInfo[]): SlashSkillInfo[] {
 		try {
 			const eps = listLauncherEntrypoints("composer-slash");
@@ -266,14 +276,22 @@ export class MessageEditor extends LitElement {
 		}
 	}
 
+	private _showLauncherFeedback(message: string, kind: "pending" | "error"): void {
+		window.dispatchEvent(new CustomEvent("bobbit-launcher-feedback", { detail: { kind, message } }));
+		void import("../../app/render.js")
+			.then((m) => m.showHeaderToast(message))
+			.catch(() => { /* best-effort */ });
+	}
+
+	private _showLauncherError(message: string): void {
+		this._showLauncherFeedback(message, "error");
+	}
+
+	private _showLauncherPending(message = "Starting PR walkthrough…"): void {
+		this._showLauncherFeedback(message, "pending");
+	}
+
 	private _selectSlashSkill(skill: SlashSkillInfo) {
-		// Slice C1 — a pack composer-slash ENTRYPOINT runs its launcher (open panel /
-		// navigate) on selection (the user gesture) instead of inserting text.
-		if (skill.entrypointId) {
-			this._slashMenuOpen = false;
-			try { runLauncherEntrypoint(skill.entrypointId); } catch { /* non-fatal */ }
-			return;
-		}
 		const textarea = this.textareaRef.value;
 		if (!textarea) return;
 		const before = this.value.substring(0, this._slashTokenStart);
@@ -281,13 +299,34 @@ export class MessageEditor extends LitElement {
 		this.value = before + `/${skill.name} ` + after;
 		this._slashMenuOpen = false;
 		this.onInput?.(this.value);
-		// Update textarea and move cursor after the inserted skill name
-		if (textarea) {
-			textarea.value = this.value;
-			const newPos = before.length + skill.name.length + 2; // "/" + name + " "
-			textarea.focus();
-			textarea.setSelectionRange(newPos, newPos);
+		// Update textarea and move cursor after the inserted skill name. Pack
+		// composer-slash launchers are dispatched only when the completed command is
+		// sent, so selecting autocomplete still lets the user type required args.
+		textarea.value = this.value;
+		const newPos = before.length + skill.name.length + 2; // "/" + name + " "
+		textarea.focus();
+		textarea.setSelectionRange(newPos, newPos);
+	}
+
+	private _packSlashLaunchFromText(text: string): { entrypointId: string; body: Record<string, unknown> } | undefined {
+		const trimmed = text.trim();
+		const match = trimmed.match(/^\/([A-Za-z0-9_.-]+)(?:\s+([\s\S]+))?$/);
+		if (!match) return undefined;
+
+		const name = match[1];
+		const launcher = listLauncherEntrypoints("composer-slash").find((l) => l.id === name);
+		if (!launcher) return undefined;
+
+		const arg = (match[2] ?? "").trim();
+		if (!arg) return { entrypointId: launcher.key, body: {} };
+
+		// PR walkthrough's run route already accepts these argument fields.
+		if (launcher.packId === "pr-walkthrough" || launcher.id === "pr-walkthrough") {
+			if (/^\d+$/.test(arg)) return { entrypointId: launcher.key, body: { prNumber: Number(arg) } };
+			return { entrypointId: launcher.key, body: { prUrl: arg } };
 		}
+
+		return { entrypointId: launcher.key, body: { input: arg } };
 	}
 
 	/** Fetch the file list for the current `@` query from the server (debounced).
@@ -637,7 +676,7 @@ export class MessageEditor extends LitElement {
 						continue;
 					}
 
-					const attachment = await loadAttachment(file);
+					const attachment = await loadAttachmentLazy(file);
 					newAttachments.push(attachment);
 				} catch (error) {
 					console.error("Error processing pasted image:", error);
@@ -667,6 +706,27 @@ export class MessageEditor extends LitElement {
 			}
 		}
 		this._sendSizeError = "";
+		const packSlashLaunch = this.attachments.length === 0 ? this._packSlashLaunchFromText(text) : undefined;
+		if (packSlashLaunch) {
+			this._slashMenuOpen = false;
+			this.dispatchEvent(new CustomEvent("message-send", { bubbles: true, composed: true }));
+			this.value = "";
+			this.onInput?.(this.value);
+			const textarea = this.textareaRef.value;
+			if (textarea) {
+				textarea.value = this.value;
+				textarea.focus();
+			}
+			this._historyIndex = -1;
+			this._savedDraft = "";
+			void this.addToHistory(text);
+
+			this._showLauncherPending();
+			runLauncherEntrypoint(packSlashLaunch.entrypointId, (r) => {
+				if (!r.ok) this._showLauncherError(r.error || "Could not start the PR walkthrough.");
+			}, { body: packSlashLaunch.body });
+			return;
+		}
 		// Dispatch a composed event that escapes shadow DOM — used by
 		// session-manager for draft cleanup without monkey-patching.
 		this.dispatchEvent(new CustomEvent("message-send", { bubbles: true, composed: true }));
@@ -703,7 +763,7 @@ export class MessageEditor extends LitElement {
 					continue;
 				}
 
-				const attachment = await loadAttachment(file);
+				const attachment = await loadAttachmentLazy(file);
 				newAttachments.push(attachment);
 			} catch (error) {
 				console.error(`Error processing ${file.name}:`, error);
@@ -767,7 +827,7 @@ export class MessageEditor extends LitElement {
 					continue;
 				}
 
-				const attachment = await loadAttachment(file);
+				const attachment = await loadAttachmentLazy(file);
 				newAttachments.push(attachment);
 			} catch (error) {
 				console.error(`Error processing ${file.name}:`, error);

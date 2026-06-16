@@ -14,12 +14,12 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { WorktreePool, isPoolBranch } from "../src/server/agent/worktree-pool.ts";
 import type { Component } from "../src/server/agent/project-config-store.ts";
+import { makeTmpDir } from "./helpers/tmp.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,7 +27,7 @@ const __dirname = path.dirname(__filename);
 const execFile = promisify(execFileCb);
 
 async function makeRepo(): Promise<string> {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobbit-pool-test-"));
+	const dir = makeTmpDir("bobbit-pool-test-");
 	const repo = path.join(dir, "repo");
 	fs.mkdirSync(repo, { recursive: true });
 	await execFile("git", ["init", "--initial-branch=master"], { cwd: repo });
@@ -88,6 +88,21 @@ describe("WorktreePool — Phase 3 claim sequence", () => {
 				.find(l => l.startsWith("pool/_pool-"));
 			assert.ok(originalPoolBranch, "should have captured the original pool branch before claim");
 
+
+			// Capture the pooled branch name BEFORE claim. claim() kicks off a
+			// background refill (replenish() → _fill() back up to targetSize), which
+			// legitimately creates a NEW `pool/_pool-*` branch. So asserting the
+			// global absence of the `pool/_pool-` prefix after claim is racy (the
+			// refill can land before the assertion under load). Instead assert that
+			// THIS pooled branch was renamed away — claim's actual contract.
+			const listBranches = async (): Promise<string[]> => {
+				const { stdout } = await execFile("git", ["branch", "--list"], { cwd: repo });
+				return stdout.split("\n").map((s) => s.replace(/^[*+]?\s*/, "").trim()).filter(Boolean);
+			};
+			const pooledBranch = (await listBranches()).find((b) => b.startsWith("pool/_pool-"));
+			assert.ok(pooledBranch, "a pool branch should exist before claim");
+
+
 			const claim = await pool.claim("session/abcd1234");
 			assert.ok(claim, "claim should succeed");
 			assert.equal(claim!.branchName, "session/abcd1234");
@@ -100,6 +115,13 @@ describe("WorktreePool — Phase 3 claim sequence", () => {
 			const { stdout: branchList } = await execFile("git", ["branch", "--list"], { cwd: repo });
 			assert.ok(branchList.includes("session/abcd1234"), "target branch should exist");
 			assert.ok(!branchList.includes(originalPoolBranch!), `claimed pool branch ${originalPoolBranch} should be renamed away`);
+
+
+			// Verify the pooled branch was renamed to the session branch.
+			const after = await listBranches();
+			assert.ok(after.includes("session/abcd1234"), "target branch should exist");
+			assert.ok(!after.includes(pooledBranch!), "the claimed pool branch should be renamed away");
+
 
 			// Verify the directory was moved (path basename is the flattened slug).
 			assert.equal(path.basename(claim!.worktreePath), "session-abcd1234");
