@@ -1,4 +1,4 @@
-import type { ChatPanel } from "../ui/index.js";
+import type { ChatPanel } from "../ui/ChatPanel.js";
 import type { RemoteAgent, ConnectionStatus } from "./remote-agent.js";
 import type { InboxEntry } from "../server/agent/inbox-store.js";
 import type { PanelWorkspaceTab } from "./panel-workspace.js";
@@ -368,6 +368,17 @@ export const state = {
 	archivedSessionsCursor: null as number | null,
 	archivedSessionsHasMore: false,
 	archivedSessionsTotal: 0,
+
+	// Pagination/loading for archived search results. Kept separate from normal archive pagination.
+	archivedSearchQuery: "",
+	archivedSearchGoalsCursor: null as number | null,
+	archivedSearchGoalsHasMore: false,
+	archivedSearchGoalsTotal: 0,
+	archivedSearchGoalsLoading: false,
+	archivedSearchSessionsCursor: null as number | null,
+	archivedSearchSessionsHasMore: false,
+	archivedSearchSessionsTotal: 0,
+	archivedSearchSessionsLoading: false,
 
 
 	// Unified assistant state

@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import type { SessionManager, SessionInfo } from "./session-manager.js";
 import { GoalManager } from "./goal-manager.js";
 import { GoalStore, type PersistedGoal } from "./goal-store.js";
-import { createWorktree, cleanupWorktree } from "../skills/git.js";
+import { createWorktree, cleanupWorktree, shouldSkipRemoteGitForTests } from "../skills/git.js";
 import { applyPromptConditionals } from "./prompt-conditionals.js";
 import type { RoleStore, Role } from "./role-store.js";
 import { resolveRole, listAvailableRoles } from "./resolve-role.js";
@@ -46,6 +46,35 @@ const execFile = promisify(execFileCb);
 function scanSlugDirForJsonls(worktreePath: string) {
 	const sessionsRoot = path.join(os.homedir(), ".bobbit", "agent", "sessions");
 	return scanSlugDirForJsonlsAt(sessionsRoot, worktreePath, fs, path.join);
+}
+
+function splitWorkerResultSummary(resultSummary: string): { summary?: string; branch?: string; commit?: string; checks?: string } {
+	let rest = resultSummary.trim();
+	let branch: string | undefined;
+	let commit: string | undefined;
+	let checks: string | undefined;
+
+	const branchMatch = rest.match(/\bBranch\s+(\S+)\s+pushed\s+at\s+([0-9a-f]{7,40})\.?/i);
+	if (branchMatch) {
+		branch = branchMatch[1];
+		commit = branchMatch[2];
+		rest = `${rest.slice(0, branchMatch.index)} ${rest.slice((branchMatch.index ?? 0) + branchMatch[0].length)}`.trim();
+	}
+
+	rest = rest.replace(/\bWorking copy clean after push\.?/i, "").trim();
+
+	const validationMatch = rest.match(/\bValidation(?:\s+passed)?:\s*([\s\S]*)$/i);
+	if (validationMatch) {
+		checks = validationMatch[1].trim().replace(/\.$/, "");
+		rest = rest.slice(0, validationMatch.index).trim();
+	}
+
+	return {
+		summary: rest.replace(/\s+/g, " ").replace(/\.$/, "").trim() || undefined,
+		branch,
+		commit,
+		checks: checks?.replace(/\s+/g, " ").trim() || undefined,
+	};
 }
 
 /**
@@ -921,9 +950,6 @@ export class TeamManager {
 				);
 			}
 		}
-		// boot-respawn for sessionless in-progress goals — Boot-respawn for sessionless in-progress goals.
-		this._bootRespawnSessionlessGoals();
-
 		// boot-resume idle team-leads with outstanding work. The stuck-sweep
 		// would catch these after STUCK_QUIET_THRESHOLD_MS (5 min) but that
 		// leaves a gap where the operator sees a freshly-restored team-lead
@@ -1026,60 +1052,6 @@ export class TeamManager {
 		if (failedGates > 0) parts.push(`${failedGates} failed gate(s)`);
 		if (openTasks > 0) parts.push(`${openTasks} open task(s)`);
 		return parts.join(", ");
-	}
-
-	/**
-	 * boot-respawn for sessionless in-progress goals — Walk every non-archived goal that is in-progress, has
-	 * setupStatus=ready, and is a team goal but has no live team entry. Spin
-	 * up a fresh team-lead for each so the goal is not stranded.
-	 *
-	 * Symptom on PR #409: after several gateway restarts, three Phase-2 leaves
-	 * all sat in `state: in-progress, setupStatus: ready, archived: null`
-	 * with ZERO team agents and ZERO team-lead session. The harness's
-	 * existing recovery only fired when there was an active verification with
-	 * the child's planId — but the parent's verification record was itself
-	 * lost in the restart, so nothing rescued the orphan.
-	 *
-	 * Wraps each respawn in try/catch — one bad goal must not block the rest.
-	 */
-	private _bootRespawnSessionlessGoals(): void {
-		if (!this.config.projectContextManager) return;
-
-		for (const ctx of this.config.projectContextManager.all()) {
-			for (const goal of ctx.goalStore.getAll()) {
-				if (goal.archived) continue;
-				// Pause-cascade: a paused goal must never trigger a fresh
-				// team-lead spawn on boot/respawn. Without this guard, an
-				// operator who pauses a goal then aborts its team-lead would
-				// see a new team-lead reappear within seconds (whack-a-mole).
-				// See docs/design/pause-cascade.md §Call-site 7 (CRITICAL).
-				if (goal.paused) continue;
-				if (goal.state !== "in-progress") continue;
-				if (goal.setupStatus !== "ready") continue;
-				if (!goal.team) continue;
-				if (this.teams.has(goal.id)) continue;
-
-				try {
-					console.log(
-						`[team-manager] Boot recovery: respawning team-lead for sessionless in-progress goal "${goal.title}" (id=${goal.id})`,
-					);
-					// Fire and forget — startTeam returns a promise but boot can't
-					// block on it. Errors are logged inside the catch so they
-					// don't propagate as unhandled rejections.
-					this.startTeam(goal.id).catch((err) => {
-						console.error(
-							`[team-manager] Boot recovery startTeam failed for goal=${goal.id} ("${goal.title}"):`,
-							err,
-						);
-					});
-				} catch (err) {
-					console.error(
-						`[team-manager] Boot recovery failed synchronously for goal=${goal.id} ("${goal.title}"):`,
-						err,
-					);
-				}
-			}
-		}
 	}
 
 	/** Clear and remove all idle-nudge timers for a goal. */
@@ -1734,9 +1706,12 @@ export class TeamManager {
 			const goalId8 = goalId.slice(0, 8);
 			branchName = `goal/${goalId8}/${role}-${shortId}`;
 
-			// Fetch latest so origin/<goal-branch> is up to date for the worktree start-point
+			// Fetch latest so origin/<goal-branch> is up to date for the worktree start-point.
+			// Test harnesses may use repos with no origin; never contact real remotes there.
 			try {
-				await execFile("git", ["fetch", "origin", goal.branch!], { cwd: goal.repoPath!, timeout: 30_000 });
+				if (!(await shouldSkipRemoteGitForTests(goal.repoPath!))) {
+					await execFile("git", ["fetch", "origin", goal.branch!], { cwd: goal.repoPath!, timeout: 30_000 });
+				}
 			} catch { /* fetch failure is non-fatal — worktree falls back to local HEAD */ }
 
 			// Compute subdirectory offset from the goal's worktree root to its cwd.
@@ -1959,14 +1934,23 @@ export class TeamManager {
 
 		let message: string;
 		if (tasks.length > 0) {
-			const taskSummaries = tasks.map(t => {
-				let s = `"${t.title}" (state: ${t.state})`;
-				if (t.resultSummary) s += ` — ${t.resultSummary}`;
-				return s;
-			}).join("; ");
-			message = `Agent ${agentId} (${role}) has finished. Tasks: ${taskSummaries}. Check task details and decide next steps.`;
+			const heading = tasks.every(t => t.state === "complete") ? "Task complete" : "Agent finished";
+			const taskSummaries = tasks.map(t => `**${t.title}** (\`${t.state}\`)`).join("; ");
+			const resultSummary = tasks.map(t => t.resultSummary?.trim()).filter(Boolean).join(" ");
+			const result = resultSummary ? splitWorkerResultSummary(resultSummary) : undefined;
+			const lines = [
+				`**${heading}**`,
+				"",
+				`- **Agent:** \`${agentId}\` (\`${role}\`)`,
+				`- **Task:** ${taskSummaries}`,
+			];
+			if (result?.summary) lines.push(`- **Result:** ${result.summary}`);
+			if (result?.branch) lines.push(`- **Branch:** \`${result.branch}\`${result.commit ? ` @ \`${result.commit.slice(0, 8)}\`` : ""}`);
+			if (result?.checks) lines.push(`- **Checks:** ${result.checks}`);
+			lines.push("- **Next:** `task_list`, then review task and decide next step.");
+			message = lines.join("\n");
 		} else {
-			message = `Agent ${agentId} (${role}) has finished with no assigned tasks. Check tasks and decide next steps.`;
+			message = `**Agent finished**\n\n- **Agent:** \`${agentId}\` (\`${role}\`)\n- **Task:** no assigned tasks\n- **Next:** \`task_list\`, then review tasks and decide next step.`;
 		}
 
 		try {

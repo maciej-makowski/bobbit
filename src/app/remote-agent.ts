@@ -1,6 +1,7 @@
 import type { Model } from "@earendil-works/pi-ai";
 import { PROPOSAL_PARSERS } from "./proposal-parsers.js";
 import { bootMark, bootTimingMeta, bootTimingReport } from "./boot-timing.js";
+import { loadSavedBindings } from "./shortcut-registry.js";
 
 /**
  * Placeholder model used as the initial value of `_state.model` before the
@@ -30,6 +31,15 @@ const PLACEHOLDER_DEFAULT_MODEL: Model<"anthropic-messages"> = {
 };
 
 import { isProposalType, type ProposalType } from "./proposal-registry.js";
+
+export type ProposalSource = "tool" | "legacy" | "edit" | "seed" | "rehydrate" | "restore";
+const SERVER_PROPOSAL_SOURCES = new Set<ProposalSource>(["edit", "seed", "rehydrate", "restore"]);
+
+function normalizeServerProposalSource(source: unknown): ProposalSource {
+	return typeof source === "string" && SERVER_PROPOSAL_SOURCES.has(source as ProposalSource)
+		? source as ProposalSource
+		: "edit";
+}
 import { state, renderApp, setProjectsIfChanged } from "./state.js";
 import { closeReviewWorkspaceTabs, selectReviewWorkspaceTab, selectSensiblePanelWorkspaceTab } from "./preview-panel.js";
 import { clearPersistedReviewDocuments, openMarkdownReviewDocument, removePersistedReviewDocument, restorePersistedReviewDocuments } from "./review-sources.js";
@@ -222,7 +232,7 @@ export interface QueuedMessage {
 	images?: Array<{ type: "image"; data: string; mimeType: string }>;
 	attachments?: unknown[];
 	isSteered: boolean;
-	/** True if already dispatched mid-turn via steer RPC (kept in queue for UI) */
+	/** Legacy optional flag from the pre-ledger queue model; current server rows omit it. */
 	dispatched?: boolean;
 	/** True for a client-side outbox row not yet delivered to the server (S2):
 	 *  issued while the WS was reconnecting; flushed on auth_ok. Lets the pill
@@ -507,12 +517,14 @@ export class RemoteAgent {
 		fields: Record<string, unknown> | null,
 		streaming: boolean,
 		rev?: number,
+		source?: ProposalSource,
 	) => void;
 	private _bufferedProposalEvents: Array<{
 		type: ProposalType;
 		fields: Record<string, unknown> | null;
 		streaming: boolean;
 		rev?: number;
+		source?: ProposalSource;
 	}> = [];
 	get onProposal(): typeof this._onProposal {
 		return this._onProposal;
@@ -523,7 +535,7 @@ export class RemoteAgent {
 			const pending = this._bufferedProposalEvents;
 			this._bufferedProposalEvents = [];
 			for (const ev of pending) {
-				try { fn(ev.type, ev.fields, ev.streaming, ev.rev); }
+				try { fn(ev.type, ev.fields, ev.streaming, ev.rev, ev.source); }
 				catch (err) { console.warn("[remote-agent] buffered onProposal replay threw:", err); }
 			}
 		}
@@ -1931,11 +1943,12 @@ export class RemoteAgent {
 				const pType = (msg as any).proposalType;
 				const fields = (msg as any).fields;
 				const rev = typeof (msg as any).rev === "number" ? (msg as any).rev as number : undefined;
+				const source = normalizeServerProposalSource((msg as any).source);
 				if (isProposalType(pType) && fields && typeof fields === "object") {
 					if (this._onProposal) {
-						this._onProposal(pType, fields as Record<string, unknown>, false, rev);
+						this._onProposal(pType, fields as Record<string, unknown>, false, rev, source);
 					} else {
-						this._bufferedProposalEvents.push({ type: pType, fields: fields as Record<string, unknown>, streaming: false, rev });
+						this._bufferedProposalEvents.push({ type: pType, fields: fields as Record<string, unknown>, streaming: false, rev, source });
 					}
 				}
 				break;
@@ -2104,7 +2117,7 @@ export class RemoteAgent {
 			// which would leave nothing for mergeFields to preserve if onProposal
 			// ran second.
 			if (this.onProposal && isProposalType(proposalType)) {
-				this.onProposal(proposalType, input, streaming);
+				this.onProposal(proposalType, input, streaming, undefined, "tool");
 			}
 			if (callback) callback(input, streaming);
 
@@ -2211,7 +2224,7 @@ export class RemoteAgent {
 
 				console.warn(`[proposal] Detected legacy XML <${parser.tag}> block — this format is deprecated, use propose_* tools instead`);
 				if (this.onProposal && proposalType) {
-					this.onProposal(proposalType, normalized, false);
+					this.onProposal(proposalType, normalized, false, undefined, "legacy");
 				}
 				if (callback) callback(normalized);
 			}
@@ -2377,7 +2390,7 @@ export class RemoteAgent {
 
 		// Apply shortcuts
 		if ("shortcuts" in prefs) {
-			import("./shortcut-registry.js").then((m) => m.loadSavedBindings());
+			void loadSavedBindings();
 		}
 
 	}
@@ -2589,8 +2602,12 @@ export class RemoteAgent {
 
 						// Mark this id as the streaming-preview message so the render
 						// layer can hide it from message-list while the streaming
-						// container still owns it. When there are no tool calls the
-						// streaming container will be cleared by AgentInterface.
+						// container owns it. Some tool-only turns (notably parked
+						// `bash_bg wait`) arrive as `message_end` without a prior
+						// `message_update`; in that case this final message is the first
+						// thing the streaming container can render. When there are no
+						// tool calls the streaming container will be cleared by
+						// AgentInterface.
 						if (hasToolCalls) {
 							const sid = computeStreamingMessageId(msg);
 							this.streamingMessageId = sid;
@@ -2602,6 +2619,7 @@ export class RemoteAgent {
 							if (sid && (typeof msg.id !== "string" || msg.id.length === 0)) {
 								msg = { ...msg, id: sid };
 							}
+							this._state.streamingMessage = msg;
 						} else {
 							this._state.streamingMessage = null;
 							this.streamingMessageId = undefined;

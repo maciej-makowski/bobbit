@@ -26,6 +26,7 @@ import {
 	bedrockRoutesForType,
 } from "./aigw-manager.js";
 import { getOpenAIModelAdditions } from "./openai-model-additions.js";
+import { getGoogleCodeAssistModels } from "./google-code-assist-models.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -44,6 +45,18 @@ export interface ApiModel {
 	headers?: Record<string, string>;
 	compat?: unknown;
 	authenticated: boolean;
+	/**
+	 * When `false`, the model is authenticated but MUST NOT be bound to an agent
+	 * session: the pi-coding-agent runtime has no provider/api capable of running
+	 * it (e.g. `google-gemini-cli` Code Assist models, whose Code Assist adapter is
+	 * only wired into server-side completion, not the session runtime). The
+	 * ModelSelector renders these visibly unavailable-for-sessions and refuses to
+	 * select them. Undefined/true means selectable. Single source of truth for
+	 * session-selectability lives where each model is emitted.
+	 */
+	sessionSelectable?: boolean;
+	/** Human-readable reason shown in the selector when `sessionSelectable === false`. */
+	sessionUnavailableReason?: string;
 }
 
 export interface CustomProviderConfig {
@@ -80,6 +93,10 @@ export function invalidateModelCache(): void {
  * Get all available models, merged from all sources.
  * Results are cached for 5 seconds.
  */
+export function getBuiltInProviderIds(): string[] {
+	return getProviders().map(provider => String(provider));
+}
+
 export async function getAvailableModels(prefs: PreferencesStore): Promise<ApiModel[]> {
 	const now = Date.now();
 	const currentVersion = getPrefsVersion(prefs);
@@ -179,6 +196,18 @@ async function assembleModels(prefs: PreferencesStore): Promise<ApiModel[]> {
 		} catch (err) {
 			console.error("[model-registry] Failed to load built-in providers:", err);
 		}
+
+		// 1b. Google account (Code Assist / OAuth) Gemini models. These reach
+		// cloudcode-pa.googleapis.com directly from the gateway host, so they share
+		// the same direct-egress visibility semantics as built-in providers and are
+		// only emitted when an account credential is present.
+		try {
+			for (const m of getGoogleCodeAssistModels()) {
+				results.push({ ...m, authenticated: detectProviderAuth(m.provider, prefs) });
+			}
+		} catch (err) {
+			console.error("[model-registry] Failed to load Google Code Assist models:", err);
+		}
 	}
 
 	// 2. Gateway models — loop the enabled gateways. In exclusive mode only
@@ -243,6 +272,19 @@ const ENV_MAP: Record<string, string> = {
 	"mistral": "MISTRAL_API_KEY",
 };
 
+/**
+ * Providers whose `auth.json` credentials are genuine OAuth/account tokens.
+ * Only these may be authenticated via `hasOAuthCredentials()` — this prevents a
+ * generic OAuth credential (e.g. `auth.json["google-gemini-cli"]`) from making
+ * API-key-only providers like `google` (Gemini Developer API) look usable.
+ * Single source of truth for OAuth-capable provider detection.
+ */
+const OAUTH_AUTHENTICATED_PROVIDERS = new Set(["anthropic", "openai-codex", "google-gemini-cli"]);
+
+export function isOAuthCapableProvider(provider: string): boolean {
+	return OAUTH_AUTHENTICATED_PROVIDERS.has(provider);
+}
+
 function detectProviderAuth(provider: string, prefs: PreferencesStore): boolean {
 	// Check provider key in preferences (migrated from IndexedDB)
 	const storedKey = prefs.get(`providerKey.${provider}`) as string | undefined;
@@ -252,8 +294,9 @@ function detectProviderAuth(provider: string, prefs: PreferencesStore): boolean 
 	const envVar = ENV_MAP[provider];
 	if (envVar && process.env[envVar]) return true;
 
-	// Check OAuth credentials (auth.json)
-	if (hasOAuthCredentials(provider)) return true;
+	// Check OAuth credentials (auth.json) — only for OAuth-capable providers so a
+	// google-gemini-cli account token can't authenticate API-key-only `google`.
+	if (OAUTH_AUTHENTICATED_PROVIDERS.has(provider) && hasOAuthCredentials(provider)) return true;
 
 	return false;
 }

@@ -46,6 +46,7 @@ import "./StreamingMessageContainer.js";
 import "./BellToggle.js";
 import { state as appState, renderApp } from "../../app/state.js";
 import { gatewayFetch } from "../../app/api.js";
+import { selectProposalWorkspaceTab } from "../../app/preview-panel.js";
 import { setHashRoute } from "../../app/routing.js";
 import type { Agent, AgentEvent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Attachment } from "../utils/attachment-utils.js";
@@ -213,10 +214,9 @@ export class AgentInterface extends LitElement {
 		if (this.assistantType) {
 			s.assistantTab = "preview";
 		}
-		void import("../../app/preview-panel.js")
-			.then((mod: any) => mod.selectProposalWorkspaceTab?.(type, { sessionId, select: true, setAssistantTab: true }))
-			.then(() => renderApp())
-			.catch(() => { /* legacy fields above still select the proposal */ });
+		try {
+			selectProposalWorkspaceTab(type, { sessionId, select: true, setAssistantTab: true });
+		} catch { /* legacy fields above still select the proposal */ }
 		renderApp();
 		this.requestUpdate();
 	}
@@ -1091,17 +1091,17 @@ export class AgentInterface extends LitElement {
 					this._updateAndPin();
 					break;
 				case "message_end":
-					// When a message finishes, sync the streaming container
-					// with the current streamingMessage state.  If the agent
-					// cleared streamingMessage (e.g. message without tool calls),
-					// we clear the container so the finalized message only
-					// appears in message-list.  If streamingMessage is still set
-					// (deferred tool-call message), the container keeps it.
+					// When a message finishes, sync the streaming container with
+					// the current streamingMessage state. If the agent cleared
+					// streamingMessage (e.g. message without tool calls), clear the
+					// container so the finalized message only appears in
+					// message-list. If streamingMessage is set, push it into the
+					// container now: some tool-only messages (notably parked
+					// `bash_bg wait`) arrive as a final `message_end` without a
+					// prior `message_update`.
 					if (this._streamingContainer) {
 						const sm = this.session?.state.streamingMessage;
-						if (!sm) {
-							this._streamingContainer.setMessage(null, true);
-						}
+						this._streamingContainer.setMessage(sm || null, true);
 					}
 					this._updateAndPin();
 					break;
