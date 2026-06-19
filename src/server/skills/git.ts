@@ -2,12 +2,14 @@ import { execFile as execFileCb } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { cpuDiagnosticsEnabled, getCpuDiagnostics } from "../agent/cpu-diagnostics.js";
 import type { Component } from "../agent/project-config-store.js";
 import { branchToSlug, worktreeRoot as wtRootHelper } from "./worktree-paths.js";
 
 const execFile = promisify(execFileCb);
+const primaryBranchFallbackWarningCwds = new Set<string>();
 
 function childErrorCode(err: unknown): string {
 	const code = (err as { code?: unknown } | null)?.code;
@@ -57,6 +59,42 @@ async function execGit(
  */
 export function shouldSkipRemotePush(): boolean {
 	return process.env.BOBBIT_TEST_NO_PUSH === "1";
+}
+
+function isLocalGitRemoteUrl(rawUrl: string): boolean {
+	const url = rawUrl.trim();
+	if (!url) return false;
+	if (path.isAbsolute(url) || path.win32.isAbsolute(url)) return true;
+	if (url === "." || url === ".." || url.startsWith("./") || url.startsWith("../") || url.startsWith("~/")) return true;
+	if (/^[A-Za-z]:[\\/]/.test(url)) return true;
+	try {
+		const parsed = new URL(url);
+		return parsed.protocol === "file:";
+	} catch {
+		// Not a URL; fall through to SCP-style checks.
+	}
+	if (/^[^\s/:]+@[^\s:]+:.+/.test(url)) return false;
+	if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(url)) return false;
+	return !/^[^\\/]+:.+/.test(url);
+}
+
+/**
+ * In offline E2E/unit modes, skip git operations that would touch a missing or
+ * non-local remote. Local bare/file remotes are allowed so tests can exercise
+ * fetch/reset semantics without network access.
+ */
+export async function shouldSkipRemoteGitForTests(cwd: string, remote = "origin"): Promise<boolean> {
+	if (process.env.BOBBIT_TEST_NO_REMOTE !== "1" && process.env.BOBBIT_TEST_NO_EXTERNAL !== "1") return false;
+	try {
+		const { stdout } = await execGit(["remote", "get-url", remote], { cwd, timeout: 5_000 });
+		return !isLocalGitRemoteUrl(stdout.toString());
+	} catch {
+		return true;
+	}
+}
+
+export async function shouldSkipRemotePushForTests(cwd: string, remote = "origin"): Promise<boolean> {
+	return shouldSkipRemotePush() || await shouldSkipRemoteGitForTests(cwd, remote);
 }
 
 /**
@@ -111,8 +149,90 @@ export async function detectPrimaryBranch(cwd: string): Promise<string> {
 		await execGit(["rev-parse", "--verify", "refs/heads/main"], { cwd, timeout: 5_000 });
 		return "main";
 	} catch { /* ignore */ }
-	console.warn(`[git] detectPrimaryBranch(${cwd}): could not detect primary branch; defaulting to "master"`);
+	await warnPrimaryBranchFallbackIfUseful(cwd);
 	return "master";
+}
+
+async function warnPrimaryBranchFallbackIfUseful(cwd: string): Promise<void> {
+	if (!await shouldWarnPrimaryBranchFallback(cwd)) return;
+	const key = path.resolve(cwd);
+	if (primaryBranchFallbackWarningCwds.has(key)) return;
+	primaryBranchFallbackWarningCwds.add(key);
+	console.warn(`[git] detectPrimaryBranch(${cwd}): could not detect primary branch; defaulting to "master"`);
+}
+
+async function shouldWarnPrimaryBranchFallback(cwd: string): Promise<boolean> {
+	const expectedTempFallbackPath = isExpectedTempPrimaryBranchFallbackPath(cwd);
+	try {
+		await execGit(["remote", "get-url", "origin"], { cwd, timeout: 5_000 });
+		return true;
+	} catch { /* no origin remote is fine for minimal temp repos */ }
+
+	try {
+		const { stdout } = await execGit(["rev-parse", "--is-inside-work-tree"], { cwd, timeout: 5_000 });
+		if (stdout.trim() !== "true") return !expectedTempFallbackPath;
+	} catch {
+		return !expectedTempFallbackPath;
+	}
+
+	if (expectedTempFallbackPath) return false;
+
+	try {
+		const { stdout } = await execGit(["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"], {
+			cwd,
+			timeout: 5_000,
+		});
+		return stdout.split(/\r?\n/).some((line) => {
+			const ref = line.trim();
+			return ref !== "" && ref !== "refs/remotes/origin/HEAD";
+		});
+	} catch {
+		// If even ref enumeration fails, keep the diagnostic for likely bad cwd/repos.
+		return true;
+	}
+}
+
+function isExpectedTempPrimaryBranchFallbackPath(cwd: string): boolean {
+	const resolved = path.resolve(cwd);
+	const tmpRoot = path.resolve(os.tmpdir());
+	if (sameOrInsidePath(resolved, tmpRoot)) {
+		if (samePath(resolved, tmpRoot)) return true;
+		if (hasExpectedTempHarnessComponent(resolved)) return true;
+	}
+
+	const e2eRoot = path.resolve(process.env.BOBBIT_E2E_TMP_ROOT || defaultE2eTempRoot());
+	return sameOrInsidePath(resolved, e2eRoot);
+}
+
+function defaultE2eTempRoot(): string {
+	return process.platform === "win32" ? "C:\\bobbit-e2e" : path.join(os.tmpdir(), "bobbit-e2e");
+}
+
+function hasExpectedTempHarnessComponent(p: string): boolean {
+	return p.split(/[\\/]+/).some((component) => {
+		const c = component.toLowerCase();
+		return c === "bobbit-e2e"
+			|| c.startsWith("bobbit-e2e-")
+			|| c.startsWith("proj-isolation-")
+			|| c.startsWith("verif-restart-repo-");
+	});
+}
+
+function sameOrInsidePath(child: string, parent: string): boolean {
+	const c = comparablePath(child);
+	const p = comparablePath(parent);
+	if (c === p) return true;
+	const rel = path.relative(p, c);
+	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+function samePath(a: string, b: string): boolean {
+	return comparablePath(a) === comparablePath(b);
+}
+
+function comparablePath(p: string): string {
+	const resolved = path.resolve(p);
+	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 async function resolveRemotePrimary(repoPath: string): Promise<string> {
@@ -239,6 +359,7 @@ export function parseLsRemoteSymref(output: string): string | null {
  */
 export async function detectBaseRefFromRemote(repoPath: string): Promise<string | null> {
 	try {
+		if (await shouldSkipRemoteGitForTests(repoPath)) return null;
 		const { stdout } = await execGit(["ls-remote", "--symref", "origin", "HEAD"], {
 			cwd: repoPath,
 			timeout: 10_000,
@@ -430,10 +551,13 @@ export async function createWorktree(repoPath: string, branchName: string, opts?
 		}
 	}
 
-	// Fetch the start point to ensure it's up to date
+	// Fetch the start point to ensure it's up to date. Test harnesses must never
+	// reach real remotes; local bare origins used by explicit remote specs remain allowed.
 	try {
-		const remote = startPoint.startsWith("origin/") ? startPoint.replace("origin/", "") : startPoint;
-		await execGit(["fetch", "origin", remote], { cwd: repoPath, timeout: 30_000 });
+		if (!(await shouldSkipRemoteGitForTests(repoPath))) {
+			const remote = startPoint.startsWith("origin/") ? startPoint.replace("origin/", "") : startPoint;
+			await execGit(["fetch", "origin", remote], { cwd: repoPath, timeout: 30_000 });
+		}
 	} catch {
 		// Fetch failure is non-fatal — may be offline, or startPoint is a local ref
 	}
@@ -503,7 +627,7 @@ export async function createWorktree(repoPath: string, branchName: string, opts?
 	// upstream config (for example origin/master) can never redirect the publish.
 	// Set upstream tracking only after that safe publish succeeds so git-status can
 	// report ahead/behind and `git rev-parse @{u}` doesn't emit "fatal: no upstream" errors.
-	if (!opts?.skipPush && !shouldSkipRemotePush()) {
+	if (!opts?.skipPush && !(await shouldSkipRemotePushForTests(worktreePath))) {
 		try {
 			await execGit(["push", "origin", `${branchName}:refs/heads/${branchName}`], {
 				cwd: worktreePath,
@@ -745,7 +869,7 @@ export async function cleanupWorktree(
 		}
 		// Also delete the remote branch (best-effort — remote may be unreachable,
 		// or the repo may have no remote configured, e.g. in E2E tests).
-		if (!shouldSkipRemotePush()) {
+		if (!(await shouldSkipRemotePushForTests(repoPath))) {
 			try {
 				await execGit(["push", "origin", "--delete", branchName], {
 					cwd: repoPath,
@@ -821,9 +945,12 @@ export async function mergeChildBranchLocal(
 		);
 	}
 
-	// Best-effort fetch — child branch may be local-only.
+	// Best-effort fetch — child branch may be local-only. In tests, only local
+	// bare origins are allowed so the suite never contacts a real remote.
 	try {
-		await execFile("git", ["fetch", "origin", childBranch], { cwd: parentCwd, timeout: 30_000 });
+		if (!(await shouldSkipRemoteGitForTests(parentCwd))) {
+			await execFile("git", ["fetch", "origin", childBranch], { cwd: parentCwd, timeout: 30_000 });
+		}
 	} catch {
 		// non-fatal
 	}
@@ -961,12 +1088,15 @@ export async function recoverWorktree(
 			}
 		}
 
-		// Fetch to make sure we have the branch ref
+		// Fetch to make sure we have the branch ref. In tests, only local bare
+		// origins are allowed so recovery never contacts a real remote.
 		try {
-			await execGit(["fetch", "origin", branchName], {
-				cwd: repoPath,
-				timeout: 30_000,
-			});
+			if (!(await shouldSkipRemoteGitForTests(repoPath))) {
+				await execGit(["fetch", "origin", branchName], {
+					cwd: repoPath,
+					timeout: 30_000,
+				});
+			}
 		} catch {
 			// Fetch failure is non-fatal — branch may exist locally
 		}

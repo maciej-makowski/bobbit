@@ -196,6 +196,24 @@ carry sub-namespaces. Per-op policies on `mcp__<server>__<op>` /
 `mcp__<server>__<sub>__<op>` continue to be matched at Layer B (per-call)
 before meta-aggregation.
 
+### Applying policy changes to existing agents
+
+Changing an MCP group policy updates the stored cascade immediately, but an
+already-running agent must be refreshed before its model-facing tool surface
+changes. `Refresh agent` recomputes role-derived allowed tools from the current
+cascade, so a server that moved from `never` to `ask` or `allow` registers its
+`mcp_<server>` meta-tool after the refresh.
+
+`ask` and `allow` differ only at execution time: `ask` registers the meta-tool
+and routes calls through the permission guard, while `allow` registers it for
+direct execution. A role-level `never` on the MCP key still wins over group
+policy and keeps the meta-tool unavailable.
+
+Session-scoped grants are not lost during this respawn. `session-only` grants
+and any unconsumed `one-time` grants are re-applied in memory; persisted
+session allow-list constraints, such as delegate/read-only restrictions, remain
+authoritative.
+
 ## Tools page UI
 
 The Tools page surfaces one row per MCP **server** under a dedicated "MCP"
@@ -220,6 +238,20 @@ Both the server and tool selects route through `updateGroupPolicy(key, value)`
 (no backend change — the endpoint already accepts arbitrary keys). This means
 top-level tool count visible to the user matches the model's view, with the
 option to drill into any server when needed.
+
+Sub-namespace rows mirror the runtime MCP policy cascade for display: when
+`mcp__<server>` is explicitly set and `mcp__<server>__<sub>` is unset, the row
+shows the inherited parent policy (for example, `Never (inherited from mcp__gr)`)
+while the select value remains empty. Empty still means "no stored
+sub-key". Selecting Allow, Ask, or Never writes an explicit sub-namespace key;
+clearing the select sends `policy: null`, removes that key, and returns the row
+to the inherited parent display. Flat servers keep using only `mcp__<server>`
+and do not show a synthetic inherited sub-policy.
+
+Access-tab effective policy and source hints use the same MCP keys for MCP
+operation and meta-tool rows before falling back to generic display group
+labels: `mcp__<server>__<sub>` first, then `mcp__<server>` (and role-level
+`mcp__` wildcard), then labels such as `MCP: <server>`.
 
 The page reads the structured `/api/mcp-servers` payload directly: each
 operation entry carries `subNamespace?` + `op`, so the UI groups by

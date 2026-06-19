@@ -8,11 +8,11 @@ per-session side-panel workspace shared by regular and assistant sessions.
 
 ## Mental model
 
-Four pieces, one mount, one URL shape:
+Five pieces, one mount, one URL shape:
 
 1. **Per-session mount on disk** — `<bobbitStateDir>/preview/<sid>/` holds the
    entry HTML and any sibling assets (images, CSS, video, …). Single source of
-   truth for what the panel shows.
+   truth for rendered bytes.
 2. **Content origin** — the gateway serves the mount at `/preview/<sid>/<path>`.
    Same shape for the iframe `src`, the "Open in new tab" button, and any link
    the user clicks inside the preview.
@@ -22,6 +22,10 @@ Four pieces, one mount, one URL shape:
 4. **SSE hot reload** — `GET /api/sessions/:sid/preview-events` streams a
    `preview-changed` event whenever the gateway repopulates the mount. The panel
    bumps `#mtime=<n>` on the iframe `src` to force a reload.
+5. **Server-backed workspace tab** — successful mount/open events persist the
+   active preview tab identity and small render metadata. This is what restores
+   the side-panel tab after a gateway restart; the mount/artifact files still
+   serve the bytes.
 
 Every populated mount also has a `contentHash`: a lowercase SHA-256 identity for
 that mounted preview tree. The hash represents rendered content identity, not a
@@ -39,17 +43,23 @@ Old paths and concepts that are gone:
 
 ## Side-panel workspace integration
 
-The UI treats the side pane as a Chrome-style tab strip beside the chat
-(never above it). The shared strip can hold HTML preview, proposal,
-review, PR walkthrough, and inbox tabs at the same time. Chat is **not**
-a tab — there is no `chat` side-pane id, no Chat pill in the strip, and
-the side pane hides entirely when a non-staff session has no side-pane
-tabs. The full rules — id grammar, focus and ordering, drag reorder,
-pinned inbox, walkthrough tab identity, immutable artifact restore,
-per-filename version assignment — live in
-[`design/side-panel-tab-contract.md`](./design/side-panel-tab-contract.md).
+The UI treats the side pane as a server-backed Chrome-style tab strip beside the
+chat (never above it). The shared strip can hold HTML preview, proposal, review,
+pack/PR-walkthrough, artifact-viewer, and inbox tabs at the same time. Chat is
+**not** a tab — there is no `chat` side-pane id, no Chat pill in the strip, and
+the side pane hides entirely when a non-staff session has no side-pane tabs.
 
-Preview tab identity in that contract:
+The side-panel workspace is authoritative for whether a preview tab is open. A
+preview mount, immutable artifact, bootstrap response, or SSE event may update
+content caches, but it must not resurrect a closed tab. Explicit preview tool
+mount/open events and historical preview-card Open buttons create or focus tabs;
+bootstrap and SSE updates patch only already-open tabs when they are not an
+explicit open. After a gateway restart, the client renders the active preview
+iframe from the hydrated server workspace tab, not from transient preview mirrors
+or mount discovery. Full workspace rules live in
+[`side-panel-workspace.md`](./side-panel-workspace.md).
+
+Preview tab identity:
 
 - The **current** preview tab for a filename is
   `preview:entry:<encoded-filename>`. Label is unversioned (e.g.
@@ -155,6 +165,34 @@ When the user clicks **Open** on a historical `preview_open` tool card
 | v3 without `artifactId`, with `html` / `file` original params | `POST /api/preview/mount {html\|file}` | Remount the original; the POST response's `artifactId` and `contentHash` are attached to the tab. Same collapse rule. |
 | v3 without `artifactId` and no remount body | None (recorded entry / mtime / url) | Select the recorded entry; iframe points at the existing mount path. Best-effort. |
 | Legacy v1 / v2 | `POST /api/preview/mount {html\|file}` | Stays historical even when the response includes `contentHash`. |
+
+### Restart restore
+
+A successful `POST /api/preview/mount` opens or updates the current preview
+workspace tab unless the caller opts out with `workspaceTab: false`,
+`openWorkspaceTab: false`, or an internal restore flag. The tab persists enough
+small metadata to render after restart:
+
+- source identity: `entry`, `contentHash`, `path`, `url`, and `artifactId` when a
+  matching artifact exists;
+- tab state: `entry`, `mtime`, `path`, `url`, `contentHash`, `artifactId`, and
+  `origin: "preview-mount"`;
+- workspace state: tab id/order and `activeTabId`.
+
+On gateway restart, `sidePanelWorkspace` is loaded with the session. When the
+browser reloads or returns to the session, the side-panel shell renders the
+active preview tab and the iframe derives `entry`, `mtime`, and `artifactId` from
+that tab before transient preview mirrors are repopulated. Live tabs point at
+`/preview/<sid>/<entry>?mtime=<n>`; artifact-backed historical tabs point at
+`/preview/<sid>/_artifact/<artifactId>/<entry>?mtime=<n>`.
+
+Bootstrap (`GET /api/preview/mount`) and `preview-changed` SSE metadata may later
+refresh already-open tabs, but they are not tab-creation sources. If the user
+closed the preview tab before restart, the persisted workspace has no preview
+tab, so reload/reconnect/bootstrap must leave the side panel closed until a new
+explicit `preview_open` / mount event or historical-card **Open** action occurs.
+
+Pinned by `tests/e2e/ui/preview-durable-restart.spec.ts`.
 
 ## Per-session mount
 
@@ -598,9 +636,11 @@ back the preview tree sees the same bytes the gateway just wrote.
 | `defaults/tools/html/snapshot.ts` | Marker constants, `buildPreviewSnapshotV3Block`, `parseSnapshot`, 250-byte v3 cap |
 | `src/server/preview/artifacts.ts` | Immutable artifact store — capture, restore, hash-based dedupe, orphan sweep |
 | `src/ui/tools/renderers/PreviewRenderer.ts` | Open button on tool cards; artifact restore → source remount → recorded-entry fallback; live-hash remount skip; filename-keyed tab dispatch |
-| `src/app/panel-workspace.ts` | Side-pane tab id grammar (`preview:entry:<file>[:v:N]`, `proposal:<type>[:rev:N]`, `review:<title>`, `inbox`), per-filename version ledger, pinned-first ordering, drag reorder, persistence |
-| `src/app/preview-panel.ts` | EventSource subscription, mount bootstrap, current-vs-historical upsert, older-version-rehydration guard |
-| `src/app/render.ts` | Side-pane tab strip rendering (Chrome-style with radial-gradient corner pseudos), mobile pane bar with pinned Chat pill, SortableJS drag integration with X-axis lock, active-content lookup by id only, artifact-id derived from active tab so iframe src never desyncs from state.previewPanelEntry |
+| `src/shared/side-panel-workspace.ts` | Server/client workspace model shared by preview and other panel kinds |
+| `src/app/side-panel-workspace.ts` | Server hydrate/mutate controller, optimistic in-memory updates, localStorage migration, popout URL helper |
+| `src/app/panel-workspace.ts` | Preview/proposal/review/pack tab id helpers and per-filename preview version ledger; file-fixture fallback only |
+| `src/app/preview-panel.ts` | EventSource subscription, mount bootstrap, explicit preview tab open/update, older-version-rehydration guard |
+| `src/app/render.ts` | Shared side-panel shell, tab strip, mobile slider, shared controls, active-content lookup by server workspace tab id |
 
 ## Acceptance properties
 
@@ -622,11 +662,11 @@ back the preview tree sees the same bytes the gateway just wrote.
 - "Open in new tab" works because the cookie has `Path=/`.
 - Edits to the mount fan out via SSE within ~50 ms (debounce window in
   `watchMount`).
-- The side-pane tab strip never contains a Chat pill; chat is rendered
-  outside the strip (see
-  [`design/side-panel-tab-contract.md`](./design/side-panel-tab-contract.md)).
-- The current preview tab for a filename is updated in place by new
-  `preview_open` calls and SSE — no duplicate, no reorder.
+- The side-pane tab strip never contains a Chat pill; chat is rendered outside
+  the strip (see [`side-panel-workspace.md`](./side-panel-workspace.md)).
+- The current preview tab for a filename is updated in place by explicit
+  preview open events; bootstrap/SSE metadata updates patch only already-open
+  tabs and do not resurrect closed tabs.
 - Opening a historical v3 card whose `contentHash` matches the current
   filename tab collapses to that tab and skips the remount POST; otherwise it
   opens `preview:entry:<file>:v:N` keyed off the per-filename version ledger.

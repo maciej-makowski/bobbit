@@ -34,6 +34,7 @@ Session-list invalidations (`session_created`, `sessions_changed`, and `session_
 | `reorder_queue` | `messageIds` | Reorder the prompt queue to match the given ID order |
 | `abort` | — | Abort the current agent turn |
 | `retry` | — | Retry the last failed turn |
+| `restart_agent` | — | Restart the agent process for this socket's session. This is the active-session path; the sidebar `Refresh agent` action uses `POST /api/sessions/:id/restart` to target any live row by id. Both paths call the same session-manager restart implementation. |
 | `set_model` | `provider`, `modelId` | Switch the AI model |
 | `set_image_model` | `provider`, `modelId` | Switch the per-session image generation model. Server validates `(provider, modelId)` against `getAvailableImageModels()`; on unknown the server replies with `{ type: "error", message: "unknown image model", code: "UNKNOWN_IMAGE_MODEL" }` and does **not** mutate session state. On valid, persists `imageModelProvider`/`imageModelId` to the session row and broadcasts the updated state to all attached clients. |
 | `compact` | — | Trigger context compaction |
@@ -69,6 +70,7 @@ Session-list invalidations (`session_created`, `sessions_changed`, and `session_
 | `pong` | — | Keepalive response |
 | `cost_update` | `sessionId`, `goalId?`, `taskId?`, `cost` | Cumulative persisted session cost snapshot. Sent after live completed assistant usage and during hydration paths when persisted cost exists. Current servers include `cost.cacheHitRate`; see [Cost update shape](#cost-update-shape). |
 | `queue_update` | `sessionId`, `queue` | Prompt queue changed |
+| `side_panel_workspace` | `sessionId`, `workspace` | The server-authoritative side-panel workspace for the session changed. Clients replace their local mirror only when `workspace.revision` is newer; see [side-panel-workspace.md](side-panel-workspace.md). |
 | `task_changed` | `task` | A task was created, updated, or deleted |
 | `tasks_list` | `tasks` | Full task list for a goal |
 | `session_archived` | `sessionId`, `archivedAt` | Session was archived |

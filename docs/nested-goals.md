@@ -63,6 +63,20 @@ Enable QA Testing):
 
 Both render **only while the system Subgoals preference is ON**.
 
+These controls (and the parent-goal picker) live in a dedicated **Sub-goals**
+tab (`data-testid="goal-proposal-tab-subgoals"`). The tab's visibility — and the
+equivalent non-tabbed parent-picker row — is a **pure function of the system
+Subgoals preference**: present when the flag is ON (for both top-level proposals
+and child proposals that already carry a `parentGoalId`) and absent when it is
+OFF, regardless of `parentGoalId`. Team-lead `propose_goal` calls only auto-fill
+`parentGoalId` when the current goal can spawn children under the current system
+and per-goal subgoal policy; otherwise an omitted `parentGoalId` stays omitted
+and accepting the proposal creates a top-level goal. Earlier the visibility also
+keyed off `parentGoalId`; but a child proposal can only exist when the flag is
+on (child creation is server-gated), so `parentGoalId` always implied
+`subgoalsEnabled` — the extra clause was dead and was removed so tab visibility
+tracks the setting, not the proposal's parent/child relationship.
+
 The proposal modal also exposes **Workflow** and **Roles** tabs
 (`goal-proposal-tab-workflow` / `goal-proposal-tab-roles`) for authoring a
 goal-scoped inline workflow snapshot and per-goal role overrides (see
@@ -295,9 +309,12 @@ place.
 
 - soft-aborts the subtree's sessions and cancels in-flight verifications,
 - makes every spawn path return `409 GOAL_PAUSED`,
-- and — critically — the **boot-respawn supervisor skips paused goals**, so a
-  paused goal stays paused across a gateway restart instead of being
-  resurrected (the "whack-a-mole" fix).
+- and keeps the pause durable across gateway restart.
+
+Restart restores persisted active teams and re-subscribes their existing leads.
+Boot-resume/nudge skip predicates apply only to those restored leads, so a
+paused restored lead is not nudged. Restart does not create a new Team Lead for
+an existing goal that is teamless.
 
 Resume re-enables spawns but does not auto-restart sessions. Pause/resume is an
 **operator** action and is distinct from the scheduler's dependency `blocked`
