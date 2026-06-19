@@ -44,7 +44,7 @@ Every committed mutation increments `revision`, persists the whole workspace thr
 
 | Kind | Tab id shape | Source identity | Notes |
 |---|---|---|---|
-| Preview | `preview:entry:<encoded-entry>` or `preview:entry:<encoded-entry>:v:<N>` | `entry`, `artifactId?`, `contentHash?`, `version?`, `live?`, `historical?` | Live preview tabs update in place. Historical preview tabs represent immutable artifacts or restored older cards. |
+| Preview | `preview:entry:<encoded-entry>` or `preview:entry:<encoded-entry>:v:<N>` | `entry`, `artifactId?`, `contentHash?`, `path?`, `url?`, `version?`, `live?`, `historical?`; state may include `mtime` | Live preview tabs update in place and restore from persisted tab metadata after restart. Historical preview tabs represent immutable artifacts or restored older cards. |
 | Pack | `pack:<encoded-packId>:<encoded-panelId>:<encoded-instanceKey>` | `packId`, `panelId`, `instanceKey`, `params?` | Covers PR walkthrough and artifact viewer pack panels. `instanceKey` is part of identity. |
 | Proposal | `proposal:<type>` or `proposal:<type>:rev:<N>` | `proposalType`, `rev?`, `historical?` | Types are `goal`, `project`, `role`, `tool`, and `staff`. Current revisions update the current tab; historical revs open only by explicit reopen. |
 | Review | `review:<encoded-documentId>` | stable `documentId`, display `title` | Title is metadata. Renames do not change identity. Closing the tab preserves content/annotations for explicit reopen. |
@@ -60,18 +60,34 @@ Because those legacy files are superseded by pack artifact panels, they are excl
 
 `preview_open` still writes the per-session preview mount and streams updates via preview SSE. Workspace tab creation is separate:
 
-- explicit preview mount/tool events open or focus the current preview tab;
+- explicit preview open/tool actions open or focus the current preview tab and persist render metadata such as `entry`, `mtime`, `contentHash`, `path`, `url`, and `artifactId` when available;
+- gateway restart restores the active preview iframe from that persisted workspace tab; the client does not need a fresh tool call or a mount bootstrap to recreate the tab;
 - historical card Open buttons explicitly open a versioned preview tab or focus an equivalent current tab when hashes match;
-- `GET /api/preview/mount` bootstrap and `preview-changed` SSE events patch metadata only for already-open tabs when they are not explicitly opening a tab;
-- closing a preview tab removes only the workspace tab, not the mount or immutable artifacts.
+- `GET /api/preview/mount` bootstrap, `preview-changed` SSE events, and mount metadata refreshes patch metadata only for already-open tabs;
+- closing a preview tab removes only the workspace tab, not the live mount or immutable artifacts.
 
-This split prevents a browser refresh from resurrecting a preview tab just because a preview mount still exists.
+This split prevents navigation, reload, restart, or reconnect from resurrecting a preview tab just because a preview mount still exists. A later explicit preview Open action can reopen it.
 
-### Proposal and review lifecycle
+### Proposal lifecycle
 
-Proposal events and explicit proposal reopen affordances call the workspace open API. Current proposal tabs are keyed by proposal type (`proposal:goal`, `proposal:project`, etc.); a new current revision updates/focuses the same tab. Historical proposal revisions use `proposal:<type>:rev:<N>` and are created only by explicit historical/reopen UI.
+Proposal content and proposal tab presence are separate. The proposal slot/cache is the source of truth for editable content; the server workspace is the source of truth for whether the side-panel tab is open.
 
-Review tabs are keyed by stable document id, not title. `openMarkdownReviewDocument()` creates or preserves the document id, caches the content, and opens `review:<documentId>`. Restoring cached review documents restores content state only; it does not open tabs unless the server workspace already contains those tabs.
+Current proposal tabs are keyed by proposal type (`proposal:goal`, `proposal:project`, etc.); an allowed explicit reveal updates/focuses that same tab. Historical proposal revisions use `proposal:<type>:rev:<N>` and are created only by explicit historical/reopen UI.
+
+Source rules:
+
+- non-explicit `rehydrate` events and ordinary `edit` events update proposal content only; they must not create or focus a workspace tab;
+- fresh explicit sources (`tool`, `seed`, `restore`, and legacy proposal discovery) may create or focus the current proposal tab;
+- explicit Open Proposal / Resubmit Proposal chat-renderer actions may reopen a closed proposal tab;
+- opening a historical revision is always an explicit reopen action and uses the revisioned tab id.
+
+Proposal close paths are durable workspace deletes. The tab close button, Dismiss, Create/Accept, and registered-project Apply Changes all remove the current proposal tab from the server workspace. Draft files, accepted/saved-state caches, form mirrors, and subsequent content-only rehydrates must not recreate that closed tab.
+
+### Review lifecycle
+
+Review tabs are keyed by stable document id, not title. `openMarkdownReviewDocument()` creates or preserves the document id, caches the content, and explicitly opens `review:<documentId>`.
+
+Restoring cached or persisted review documents restores content only for review tabs that already exist in the server workspace. If a review tab was closed, the cached document and annotations may remain available for an explicit review reopen, but hydration must not recreate the tab from cache alone.
 
 ### Pack panel lifecycle
 
@@ -198,6 +214,9 @@ Useful checks:
 - `revision` should increase after every committed mutation;
 - duplicate artifact pack panels should differ by `source.instanceKey`;
 - review tab ids should include document ids, not mutable titles;
-- stale localStorage should not change the workspace after `migratedFromLocalStorageAt` is set.
+- stale localStorage should not change the workspace after `migratedFromLocalStorageAt` is set;
+- preview restart restore should show the active preview tab in the workspace after gateway restart, and a user-closed preview tab should stay absent even while `GET /api/preview/mount` still succeeds.
 
-Related docs: [architecture.md](architecture.md#side-panel-workspace), [preview-architecture.md](preview-architecture.md#side-panel-workspace-integration), [extension-host-authoring.md](extension-host-authoring.md#panels--persistent-side-panels-hostuiopenpanel), [rest-api.md](rest-api.md#side-panel-workspace), and [websocket-protocol.md](websocket-protocol.md#server--client).
+Regression coverage: `tests/e2e/ui/preview-durable-restart.spec.ts`.
+
+Related docs: [architecture.md](architecture.md#side-panel-workspace), [preview-architecture.md](preview-architecture.md#restart-restore), [extension-host-authoring.md](extension-host-authoring.md#panels--persistent-side-panels-hostuiopenpanel), [rest-api.md](rest-api.md#side-panel-workspace), and [websocket-protocol.md](websocket-protocol.md#server--client).

@@ -29,6 +29,10 @@
  *                           bash_bg.wait toolCall in an assistant
  *                           message_end with NO `id` field, parks for
  *                           <ms> ms, then closes. No real bg process.
+ *  BG_WAIT_END_ONLY:<ms>    Emits one bash_bg.wait toolCall in an
+ *                           assistant message_end with no preceding
+ *                           message_update, then parks for <ms> ms.
+ *                           Reproduces the hidden-until-refresh card bug.
  *
  * Bursts
  * ------
@@ -301,7 +305,7 @@ export class MockAgentCore {
 		if (text.includes("GOAL_PROPOSAL_PARITY_EDIT")) {
 			return {
 				tool: "propose_goal",
-				input: { title: "Parity Goal A — edited", spec: "Body B." },
+				input: { title: "Parity Goal A — edited", workflow: "general", spec: "Body B." },
 				output: "Goal proposal partial submitted.",
 			};
 		}
@@ -419,6 +423,43 @@ export class MockAgentCore {
 			};
 		}
 
+		// Goal proposal carrying a parentGoalId (a child-goal proposal) — used by
+		// subgoals-experimental-toggle.spec.ts to assert the Sub-goals tab is a
+		// pure function of the system flag and does NOT appear merely because the
+		// proposal has a parent. Must precede the generic goal_proposal matcher
+		// (it contains the "GOAL_PROPOSAL" substring).
+		if (text.includes("GOAL_PROPOSAL_WITH_PARENT")) {
+			return {
+				tool: "propose_goal",
+				input: {
+					title: "Child Goal",
+					workflow: "general",
+					spec: "A child-goal proposal seeded with a parentGoalId.",
+					parentGoalId: "some-parent-id",
+				},
+				output: "Proposal submitted. Waiting for user response.",
+			};
+		}
+
+		// Goal proposal carrying the per-goal worktree-setup fields — used by
+		// goal-worktree-setup-command.spec.ts to assert a propose_goal-seeded
+		// proposal mirrors worktreeSetupCommand / worktreeSetupTimeoutMs into the
+		// goal form and preserves them through acceptance. Must precede the generic
+		// goal_proposal matcher (it contains the "GOAL_PROPOSAL" substring).
+		if (text.includes("GOAL_PROPOSAL_WORKTREE_SETUP")) {
+			return {
+				tool: "propose_goal",
+				input: {
+					title: "E2E Test Goal",
+					workflow: "general",
+					spec: "A goal whose worktree-setup fields are seeded by the agent.",
+					worktreeSetupCommand: "./scripts/agent-seed.sh",
+					worktreeSetupTimeoutMs: 45000,
+				},
+				output: "Proposal submitted. Waiting for user response.",
+			};
+		}
+
 		if (lower.includes("goal_proposal") || lower.includes("goal proposal")) {
 			return {
 				tool: "propose_goal",
@@ -453,6 +494,14 @@ export class MockAgentCore {
 					input: { title: d.title, markdown: d.markdown },
 					output: JSON.stringify({ action: "review_open", title: d.title, markdown: d.markdown, replace: true }),
 				})),
+			};
+		}
+		if (lower.includes("review_open_revised")) {
+			const md = "# Test Document\n\nRevised review document after rejection.\n\n## Revised Section\n\nRevised markdown after rejected feedback should reopen the review pane.";
+			return {
+				tool: "review_open",
+				input: { title: "Test Document", markdown: md },
+				output: JSON.stringify({ action: "review_open", title: "Test Document", markdown: md, replace: true }),
 			};
 		}
 		if (lower.includes("review_open")) {
@@ -772,6 +821,38 @@ export class MockAgentCore {
 			this.emit({ type: "message_end", message: assistantMsg });
 			// Park here — no further events until waitMs elapses, mirroring a real
 			// `bash_bg.wait` that sits indefinitely.
+			await this.tick(waitMs);
+			if (!this.currentAbortController || this.currentAbortController.signal.aborted) {
+				this.currentAbortController = null;
+				return;
+			}
+			this.emit({ type: "tool_execution_end", toolCallId: toolId, toolName: "bash_bg", isError: false });
+			this.currentAbortController = null;
+			this.emit({ type: "agent_end" });
+			this.emit({ type: "session_status", status: "idle" });
+			return;
+		}
+
+		// BG_WAIT_END_ONLY:<ms> — emit an assistant message_end with a
+		// bash_bg.wait toolCall but no preceding message_update. This reproduces
+		// the live UI hole where RemoteAgent hides the finalized row via
+		// streamingMessageId, but the streaming container has no message to own
+		// until a later refresh/snapshot/agent_end clears the transient id.
+		const bgWaitEndOnlyMatch = text.match(/BG_WAIT_END_ONLY:(\d+)/);
+		if (bgWaitEndOnlyMatch) {
+			const waitMs = parseInt(bgWaitEndOnlyMatch[1], 10);
+			const toolId = "tc-bg-wait-end-only-1";
+			const assistantMsg = {
+				id: "msg-bg-wait-end-only-1",
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: toolId, name: "bash_bg", arguments: { action: "wait", id: "bg-end-only-1" }, input: { action: "wait", id: "bg-end-only-1" } },
+				],
+			};
+			this.conversationMessages.push(assistantMsg);
+			this.emit({ type: "message_end", message: assistantMsg });
+			// Park here — no further events until waitMs elapses, mirroring a real
+			// `bash_bg.wait` that remains pending long enough for live UI assertions.
 			await this.tick(waitMs);
 			if (!this.currentAbortController || this.currentAbortController.signal.aborted) {
 				this.currentAbortController = null;
@@ -2272,6 +2353,8 @@ export class MockAgentCore {
 				// forked/continued sessions would open empty in the E2E tier (the
 				// real CLI loads it; the mock previously no-op'd here). The file is
 				// written by `get_state` as newline-delimited {type:"message",message}.
+				// The real CLI also validates runtime cwd metadata before accepting the
+				// transcript; stale archived worktree paths must fail here.
 				try {
 					const sp = msg.sessionPath;
 					if (sp && fs.existsSync(sp)) {
@@ -2281,6 +2364,9 @@ export class MockAgentCore {
 							if (!trimmed) continue;
 							try {
 								const parsed = JSON.parse(trimmed);
+								if (parsed && (parsed.type === "system" || parsed.type === "session") && typeof parsed.cwd === "string" && !fs.existsSync(parsed.cwd)) {
+									return { success: false, error: `Stored session working directory does not exist: ${parsed.cwd}` };
+								}
 								if (parsed && parsed.type === "message" && parsed.message) loaded.push(parsed.message);
 							} catch { /* skip malformed line */ }
 						}

@@ -1,4 +1,4 @@
-import { completeSimple, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { complete, completeSimple, getModel, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { execSync } from "node:child_process";
 import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
@@ -7,6 +7,7 @@ import { globalAgentDir, globalAuthPath } from "../bobbit-dir.js";
 import type { PreferencesStore } from "./preferences-store.js";
 import { getAvailableModels, type ApiModel, type CustomProviderConfig } from "./model-registry.js";
 import { ensurePiAiBedrockHeadersPatch } from "./pi-ai-bedrock-headers-patch.js";
+import { GOOGLE_GEMINI_CLI_PROVIDER, codeAssistComplete } from "./google-code-assist.js";
 
 ensurePiAiBedrockHeadersPatch();
 
@@ -150,6 +151,23 @@ export async function completeModelText(
 	},
 	completeFn: CompleteSimpleFn = completeSimple,
 ): Promise<string> {
+	// Google account (Code Assist / OAuth) models speak a different wire protocol
+	// than pi-ai's API-key `google` provider, so route them through the Bearer
+	// Code Assist adapter instead of completeSimple. The API-key `google` provider
+	// path below is unchanged.
+	if (model.provider === GOOGLE_GEMINI_CLI_PROVIDER) {
+		return codeAssistComplete({
+			model: model.id,
+			systemPrompt: args.systemPrompt,
+			userPrompt: args.userPrompt,
+			maxTokens: args.maxTokens ?? 500,
+			...(args.thinkingLevel ? { thinkingLevel: args.thinkingLevel } : {}),
+			// Honor the caller's deadline so Code Assist completions can't hang past
+			// it; mirrors the timeoutMs handed to pi-ai for normal providers below.
+			timeoutMs: args.timeoutMs ?? 30_000,
+		});
+	}
+
 	const apiKey = await resolveProviderApiKey(prefs, model.provider);
 	const providerHeaders = resolveProviderHeaders(model.provider);
 	const options: Record<string, any> = {
@@ -173,6 +191,38 @@ export async function completeModelText(
 		throw new Error((result as any).errorMessage || "Model returned an error");
 	}
 	return assistantText(result);
+}
+
+export async function testProviderApiKey(
+	provider: string,
+	modelId: string,
+	apiKey: string,
+): Promise<{ ok: boolean; modelResolved?: string; latencyMs?: number; error?: string; status?: number }> {
+	if (!provider || !modelId || !apiKey.trim()) {
+		return { ok: false, status: 400, error: "Missing provider, modelId, or key" };
+	}
+	const model = getModel(provider as any, modelId) as Model<Api> | undefined;
+	if (!model) {
+		return { ok: false, status: 404, error: `Model "${provider}/${modelId}" is not in the built-in pi-ai catalog.` };
+	}
+
+	const started = Date.now();
+	try {
+		const result = await complete(model as any, {
+			messages: [{ role: "user", content: "Reply with: OK", timestamp: Date.now() }],
+		}, {
+			apiKey,
+			maxTokens: 5,
+			timeoutMs: 15_000,
+			maxRetries: 0,
+		} as any);
+		if ((result as any).stopReason === "error") {
+			throw new Error((result as any).errorMessage || "Model returned an error");
+		}
+		return { ok: true, modelResolved: model.id, latencyMs: Date.now() - started };
+	} catch (err: any) {
+		return { ok: false, modelResolved: model.id, latencyMs: Date.now() - started, error: err?.message || "Request failed" };
+	}
 }
 
 export async function testModelPreference(

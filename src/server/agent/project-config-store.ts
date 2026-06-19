@@ -221,12 +221,18 @@ export interface DisabledRefs {
 	tools?: string[];
 	skills?: string[];
 	entrypoints?: string[];
+	providers?: string[];
+	hooks?: string[];
+	mcp?: string[];
+	piExtensions?: string[];
+	runtimes?: string[];
+	workflows?: string[];
 }
 
 /** scope → packName → disabled entity refs by kind. Default (absent) = all enabled. */
 export type PackActivationMap = Partial<Record<PackOrderScope, Record<string, DisabledRefs>>>;
 
-const ACTIVATION_KINDS = ["roles", "tools", "skills", "entrypoints"] as const;
+const ACTIVATION_KINDS = ["roles", "tools", "skills", "entrypoints", "providers", "hooks", "mcp", "piExtensions", "runtimes", "workflows"] as const;
 
 function normalizePackOrder(raw: unknown): { value: PackOrderMap; ok: boolean } {
 	if (!isPlainObject(raw)) return { value: {}, ok: false };
@@ -310,6 +316,7 @@ const DEFAULTS: Record<string, string> = {
 	test_unit_command: "npm run test:unit",
 	test_e2e_command: "npm run test:e2e",
 	worktree_setup_command: "",  // Empty = no setup runs on new worktrees
+	worktree_setup_timeout_ms: "",  // Empty = default 120000ms. Project-level default for worktree setup command timeout (goal override > this > 120000).
 	base_ref: "",                      // Empty = today's behaviour (resolveRemotePrimary, typically origin/master). Else a branch ref — local ("master") or remote ("origin/develop"). See docs/design/base-ref.md.
 	sandbox: "none",                    // "none" | "docker"
 	sandbox_image: "bobbit-agent",      // Docker image name

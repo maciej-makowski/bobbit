@@ -6,7 +6,7 @@ import { icon } from "@mariozechner/mini-lit";
 import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { html, render } from "lit";
 import { repeat } from "lit/directives/repeat.js";
-import Sortable from "sortablejs";
+import type Sortable from "sortablejs";
 import { shortcutHint } from "./shortcut-registry.js";
 import { AlertTriangle, Archive, ArrowLeft, ExternalLink, FileText, FolderOpen, FolderPlus, Link, MessagesSquare, ChevronDown, Goal as GoalIcon, PanelRightClose, PanelRightOpen, Pencil, Plus, QrCode, RotateCw, Server, Settings, Store, Trash2, Unplug, Users, Workflow as WorkflowIcon, Wrench, X, Zap } from "lucide";
 import {
@@ -46,7 +46,7 @@ export { setSelectedWorkflowId } from "./proposal-panels-lazy.js";
 // chunk is shared across all UI surfaces that open dialogs.
 import { openGatewayDialog, showQrCodeDialog, showRenameDialog, showGoalDialog, showProjectDialog } from "./dialogs-lazy.js";
 import { startNewGoalFlow } from "./goal-entry.js";
-import { renderSidebar, toggleRolePicker, renderRolePickerDropdown, isProjectExpanded, toggleProjectExpanded, filterStaffByQuery, renderStaffSidebarSection, isProjectReordering, projectOrderForRender, renderProjectReorderHandle, renderProjectReorderLiveRegion } from "./sidebar.js";
+import { renderSidebar, toggleRolePicker, renderRolePickerDropdown, isProjectExpanded, toggleProjectExpanded, filterStaffByQuery, renderStaffSidebarSection, isProjectReordering, projectOrderForRender, renderProjectReorderHandle, renderProjectReorderLiveRegion, handleSidebarSearchInput, handleSidebarSearchClear, renderArchivedSearchControls } from "./sidebar.js";
 import { computeSpawnedClaim } from "./sidebar-spawned-children.js";
 import { isClientDebugEnabled, dumpClientDebugToComposer, registerDebugSection } from "./client-debug.js";
 import { fetchArchivedGoalsPaginated, fetchArchivedSessionsPaginated } from "./api.js";
@@ -215,8 +215,19 @@ window.addEventListener("bobbit-open-review-document", (e: Event) => {
 import { teardownMobileScrollTracking, ensureMobileScrollTracking } from "./mobile-header.js";
 import { getRouteFromHash, setHashRoute, isRouteActive, toggleConfigPage } from "./routing.js";
 import { lookupPackRoute } from "./pack-entrypoints.js";
-import { bobbitLoadingAnimation } from "../ui/components/BobbitLoadingAnimation.js";
 import "./config-scope.css";
+
+function bobbitLoadingAnimation() {
+	return html`
+		<div class="flex items-center justify-center w-full h-full" style="background: var(--background);">
+			<div
+				class="rounded-full animate-spin"
+				style="width: 2rem; height: 2rem; border: 2px solid color-mix(in oklch, var(--muted-foreground) 22%, transparent); border-top-color: var(--primary);"
+				aria-label="Loading"
+			></div>
+		</div>
+	`;
+}
 
 // ---------------------------------------------------------------------------
 // Lazy route page loader — see docs/design/ui-bundle-size-reduction.md (Task A)
@@ -334,17 +345,6 @@ function renderClientDebugButton() {
 
 /** Compact session row for mobile — mirrors sidebar row with always-visible buttons */
 
-// Mobile search handlers (shared logic with sidebar but separate scope)
-function _handleMobileSearchInput(query: string): void {
-	state.searchQuery = query;
-	renderApp();
-}
-
-function _handleMobileSearchClear(): void {
-	state.searchQuery = "";
-	renderApp();
-}
-
 function renderMobileLanding() {
 	const sidebarData = getSidebarData();
 	let { ungroupedSessions, liveGoals } = sidebarData;
@@ -435,8 +435,8 @@ function renderMobileLanding() {
 				<search-box
 					.query=${state.searchQuery}
 					.showControls=${!!state.searchQuery}
-					@search-input=${(e: CustomEvent) => { _handleMobileSearchInput(e.detail.query); }}
-					@search-clear=${() => { _handleMobileSearchClear(); }}
+					@search-input=${(e: CustomEvent) => { handleSidebarSearchInput(e.detail.query); }}
+					@search-clear=${() => { handleSidebarSearchClear(); }}
 					@full-search-click=${(e: CustomEvent) => { setHashRoute("search", e.detail.query); }}
 				></search-box>
 				${state.sessionsLoading
@@ -601,6 +601,7 @@ function renderMobileLanding() {
 												</div>
 											`;
 										})}
+										${renderArchivedSearchControls()}
 										${state.showArchived && !state.searchQuery && (state.archivedGoalsHasMore || state.archivedSessionsHasMore) ? html`
 											<div class="border-t border-border/30 my-1 mx-2"></div>
 											<div class="flex flex-col gap-0.5 px-2">
@@ -780,10 +781,14 @@ let mobileSelectedSideTabId = "";
 // lit-html doesn't fight Sortable's DOM mutations; on drop we read the new
 // DOM order and commit it back to state.
 //
-// SortableJS itself is split into its own vendor chunk (see vite.config.ts
-// manualChunks) so the ~46 kB / ~13 kB gz body lands outside the entry chunk.
+// SortableJS itself is loaded on first tab-bar render so the ~70 kB raw drag
+// library stays out of the eager app-shell SCC pinned by tests/bundle-size.test.ts.
+type SortableConstructor = typeof Sortable;
+let SortableCtor: SortableConstructor | null = null;
+let sortableLoadStarted = false;
 let panelSortable: Sortable | null = null;
 let panelSortableContainer: HTMLElement | null = null;
+let panelSortablePendingContainer: HTMLElement | null = null;
 let draggingPanelTabId = "";
 // When true, the current drag at any point tried to land on/before a pinned
 // tab. SortableJS's onMove returns false for that single candidate target, but
@@ -810,7 +815,7 @@ let panelDragLockRaf = 0;
 function startPanelDragYLock(): void {
 	cancelAnimationFrame(panelDragLockRaf);
 	const tick = () => {
-		const ghost = (Sortable as unknown as { ghost: HTMLElement | null }).ghost;
+		const ghost = (SortableCtor as unknown as { ghost: HTMLElement | null } | null)?.ghost;
 		if (ghost && ghost.style.transform) {
 			const t = ghost.style.transform;
 			const m = /matrix\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)/.exec(t);
@@ -1421,6 +1426,22 @@ function revertPanelTabDomOrder(host: HTMLElement, expectedIds: string[]): void 
 	}
 }
 
+function loadPanelSortable(): void {
+	if (SortableCtor || sortableLoadStarted) return;
+	sortableLoadStarted = true;
+	void import("sortablejs")
+		.then((mod) => {
+			SortableCtor = (mod as unknown as { default?: SortableConstructor }).default ?? (mod as unknown as SortableConstructor);
+			const pending = panelSortablePendingContainer;
+			panelSortablePendingContainer = null;
+			if (pending?.isConnected) ensurePanelSortable(pending);
+		})
+		.catch((err) => {
+			sortableLoadStarted = false;
+			console.warn("[render] failed to load SortableJS", err);
+		});
+}
+
 // Attach a SortableJS instance to the unified tab bar's inner container. Idempotent:
 // if the container DOM node is the same as last time, we keep the existing instance.
 // If the container was replaced (e.g. workspace switched sessions), we destroy the
@@ -1435,11 +1456,17 @@ function revertPanelTabDomOrder(host: HTMLElement, expectedIds: string[]): void 
 //   - onEnd: read the new DOM order, commit to state, resume renders
 function ensurePanelSortable(container: HTMLElement | null): void {
 	if (!container) {
+		panelSortablePendingContainer = null;
 		if (panelSortable) {
 			panelSortable.destroy();
 			panelSortable = null;
 			panelSortableContainer = null;
 		}
+		return;
+	}
+	if (!SortableCtor) {
+		panelSortablePendingContainer = container;
+		loadPanelSortable();
 		return;
 	}
 	if (panelSortableContainer === container && panelSortable) return;
@@ -1449,7 +1476,7 @@ function ensurePanelSortable(container: HTMLElement | null): void {
 	}
 	panelSortableContainer = container;
 
-	panelSortable = Sortable.create(container, {
+	panelSortable = SortableCtor.create(container, {
 		animation: 180,
 		easing: "cubic-bezier(0.2, 0.8, 0.2, 1)",
 		draggable: ".goal-tab-pill",
@@ -1496,7 +1523,7 @@ function ensurePanelSortable(container: HTMLElement | null): void {
 			// opacity: 0.8 (we want it to look like a real tab, not a ghost),
 			// while the source tab (.goal-tab-pill--ghost) becomes invisible —
 			// the user should perceive the tab itself moving, not a clone.
-			const ghost = (Sortable as unknown as { ghost: HTMLElement | null }).ghost;
+			const ghost = (SortableCtor as unknown as { ghost: HTMLElement | null } | null)?.ghost;
 			if (ghost) ghost.classList.add("goal-tab-pill--floating");
 		},
 		onEnd: (evt) => {
@@ -2122,28 +2149,27 @@ export function doRenderApp(): void {
 	// which forces the iframe to reload via the `#mtime=<n>` hash.
 	const htmlPreviewContent = () => {
 		const sid = activeSessionId() || "";
-		const v = state.previewPanelMtime || 0;
-		// Derive artifactId and entry from the active panel tab rather than
-		// mirroring them in global state. Many code paths (SSE preview-changed,
-		// bootstrap fetch, PreviewRenderer, session-manager) update
-		// `previewPanelEntry` without knowing about artifactId; reading directly
-		// from the active tab keeps entry+artifactId always paired.
+		// Derive artifactId, entry, and mtime from the active panel tab rather than
+		// requiring global preview mirrors to be populated. After a gateway restart,
+		// the server-persisted workspace tab can be restored before the session's
+		// transient previewPanelEntry mirror is repopulated.
 		const activeId = activeSidePanelTabIdForSession(state, workspaceSessionId());
 		const panelTabs = unifiedPanelContentTabs();
 		const activeTab = panelTabs.find((t) => t.id === activeId);
 		let artifactId = "";
-		let entry = state.previewPanelEntry || "inline.html";
+		let entry = state.previewPanelEntry || "";
+		let tabMtime = 0;
 		if (activeTab && activeTab.kind === "preview") {
 			const tabState = (activeTab.state || {}) as Record<string, unknown>;
 			const source = activeTab.source as Record<string, unknown>;
+			const tabEntry = previewEntryFromTab(activeTab);
+			if (tabEntry) entry = tabEntry;
+			if (typeof tabState.mtime === "number" && Number.isFinite(tabState.mtime)) tabMtime = tabState.mtime;
 			const isLiveTab = isLivePreviewTab(activeTab);
-			if (!isLiveTab) {
-				artifactId = recordValue(tabState, "artifactId") || recordValue(source, "artifactId");
-				const tabEntry = previewEntryFromTab(activeTab);
-				if (tabEntry) entry = tabEntry;
-			}
+			if (!isLiveTab) artifactId = recordValue(tabState, "artifactId") || recordValue(source, "artifactId");
 		}
-		if (!sid || !state.previewPanelEntry) {
+		const v = state.previewPanelMtime || tabMtime || 0;
+		if (!sid || !entry) {
 			// Empty-state until the first SSE `preview-changed` event lands.
 			return html`
 				<div class="flex-1 min-h-0 flex items-center justify-center text-muted-foreground text-sm">
@@ -2319,7 +2345,7 @@ export function doRenderApp(): void {
 	`;
 
 	const sidePanelActionButtons = (tab: UnifiedContentTab) => html`
-		${tab.kind === "preview" && state.previewPanelEntry ? previewControlButtons(tab) : ""}
+		${tab.kind === "preview" && (previewEntryFromTab(tab) || state.previewPanelEntry) ? previewControlButtons(tab) : ""}
 	`;
 
 	const sidePanelWindowControls = (tab: UnifiedContentTab, mode: SidePanelSizeMode) => {
@@ -2337,7 +2363,7 @@ export function doRenderApp(): void {
 				${icon(PanelRightOpen, "sm")}
 			</button>
 		`}
-		<a
+		${tab.kind !== "preview" ? html`<a
 			href=${sidePanelPopoutUrl(tab)}
 			target="_blank"
 			rel="noopener noreferrer"
@@ -2345,7 +2371,7 @@ export function doRenderApp(): void {
 			style=${sidePanelChromeButtonStyle}
 			title="Open side panel in new tab"
 			data-testid="side-panel-popout"
-		>${icon(ExternalLink, "sm")}</a>
+		>${icon(ExternalLink, "sm")}</a>` : ""}
 		<button @click=${() => setSidePanelModeAndRender("collapsed")} class=${sidePanelChromeButtonClass} style=${sidePanelChromeButtonStyle} title=${`Collapse side panel${shortcutHint("toggle-preview")}`} data-testid="side-panel-collapse">
 			${icon(PanelRightClose, "sm")}
 		</button>

@@ -17,7 +17,7 @@ import type { SessionInfo } from "./session-manager.js";
 import { emitSessionEvent, broadcastStatus } from "./session-manager.js";
 import type { RpcBridgeOptions } from "./rpc-bridge.js";
 import { RpcBridge } from "./rpc-bridge.js";
-import { sanitizeAgentTranscriptFile } from "./transcript-sanitizer.js";
+import { rebaseAgentTranscriptCwdMetadataFile, sanitizeAgentTranscriptFile } from "./transcript-sanitizer.js";
 import { EventBuffer } from "./event-buffer.js";
 import { PromptQueue } from "./prompt-queue.js";
 import { applyPromptConditionals } from "./prompt-conditionals.js";
@@ -33,12 +33,16 @@ import type { McpManager } from "../mcp/mcp-manager.js";
 import type { SandboxManager } from "./sandbox-manager.js";
 import type { PromptParts, NestingContext } from "./system-prompt.js";
 import type { PrStatusStore } from "./pr-status-store.js";
+import type { LifecycleHub } from "./lifecycle-hub.js";
+import type { ContextBlock } from "./context-blocks.js";
 
 import type { ConfigCascade } from "./config-cascade.js";
 import { getAssistantDef } from "./assistant-registry.js";
 import { buildReattemptContext } from "./goal-assistant.js";
 import { computeToolActivationArgs, writeMcpProxyExtensions, writeToolGuardExtension, computeEffectiveAllowedTools, type EffectiveTool } from "./tool-activation.js";
-import { createWorktree, cleanupWorktree } from "../skills/git.js";
+import { hasProviderBridgeHooks, writeProviderBridgeExtension } from "./provider-bridge-extension.js";
+import { createWorktree, cleanupWorktree, isUnresolvedHeadWorktreeError } from "../skills/git.js";
+import { isWorktreePathReferencedByLiveSession, type WorktreeReferenceRecord } from "./worktree-reference-guard.js";
 
 import { TOOLS_DIR } from "./tool-manager.js";
 import { profile, profileAsync, recordElapsed } from "./profiling.js";
@@ -168,6 +172,7 @@ export interface SessionSetupPlan {
 	bridgeOptions: RpcBridgeOptions;
 	effectiveAllowedTools?: EffectiveTool[];
 	promptPath?: string;
+	dynamicContextBlocks?: ContextBlock[];
 
 	// Options passed through from caller
 	agentArgs?: string[];
@@ -205,6 +210,11 @@ export interface SessionSetupPlan {
 	 * CLI rehydrates from it (same mechanism `restoreSession` uses).
 	 */
 	preExistingAgentSessionFile?: string;
+	/**
+	 * Continue/Fork rehydration: archived/provenance cwd values that may appear in
+	 * runtime-only transcript system metadata and should be rewritten to plan.cwd.
+	 */
+	preExistingAgentSessionOldCwds?: string[];
 }
 
 /**
@@ -226,10 +236,12 @@ export interface PipelineContext {
 	sessionSecretStore: import("../auth/session-secret.js").SessionSecretStore;
 	groupPolicyStore: ToolGroupPolicyStore | null;
 	configCascade: ConfigCascade | null;
+	lifecycleHub?: LifecycleHub;
 	costTracker: CostTracker;
 	store: SessionStore;
 	searchIndex: SearchService;
 	sessions: Map<string, SessionInfo>;
+	listPersistedSessionsForWorktreeGuard?: () => WorktreeReferenceRecord[];
 	assemblePrompt: (id: string, parts: PromptParts) => string | undefined;
 
 	applySandboxWiring: (opts: RpcBridgeOptions, id: string, sandboxOpts?: SandboxWiringOptions) => Promise<boolean>;
@@ -301,7 +313,7 @@ export function nextBackoffDelay(
 
 export async function withRetry<T>(
 	fn: () => Promise<T>,
-	opts: { retries: number; delays: number[]; label: string; sessionId: string },
+	opts: { retries: number; delays: number[]; label: string; sessionId: string; nonRetryable?: (err: Error) => boolean },
 ): Promise<T> {
 	let lastError: Error | undefined;
 	for (let attempt = 0; attempt <= opts.retries; attempt++) {
@@ -309,6 +321,7 @@ export async function withRetry<T>(
 			return await fn();
 		} catch (err) {
 			lastError = err as Error;
+			if (opts.nonRetryable?.(lastError)) throw lastError;
 			if (attempt < opts.retries) {
 				const delay = opts.delays[attempt] ?? opts.delays[opts.delays.length - 1];
 				console.warn(
@@ -467,6 +480,24 @@ function lookupRole(name: string, plan: SessionSetupPlan, ctx: PipelineContext):
 	return ctx.roleManager?.getRole(name);
 }
 
+export async function resolveDynamicContext(plan: SessionSetupPlan, ctx: PipelineContext): Promise<void> {
+	if (!ctx.lifecycleHub) return;
+	try {
+		const { blocks } = await ctx.lifecycleHub.dispatch("sessionSetup", {
+			sessionId: plan.id,
+			projectId: plan.projectId,
+			scope: plan.projectId ? "project" : "global",
+			cwd: plan.cwd,
+			goalId: plan.goalId,
+			roleName: plan.roleName,
+			prompt: plan.instructions,
+		});
+		plan.dynamicContextBlocks = blocks;
+	} catch (err) {
+		console.error(`[session-setup] sessionSetup dynamic context failed for ${plan.id}:`, err);
+	}
+}
+
 /** Step 4: Assemble system prompt (handles assistant, normal, delegate variants). */
 export function resolvePrompt(plan: SessionSetupPlan, ctx: PipelineContext): void {
 	return profile("resolvePrompt", () => _resolvePrompt(plan, ctx));
@@ -510,6 +541,7 @@ function _resolvePrompt(plan: SessionSetupPlan, ctx: PipelineContext): void {
 		}
 
 		const promptPath = ctx.assemblePrompt(plan.id, {
+			dynamicContext: plan.dynamicContextBlocks,
 			// Include the base system prompt so assistant sessions
 			// (goal/project/tool assistants) get it by default.
 			baseSystemPromptPath: ctx.systemPromptPath,
@@ -533,6 +565,7 @@ function _resolvePrompt(plan: SessionSetupPlan, ctx: PipelineContext): void {
 		}
 
 		const promptPath = ctx.assemblePrompt(plan.id, {
+			dynamicContext: plan.dynamicContextBlocks,
 			// Delegates still get the global base system prompt. The task spec is
 			// layered on top as goalSpec; AGENTS.md from the worktree is also included.
 			baseSystemPromptPath: ctx.systemPromptPath,
@@ -581,6 +614,7 @@ function _resolvePrompt(plan: SessionSetupPlan, ctx: PipelineContext): void {
 			: undefined;
 
 		const promptPath = ctx.assemblePrompt(plan.id, {
+			dynamicContext: plan.dynamicContextBlocks,
 			baseSystemPromptPath: ctx.systemPromptPath,
 			cwd: plan.cwd,
 			projectRoot: plan.repoPath,
@@ -655,6 +689,18 @@ function _resolveToolActivation(plan: SessionSetupPlan, ctx: PipelineContext): v
 	if (guardPath) {
 		plan.bridgeOptions.args.push("--extension", guardPath);
 	}
+
+	// Generate and add the provider-bridge extension (per-turn beforePrompt /
+	// beforeCompact hooks) ONLY when at least one enabled provider for this
+	// session's project declares those hooks. When no provider is interested the
+	// bridge is never written or passed to pi — preserving zero overhead and
+	// keeping spawn args byte-identical to the no-provider baseline.
+	if (ctx.lifecycleHub && hasProviderBridgeHooks(ctx.lifecycleHub, plan.projectId)) {
+		const bridgePath = writeProviderBridgeExtension(plan.id);
+		if (bridgePath) {
+			plan.bridgeOptions.args.push("--extension", bridgePath);
+		}
+	}
 }
 
 // ── Event subscription ─────────────────────────────────────────────────────
@@ -722,6 +768,7 @@ export async function executePlan(plan: SessionSetupPlan, ctx: PipelineContext):
 	resolveBridgeOptions(plan, ctx);
 	resolveGoalExtensions(plan, ctx);
 	resolveTools(plan, ctx);
+	await resolveDynamicContext(plan, ctx);
 	resolvePrompt(plan, ctx);
 	resolveToolActivation(plan, ctx);
 	recordElapsed("executePlan.resolveConfig", performance.now() - __t0);
@@ -741,7 +788,7 @@ export async function executePlan(plan: SessionSetupPlan, ctx: PipelineContext):
 				sandboxBaseBranch: plan.sandboxBaseBranch,
 				sandboxCwdOffset: plan.sandboxCwdOffset,
 			}),
-			{ retries: 1, delays: [1000], label: "wireSandbox", sessionId: plan.id },
+			{ retries: 1, delays: [1000], label: "wireSandbox", sessionId: plan.id, nonRetryable: isUnresolvedHeadWorktreeError },
 		).then(applied => {
 			if (!applied) throw new Error("Sandbox is not configured as docker");
 		});
@@ -840,13 +887,19 @@ export async function executeWorktreeAsync(
 				}));
 			}
 		} else {
-			worktreeCwd = await withRetry(
-				async () => {
-					const result = await createWorktree(plan.repoPath!, plan.branch!, { configuredBaseRef });
-					return result.worktreePath;
-				},
-				{ retries: 2, delays: [1000, 2000], label: "createWorktree", sessionId: plan.id },
-			);
+			try {
+				worktreeCwd = await withRetry(
+					async () => {
+						const result = await createWorktree(plan.repoPath!, plan.branch!, { configuredBaseRef });
+						return result.worktreePath;
+					},
+					{ retries: 2, delays: [1000, 2000], label: "createWorktree", sessionId: plan.id, nonRetryable: isUnresolvedHeadWorktreeError },
+				);
+			} catch (err) {
+				if (!isUnresolvedHeadWorktreeError(err)) throw err;
+				noWorktreeFallback = true;
+				console.warn(`[session-setup] ${err.message}; running without a worktree in ${plan.cwd}`);
+			}
 		}
 
 		// Per-component setup — non-fatal on failure. Routes through the canonical
@@ -913,6 +966,7 @@ export async function executeWorktreeAsync(
 	resolveBridgeOptions(plan, ctx);
 	resolveGoalExtensions(plan, ctx);
 	resolveTools(plan, ctx);
+	await resolveDynamicContext(plan, ctx);
 	resolvePrompt(plan, ctx);
 	resolveToolActivation(plan, ctx);
 
@@ -931,7 +985,7 @@ export async function executeWorktreeAsync(
 				sandboxBaseBranch: plan.sandboxBaseBranch,
 				sandboxCwdOffset: plan.sandboxCwdOffset,
 			}),
-			{ retries: 1, delays: [1000], label: "wireSandbox", sessionId: plan.id },
+			{ retries: 1, delays: [1000], label: "wireSandbox", sessionId: plan.id, nonRetryable: isUnresolvedHeadWorktreeError },
 		).then(applied => {
 			if (!applied) throw new Error("Sandbox is not configured as docker");
 		});
@@ -1037,10 +1091,20 @@ export async function executeWorktreeAsync(
 			ctx.store.update(session.id, { agentSessionFile: correctPath });
 		}
 
+		const transcriptFsCtx = { sandboxed: !!plan.sandboxed, projectId: plan.projectId };
+		if (plan.preExistingAgentSessionOldCwds?.length) {
+			await rebaseAgentTranscriptCwdMetadataFile(
+				transcriptFsCtx,
+				plan.preExistingAgentSessionFile,
+				ctx.sandboxManager,
+				{ oldCwds: plan.preExistingAgentSessionOldCwds, newCwd: plan.cwd },
+			);
+		}
+
 		// Un-poison any blank-text user messages in the cloned transcript before
 		// the agent rehydrates from it (best-effort, non-fatal).
 		await sanitizeAgentTranscriptFile(
-			{ sandboxed: !!plan.sandboxed, projectId: plan.projectId },
+			transcriptFsCtx,
 			plan.preExistingAgentSessionFile,
 			ctx.sandboxManager,
 		);
@@ -1059,8 +1123,10 @@ export async function executeWorktreeAsync(
 	// a kill (crash, taskkill, OS shutdown) in the gap between idle and the
 	// post-spawn fire-and-forget persist archives the session on next boot,
 	// because restoreOneSession() refuses to restore a session whose persisted
-	// agentSessionFile is empty. See tests/manual-integration/restart-minimal.spec.ts.
-	if (ctx.persistSessionMetadata) {
+	// agentSessionFile is empty. Pre-existing cloned transcripts are already
+	// recorded above; avoid get_state rewriting their runtime metadata. See
+	// tests/manual-integration/restart-minimal.spec.ts.
+	if (ctx.persistSessionMetadata && !plan.preExistingAgentSessionFile) {
 		try { await ctx.persistSessionMetadata(session); }
 		catch (err) { console.warn(`[session-setup] persistSessionMetadata pre-idle failed for ${session.id}:`, err); }
 	}
@@ -1161,8 +1227,17 @@ async function spawnAgent(plan: SessionSetupPlan, ctx: PipelineContext): Promise
 	// Continue-Archived: tell the agent CLI to rehydrate from the cloned JSONL
 	// before we persist or flip to idle. Same RPC the restart-resume path uses.
 	if (plan.preExistingAgentSessionFile) {
+		const transcriptFsCtx = { sandboxed: !!plan.sandboxed, projectId: plan.projectId };
+		if (plan.preExistingAgentSessionOldCwds?.length) {
+			await rebaseAgentTranscriptCwdMetadataFile(
+				transcriptFsCtx,
+				plan.preExistingAgentSessionFile,
+				ctx.sandboxManager,
+				{ oldCwds: plan.preExistingAgentSessionOldCwds, newCwd: plan.cwd },
+			);
+		}
 		await sanitizeAgentTranscriptFile(
-			{ sandboxed: !!plan.sandboxed, projectId: plan.projectId },
+			transcriptFsCtx,
 			plan.preExistingAgentSessionFile,
 			ctx.sandboxManager,
 		);
@@ -1181,9 +1256,10 @@ async function spawnAgent(plan: SessionSetupPlan, ctx: PipelineContext): Promise
 	ctx.sessions.set(session.id, session);
 
 	// Persist agentSessionFile BEFORE flipping status to idle so the session
-	// survives a hard kill in the post-spawn window. See worktree path for
-	// the full rationale.
-	if (ctx.persistSessionMetadata) {
+	// survives a hard kill in the post-spawn window. Pre-existing cloned
+	// transcripts are already recorded; avoid get_state rewriting their runtime
+	// metadata. See worktree path for the full rationale.
+	if (ctx.persistSessionMetadata && !plan.preExistingAgentSessionFile) {
 		try { await ctx.persistSessionMetadata(session); }
 		catch (err) { console.warn(`[session-setup] persistSessionMetadata pre-idle failed for ${session.id}:`, err); }
 	}
@@ -1293,7 +1369,12 @@ export function handleSetupFailure(
 
 	// 4. Background worktree cleanup (slow, non-blocking)
 	if (plan.worktreePath && plan.repoPath && plan.branch) {
-		cleanupWorktree(plan.repoPath, plan.worktreePath, plan.branch, true).catch(() => {});
+		const persistedSessions = ctx.listPersistedSessionsForWorktreeGuard?.() ?? ctx.store.getAll();
+		if (!isWorktreePathReferencedByLiveSession(plan.worktreePath, persistedSessions, { ignoreSessionId: session.id })) {
+			cleanupWorktree(plan.repoPath, plan.worktreePath, plan.branch, true).catch(() => {});
+		} else {
+			console.log(`[session-setup] Skipping setup-failure cleanup for shared worktree ${plan.worktreePath} (session ${session.id})`);
+		}
 	}
 
 	// 5. Clean up sandbox token for this session

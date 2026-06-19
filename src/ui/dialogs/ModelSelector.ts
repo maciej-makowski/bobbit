@@ -3,7 +3,7 @@ import { Badge } from "@mariozechner/mini-lit/dist/Badge.js";
 import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { DialogHeader } from "@mariozechner/mini-lit/dist/Dialog.js";
 import { DialogBase } from "@mariozechner/mini-lit/dist/DialogBase.js";
-import { type Model, modelsAreEqual } from "@earendil-works/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 import { html, type PropertyValues, type TemplateResult } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { createRef, ref } from "lit/directives/ref.js";
@@ -35,6 +35,11 @@ function writeHideUnauthedPref(value: boolean): void {
 	} catch {
 		/* localStorage unavailable (private mode / SSR) — filter is ephemeral */
 	}
+}
+
+function modelsAreEqual(a: Model<any> | null | undefined, b: Model<any> | null | undefined): boolean {
+	return !!a && !!b && a.provider === b.provider && a.id === b.id;
+
 }
 
 function claudeOpus4Minor(id: string): number | undefined {
@@ -249,11 +254,22 @@ export class ModelSelector extends DialogBase {
 		return String(tokens);
 	}
 
+	/**
+	 * A model the agent runtime cannot bind to a session (authenticated but
+	 * unrunnable, e.g. google-gemini-cli Code Assist). The server marks these with
+	 * `sessionSelectable === false`; the selector renders them disabled and never
+	 * selects them. Undefined/true means selectable.
+	 */
+	private isSessionUnavailable(model: any): boolean {
+		return model?.sessionSelectable === false;
+	}
+
 	private handleSelect(model: Model<any>) {
-		if (model) {
-			this.onSelectCallback?.(model);
-			this.close();
-		}
+		if (!model) return;
+		// Refuse to bind a session-unavailable model (guards both click and Enter).
+		if (this.isSessionUnavailable(model)) return;
+		this.onSelectCallback?.(model);
+		this.close();
 	}
 
 	private getFilteredModels(): Array<{ provider: string; id: string; model: any }> {
@@ -299,6 +315,12 @@ export class ModelSelector extends DialogBase {
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
 			if (aIsCurrent && !bIsCurrent) return -1;
 			if (!aIsCurrent && bIsCurrent) return 1;
+
+			// Push session-unavailable (authenticated-but-unrunnable) models to the bottom.
+			const aUnavail = this.isSessionUnavailable(a.model);
+			const bUnavail = this.isSessionUnavailable(b.model);
+			if (aUnavail && !bUnavail) return 1;
+			if (!aUnavail && bUnavail) return -1;
 
 			// Use authenticated field from server response
 			const aHasKey = a.model.authenticated ?? false;
@@ -404,13 +426,20 @@ export class ModelSelector extends DialogBase {
 						const isCurrent = modelsAreEqual(this.currentModel, model);
 						const isSelected = index === this.selectedIndex;
 						const hasKey = model.authenticated ?? false;
+						const sessionUnavailable = this.isSessionUnavailable(model);
+						const dimmed = sessionUnavailable || !hasKey;
+						const rowTitle = sessionUnavailable
+							? (model.sessionUnavailableReason
+								?? "This model can't be used in agent sessions yet.")
+							: (hasKey ? "" : "API key or account login required — set up in Settings → Account, or add a key under Settings → Models.");
 						return html`
 							<div
 								data-model-item
 								data-model-id=${id}
+								data-session-unavailable=${sessionUnavailable ? "true" : "false"}
 								class="px-4 py-3 ${
-									this.navigationMode === "mouse" ? "hover:bg-muted" : ""
-								} cursor-pointer border-b border-border ${isSelected ? "bg-accent" : ""} ${hasKey ? "" : "opacity-45"}"
+									this.navigationMode === "mouse" && !sessionUnavailable ? "hover:bg-muted" : ""
+								} ${sessionUnavailable ? "cursor-not-allowed" : "cursor-pointer"} border-b border-border ${isSelected ? "bg-accent" : ""} ${dimmed ? "opacity-45" : ""}"
 								@click=${() => this.handleSelect(model)}
 								@mouseenter=${() => {
 									// Only update selection in mouse mode
@@ -418,7 +447,7 @@ export class ModelSelector extends DialogBase {
 										this.selectedIndex = index;
 									}
 								}}
-								title=${hasKey ? "" : i18n("API key required — set up in Settings > Providers")}
+								title=${rowTitle}
 							>
 								<div class="flex items-center justify-between gap-2 mb-1">
 									<div class="flex items-center gap-2 flex-1 min-w-0">
@@ -426,7 +455,8 @@ export class ModelSelector extends DialogBase {
 										${isCurrent ? html`<span class="text-green-500">✓</span>` : ""}
 									</div>
 									<div class="flex items-center gap-1.5">
-										${!hasKey ? html`<span class="text-muted-foreground" title=${i18n("API key required")}>${icon(KeyRound, "sm")}</span>` : ""}
+										${sessionUnavailable ? Badge("Account only", "secondary") : ""}
+										${!hasKey && !sessionUnavailable ? html`<span class="text-muted-foreground" title=${"Authentication required"}>${icon(KeyRound, "sm")}</span>` : ""}
 										${Badge(provider, "outline")}
 									</div>
 								</div>
