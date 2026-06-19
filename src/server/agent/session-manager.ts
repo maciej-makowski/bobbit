@@ -31,6 +31,7 @@ import {
 	mergeCompactionSidecarIntoMessages,
 } from "./compaction-sidecar.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
+import { isWorktreePathReferencedByLiveSession, type WorktreeReferenceRecord } from "./worktree-reference-guard.js";
 import { BgProcessStore } from "./bg-process-store.js";
 import { SessionSecretStore } from "../auth/session-secret.js";
 import { shouldKeepDespiteOrphan, scanOrphanedTranscripts } from "./orphan-cleanup.js";
@@ -47,7 +48,7 @@ import type { ToolManager } from "./tool-manager.js";
 import { computeToolActivationArgs, writeMcpProxyExtensions, writeToolGuardExtension, computeEffectiveAllowedTools, tagAllowedTool, type EffectiveTool } from "./tool-activation.js";
 import { discoverSlashSkills, type SkillMarketContext } from "../skills/slash-skills.js";
 import { getProjectRoot } from "../bobbit-dir.js";
-import { shouldSkipRemotePush, detectPrimaryBranch, isGitRepo, getRepoRoot } from "../skills/git.js";
+import { shouldSkipRemotePush, shouldSkipRemoteGitForTests, detectPrimaryBranch, isGitRepo, getRepoRoot } from "../skills/git.js";
 import { eagerDeleteRemoteSessionBranch } from "./session-eager-branch-delete.js";
 import type { GrantPolicy } from "./role-store.js";
 import { applyModelString } from "./review-model-override.js";
@@ -292,6 +293,10 @@ export interface SessionInfo {
 	consecutiveErrorTurns?: number;
 	/** Pending auto-retry timer, so we can cancel it if the session terminates */
 	pendingAutoRetryTimer?: ReturnType<typeof setTimeout>;
+	/** Per-session lifecycle generation used to fence stale SessionInfo writers after restore/respawn. */
+	lifecycleGeneration?: number;
+	/** True once this SessionInfo has been replaced or is being replaced by a restore/respawn. */
+	lifecycleFenced?: boolean;
 	/** Whether tool calls were executed during the current/last turn */
 	turnHadToolCalls?: boolean;
 	/** Timestamp when the current streaming turn started */
@@ -301,6 +306,10 @@ export interface SessionInfo {
 	 * — polling for `status==idle` alone races with the pre-prompt idle
 	 * state, so observability of “a turn finished” needs its own counter. */
 	completedTurnCount?: number;
+	/** Monotonic counter bumped only by inbound agent events that prove the
+	 * agent observed/advanced a turn. Local status changes such as aborting do
+	 * not affect it, so prompt-dispatch recovery can distinguish those cases. */
+	agentObservedTurnVersion?: number;
 	/** Last user prompt text, for retry on fresh-response errors */
 	lastPromptText?: string;
 	/** Last user prompt images, for retry on fresh-response errors */
@@ -322,7 +331,9 @@ export interface SessionInfo {
 		seq: number;
 		ts: number;
 	};
-	/** Tools granted via "one-time" mode — revoked on agent_end */
+	/** Tools granted via "session-only" mode — re-applied across Refresh agent, not persisted to disk. */
+	sessionOnlyGrantedTools?: string[];
+	/** Tools granted via "one-time" mode — re-applied across Refresh agent and revoked on agent_end. */
 	oneTimeGrantedTools?: string[];
 	/** Whether post-start setup (model, thinking, metadata) has completed */
 	setupComplete?: boolean;
@@ -350,21 +361,19 @@ export interface SessionInfo {
 	/** Multi-repo: per-repo worktree paths from the pool claim. Stable for the session's lifetime. */
 	repoWorktrees?: Array<{ repo: string; repoPath: string; worktreePath: string }>;
 	/**
-	 * Shadow ledger of steer texts that have been dispatched to the SDK
-	 * (`rpcClient.steer()` resolved) but have not yet echoed back as a
-	 * user-role `message_end`. This is design §6.1 mitigation B: because
-	 * Bobbit cannot extend the upstream pi-coding-agent RPC bridge to
-	 * proxy `AgentSession.clearQueue()`, we mirror the SDK's text-match
-	 * splice logic at our layer for the abort-reconciliation case only.
+	 * Shadow ledger of steer texts that have been accepted for live-steer
+	 * dispatch but have not yet echoed back as a user-role `message_end`.
+	 * Persisted with promptQueue row removal so a gateway restart in the
+	 * dispatch→echo window can re-enqueue the steer exactly once.
 	 *
 	 * Lifecycle:
-	 *   - push: after `await rpcClient.steer(text)` resolves in `_dispatchSteer`.
+	 *   - push: in `_dispatchSteer`, before queue row removal is persisted.
 	 *   - splice: on `message_end(role:user)` whose body matches the front entry,
 	 *     mirroring `_processAgentEvent`'s `_steeringMessages.indexOf` removal.
-	 *   - drain: in `_reconcileAfterAbort` — re-enqueue at front so the next
+	 *   - drain: in restore/abort reconciliation — re-enqueue at front so the next
 	 *     turn redispatches them as a steered batch.
 	 *
-	 * Bounded growth: every entry has a paired SDK echo or an abort-drain;
+	 * Bounded growth: every entry has a paired SDK echo or a reconcile drain;
 	 * neither path is silently dropped.
 	 */
 	inFlightSteerTexts?: string[];
@@ -642,6 +651,11 @@ export interface SessionManagerOptions {
 	prStatusStore?: PrStatusStore;
 }
 
+type RestoreCoordinator = {
+	generation: number;
+	promise: Promise<SessionInfo | undefined>;
+};
+
 export class SessionManager {
 	private sessions = new Map<string, SessionInfo>();
 	/** Sessions with at least one attached WS client. Keeps heartbeat work proportional to active viewers. */
@@ -718,6 +732,13 @@ export class SessionManager {
 	/** Cached gateway model discovery, keyed by gateway name. `url` is tracked so a
 	 *  URL change (same name) busts the entry; TTL = AIGW_CACHE_TTL_MS. */
 	private _gatewayModelCache = new Map<string, { url: string; models: Awaited<ReturnType<typeof discoverGatewayModels>>; ts: number }>();
+
+
+	/** Per-session restore/respawn mutex. Concurrent revive triggers join this promise instead of replacing each other. */
+	private _restoreCoordinators = new Map<string, RestoreCoordinator>();
+	/** Latest lifecycle generation for each session; stale SessionInfo writers must no-op when behind this value. */
+	private _sessionRespawnGenerations = new Map<string, number>();
+
 	private static AIGW_CACHE_TTL_MS = 60_000; // 1 minute
 
 	/** Sessions that restoreSession's mid-turn branch has just re-prompted on
@@ -731,6 +752,78 @@ export class SessionManager {
 	 *  nudge to avoid double-prompting a cold agent. */
 	wasBootReprompted(sessionId: string): boolean {
 		return this._bootRepromptedSessions.has(sessionId);
+	}
+
+	private _currentRespawnGeneration(sessionId: string): number {
+		return this._sessionRespawnGenerations.get(sessionId) ?? 0;
+	}
+
+	private _nextRespawnGeneration(sessionId: string): number {
+		const next = this._currentRespawnGeneration(sessionId) + 1;
+		this._sessionRespawnGenerations.set(sessionId, next);
+		return next;
+	}
+
+	private _sessionWriterIsCurrent(session: SessionInfo): boolean {
+		if (session.lifecycleFenced) return false;
+		const canonical = this.sessions.get(session.id);
+		if (canonical && canonical !== session) return false;
+		return (session.lifecycleGeneration ?? 0) === this._currentRespawnGeneration(session.id);
+	}
+
+	private _fenceReplacedSession(session: SessionInfo, replacingGeneration: number): void {
+		session.lifecycleFenced = true;
+		session.lifecycleGeneration = replacingGeneration - 1;
+		session.dormant = true;
+		session.status = "terminated";
+		session.clients.clear();
+		this.cancelPendingAutoRetry(session, "terminated");
+		this._untrackConnectedSession(session);
+	}
+
+	private _coalesceRestore(
+		sessionId: string,
+		restore: (generation: number) => Promise<SessionInfo | undefined>,
+	): Promise<SessionInfo | undefined> {
+		const inFlight = this._restoreCoordinators.get(sessionId);
+		if (inFlight) return inFlight.promise;
+
+		const generation = this._nextRespawnGeneration(sessionId);
+		const promise = (async () => restore(generation))()
+			.finally(() => {
+				const current = this._restoreCoordinators.get(sessionId);
+				if (current?.generation === generation) this._restoreCoordinators.delete(sessionId);
+			});
+		this._restoreCoordinators.set(sessionId, { generation, promise });
+		return promise;
+	}
+
+	private _restoreSessionCoalesced(ps: PersistedSession): Promise<SessionInfo | undefined> {
+		return this._coalesceRestore(ps.id, async (generation) => {
+			await this.restoreSession(ps);
+			const restored = this.sessions.get(ps.id);
+			if (restored) {
+				restored.lifecycleGeneration = generation;
+				// CS-R2 follow-up (narrow CS-R7): restoreSession() re-seeds the prompt
+				// queue from `ps.messageQueue` and broadcasts idle WITHOUT draining, so
+				// a prompt persisted in the queue — or enqueued during the revive window
+				// — would sit undispatched (doc-04 F7 shape). Drain once here against the
+				// canonical revived object. `drainQueue` itself no-ops unless this is the
+				// current writer (`_sessionWriterIsCurrent`); we additionally gate on idle
+				// + not-compacting + no pending boot-reprompt so we never race the
+				// mid-turn boot-resume nudge. This is intentionally a single drain, not a
+				// broad drain-on-every-idle-transition hook.
+				if (
+					restored.status === "idle" &&
+					!restored.isCompacting &&
+					!this._bootRepromptedSessions.has(ps.id) &&
+					!restored.promptQueue.isEmpty
+				) {
+					this.drainQueue(restored);
+				}
+			}
+			return restored;
+		});
 	}
 
 	setOnPrCreationDetected(cb: (session: SessionInfo) => void): void {
@@ -1112,6 +1205,12 @@ export class SessionManager {
 		return null;
 	}
 
+	private getAllPersistedSessionsForWorktreeGuard(): PersistedSession[] {
+		return this.projectContextManager
+			? this.projectContextManager.getAllSessions()
+			: (this._testStore?.getAll() ?? []);
+	}
+
 	/** Resolve the correct CostTracker for a session based on its project. */
 	private resolveCostTracker(session: { projectId?: string }): CostTracker {
 		if (session.projectId && this.projectContextManager) {
@@ -1196,6 +1295,7 @@ export class SessionManager {
 		} else {
 			throw new Error("Cannot build pipeline context: no project context manager or test stores");
 		}
+		resolvedGoalManager.setLiveSessionResolver(() => this.getAllPersistedSessionsForWorktreeGuard());
 		return {
 			agentCliPath: this.agentCliPath,
 			systemPromptPath: this.systemPromptPath,
@@ -1214,6 +1314,7 @@ export class SessionManager {
 			store: resolvedStore,
 			searchIndex: resolvedSearchIndex,
 			sessions: this.sessions,
+			listPersistedSessionsForWorktreeGuard: () => this.getAllPersistedSessionsForWorktreeGuard(),
 			assemblePrompt: (id, parts) => this.assemblePrompt(id, parts),
 
 			applySandboxWiring: (opts, id, sandboxOpts) => this.applySandboxWiring(opts, id, sandboxOpts),
@@ -1646,6 +1747,18 @@ export class SessionManager {
 		return [];
 	}
 
+	private mergeToolNames(existing: string[] | undefined, additions: string[] | undefined): string[] | undefined {
+		const merged: string[] = [];
+		const seen = new Set<string>();
+		for (const name of [...(existing ?? []), ...(additions ?? [])]) {
+			const key = name.toLowerCase();
+			if (seen.has(key)) continue;
+			seen.add(key);
+			merged.push(name);
+		}
+		return merged.length > 0 ? merged : undefined;
+	}
+
 	private buildToolActivationArgs(
 		sessionId: string,
 		allowedTools: EffectiveTool[] | undefined,
@@ -1863,13 +1976,27 @@ export class SessionManager {
 		if (session) this.broadcastQueue(session);
 	}
 
-	private broadcastQueue(session: SessionInfo): void {
+	private persistedInFlightSteerTexts(session: SessionInfo): string[] | undefined {
+		const ledger = session.inFlightSteerTexts?.filter(text => typeof text === "string" && text.length > 0) ?? [];
+		return ledger.length > 0 ? [...ledger] : undefined;
+	}
+
+	private persistInFlightSteerLedger(session: SessionInfo): void {
+		this.resolveStoreForSession(session.id).update(session.id, {
+			inFlightSteerTexts: this.persistedInFlightSteerTexts(session),
+		});
+	}
+
+	private broadcastQueue(session: SessionInfo, opts?: { includeInFlightSteers?: boolean }): void {
+		const queue = session.promptQueue.toArray();
 		broadcast(session.clients, {
 			type: "queue_update",
 			sessionId: session.id,
-			queue: session.promptQueue.toArray(),
+			queue,
 		});
-		this.resolveStoreForSession(session.id).update(session.id, { messageQueue: session.promptQueue.toArray() });
+		const updates: { messageQueue: QueuedMessage[]; inFlightSteerTexts?: string[] } = { messageQueue: queue };
+		if (opts?.includeInFlightSteers) updates.inFlightSteerTexts = this.persistedInFlightSteerTexts(session);
+		this.resolveStoreForSession(session.id).update(session.id, updates);
 	}
 
 	/**
@@ -1919,8 +2046,44 @@ export class SessionManager {
 		 *  instead of timing out on the default 30s. */
 		coldStart?: boolean;
 	}): Promise<{ status: "dispatched" | "queued" }> {
-		const session = this.sessions.get(sessionId);
+		let session = this.sessions.get(sessionId);
 		if (!session) return { status: "queued" };
+
+		// REVIVE-WINDOW JOIN (CS-R2 follow-up). A prompt that arrives while the
+		// session is dormant/terminated/fenced — or while an `addClient` dormant
+		// revive (or any other restore) is already in flight — must NOT be queued on
+		// the stale `SessionInfo`. The coalesced restore replaces that object with a
+		// fresh one (new PromptQueue(ps.messageQueue), new EventBuffer), so a row
+		// queued here would be dropped and never dispatched (doc-04 F2e split-brain /
+		// F7 stranded-prompt shape). Instead, JOIN the coalesced restore (it starts
+		// one or joins the in-flight one), then re-read the canonical revived session
+		// and dispatch against it via the normal path below.
+		const restoreInFlight = this._restoreCoordinators.has(sessionId);
+		const inReviveWindow = restoreInFlight
+			|| session.status === "terminated"
+			|| session.dormant === true
+			|| session.lifecycleFenced === true;
+		if (inReviveWindow) {
+			const ps = this.resolveStoreForId(sessionId)?.get(sessionId);
+			if (ps && ps.agentSessionFile) {
+				// Coalesces: joins an in-flight restore or starts the single restore.
+				await this._restoreSessionCoalesced(ps);
+				const revived = this.sessions.get(sessionId);
+				if (!revived) return { status: "queued" };
+				session = revived;
+			} else if (restoreInFlight) {
+				// No restorable record of our own, but a restore is already running for
+				// this session — join it rather than acting on the stale object.
+				await this._restoreCoordinators.get(sessionId)?.promise;
+				const revived = this.sessions.get(sessionId);
+				if (!revived) return { status: "queued" };
+				session = revived;
+			}
+			// Otherwise (terminated/dormant with no restorable transcript): fall
+			// through to the existing non-idle path, which queues on the current
+			// object — unchanged behavior for genuinely unrevivable sessions.
+		}
+
 		session.lastPromptSource = opts?.source ?? "user";
 
 		// modelText is what the model sees; text is the user's verbatim input.
@@ -2102,17 +2265,17 @@ export class SessionManager {
 
 		// Happy path: enqueue then dispatch via the single _dispatchSteer site.
 		// _dispatchSteer removes the row from promptQueue *before* awaiting the
-		// RPC, so the SDK becomes the sole authority for in-flight steer text.
+		// RPC and persists an in-flight ledger for restart durability until echo.
 		const queued = session.promptQueue.enqueue(message, { isSteered: true });
 		this.broadcastQueue(session);
 		return this._dispatchSteer(session, [queued]);
 	}
 
 	/**
-	 * Promote a queued message to steered and reorder.
-	 * If the agent is streaming, all steered+undispatched messages are
-	 * batched and dispatched immediately via rpcClient.steer() so they
-	 * are injected at the next tool boundary (PI-10).
+	 * Promote a queued message to steered priority.
+	 * If the agent is streaming, dispatch the current steered front group through
+	 * the same live-steer path as a fresh steer so user intent is observed on the
+	 * current turn instead of waiting for a later tool boundary or agent_end.
 	 */
 	steerQueued(sessionId: string, messageId: string): boolean {
 		const session = this.sessions.get(sessionId);
@@ -2120,34 +2283,21 @@ export class SessionManager {
 		const ok = session.promptQueue.steer(messageId);
 		if (!ok) return false;
 
-		// Steered messages are NOT dispatched immediately on promotion.
-		// They accumulate in the queue and are dispatched as a batch at the
-		// next tool boundary (PI-10b). This ensures that multiple steers sent
-		// during a long tool call are all delivered together, even if they
-		// arrive seconds apart. The dispatch is triggered by the tool_result
-		// event handler in _handleAgentEvent().
-		// If the agent is idle, they'll drain normally via drainQueue.
-		//
-		// SPECIAL CASE: bash_bg.wait. A wait long-poll has no natural tool
-		// boundary — it sits indefinitely until the bg process exits or the
-		// wait is aborted. Without intervention, a steer-on-queue while the
-		// agent is parked in wait would be deferred for the entire wait
-		// duration. Mirror deliverLiveSteer's behaviour: when the session is
-		// streaming and there is at least one active wait, abort all waits so
-		// the agent unblocks at once. The underlying bg process keeps
-		// running; only the wait long-poll is cancelled, which is exactly
-		// what the user expects from the Steer button.
-		const bg = (this as any).bgProcessManager;
-		if (bg && session.status === "streaming") bg.abortAllWaits(session.id);
+		if (session.status === "streaming") {
+			const steered = session.promptQueue.dequeueAllSteered();
+			void this._dispatchSteer(session, steered).catch(() => {});
+			return true;
+		}
 
 		this.broadcastQueue(session);
+		if (session.status === "idle") this.drainQueue(session);
 		return true;
 	}
 
 	/**
 	 * Single dispatch site for steered prompts. Removes rows from promptQueue
-	 * *before* awaiting rpcClient.steer() so the SDK becomes the sole
-	 * authority for in-flight steer text. On RPC failure, rows are
+	 * *before* awaiting rpcClient.steer() and persists an in-flight ledger so
+	 * restart can recover the dispatch→echo window. On RPC failure, rows are
 	 * re-enqueued at the front in original order (steered group still sorts
 	 * first via PromptQueue.reorder()).
 	 *
@@ -2160,34 +2310,39 @@ export class SessionManager {
 		const bg = (this as any).bgProcessManager;
 		if (bg) bg.abortAllWaits(session.id);
 		const batchText = rows.map(r => r.text).join("\n");
-		for (const r of rows) session.promptQueue.remove(r.id);
-		this.broadcastQueue(session);
 
-		// Record on the shadow ledger BEFORE the RPC resolves so that an
-		// agent_end firing during the await window (e.g. user aborts mid-steer)
-		// still sees the in-flight entry and can re-enqueue it via
-		// _reconcileAfterAbort. Otherwise the steer text is delivered to the
-		// SDK's _steeringMessages but the aborted agent loop never consumes it,
-		// and the bobbit server has no record of it to redispatch.
+		// Record on the shadow ledger BEFORE persisting queue removal. The store
+		// update below writes both the now-empty promptQueue slice and this ledger
+		// entry together, so a restart after dispatch but before the transcript
+		// echo can restore/re-enqueue the steer exactly once.
 		//
 		// On RPC failure we splice this exact entry back out and re-enqueue
 		// the rows at front of promptQueue, so the next drain redispatches.
 		if (!session.inFlightSteerTexts) session.inFlightSteerTexts = [];
 		session.inFlightSteerTexts.push(batchText);
+		for (const r of rows) session.promptQueue.remove(r.id);
+		this.broadcastQueue(session, { includeInFlightSteers: true });
 		try {
 			const steerResp = await session.rpcClient.steer(batchText);
 			if ((steerResp as any)?.success === false) {
 				throw new Error((steerResp as any)?.error || "steer rejected");
 			}
 		} catch (err) {
-			// Splice this entry from the ledger — it never reached the SDK so
-			// it shouldn't show up as "in-flight" for reconcile.
+			// Splice this entry from the ledger only if this catch path still owns
+			// it. Abort/restart reconciliation can drain the same ledger while the
+			// steer RPC is pending; in that case the row has already been recovered
+			// exactly once and must not be enqueued again here.
 			const lidx = session.inFlightSteerTexts.lastIndexOf(batchText);
-			if (lidx !== -1) session.inFlightSteerTexts.splice(lidx, 1);
-			for (const r of [...rows].reverse()) {
-				session.promptQueue.enqueueAtFront(r.text, { isSteered: true });
+			if (lidx !== -1) {
+				session.inFlightSteerTexts.splice(lidx, 1);
+				for (const r of [...rows].reverse()) {
+					session.promptQueue.enqueueAtFront(r.text, { isSteered: true });
+				}
+				this.broadcastQueue(session, { includeInFlightSteers: true });
+			} else {
+				this.persistInFlightSteerLedger(session);
+				console.warn(`[session-manager] _dispatchSteer failed for ${session.id} after in-flight ledger was already reconciled; not re-enqueueing duplicate steer`);
 			}
-			this.broadcastQueue(session);
 			console.error(`[session-manager] _dispatchSteer failed for ${session.id}:`, err);
 			throw err;
 		}
@@ -2208,25 +2363,31 @@ export class SessionManager {
 		const text = extractUserMessageText(event.message);
 		if (!text) return;
 		const idx = ledger.indexOf(text);
-		if (idx !== -1) ledger.splice(idx, 1);
+		if (idx !== -1) {
+			ledger.splice(idx, 1);
+			this.persistInFlightSteerLedger(session);
+		}
 	}
 
 	/**
 	 * Drain the shadow ledger and re-enqueue any unresolved steers at the
-	 * front of promptQueue as steered rows. Called from agent_end while
-	 * `wasAborting`, and from `forceAbort` after killing the bridge — both
-	 * cases where a steer the SDK accepted may never echo because the turn
-	 * was torn down. The next drainQueue picks the rows up as a steered
-	 * batch via `_dispatchSteer`, redispatching exactly once.
+	 * front of promptQueue as steered rows. Called after restore and from
+	 * abort-reconciliation paths where a steer the SDK accepted may never echo
+	 * because the turn was torn down. The next drainQueue picks the rows up as
+	 * a steered batch via `_dispatchSteer`, redispatching exactly once.
 	 */
-	private _reconcileAfterAbort(session: SessionInfo): void {
+	private _reconcileInFlightSteers(session: SessionInfo): void {
 		const ledger = session.inFlightSteerTexts;
 		if (!ledger || ledger.length === 0) return;
 		for (const text of [...ledger].reverse()) {
 			session.promptQueue.enqueueAtFront(text, { isSteered: true });
 		}
 		ledger.length = 0;
-		this.broadcastQueue(session);
+		this.broadcastQueue(session, { includeInFlightSteers: true });
+	}
+
+	private _reconcileAfterAbort(session: SessionInfo): void {
+		this._reconcileInFlightSteers(session);
 	}
 
 	/** Reorder queued messages to match the given ID list. */
@@ -2258,6 +2419,7 @@ export class SessionManager {
 		attachments?: unknown[];
 		isSteered?: boolean;
 	}>, reason: string, source: string): void {
+		if (!this._sessionWriterIsCurrent(session)) return;
 		const processExited = /(?:agent process exited|process_exit)/i.test(reason);
 		if (session.status === "terminated" || (session.status === "aborting" && processExited)) {
 			console.warn(`[session-manager] ${source} dispatch failed for ${session.id} (${reason}); not recovering ${rows.length} row(s) because session is ${session.status}`);
@@ -2294,7 +2456,11 @@ export class SessionManager {
 			return;
 		}
 		session.recoverDrainAttempts = attempts;
-		setTimeout(() => { this.drainQueue(session); }, 0);
+		const generation = session.lifecycleGeneration ?? 0;
+		setTimeout(() => {
+			if ((session.lifecycleGeneration ?? 0) !== generation) return;
+			this.drainQueue(session);
+		}, 0);
 	}
 
 	private async dispatchDirectPrompt(
@@ -2343,6 +2509,7 @@ export class SessionManager {
 	 * enqueuePrompt call sees idle+empty and dispatches a second concurrent prompt.
 	 */
 	private drainQueue(session: SessionInfo): void {
+		if (!this._sessionWriterIsCurrent(session)) return;
 		if (session.promptQueue.isEmpty) return;
 
 		// Batch all steered messages at the front into a single prompt
@@ -2369,6 +2536,7 @@ export class SessionManager {
 
 		// Optimistic status update to prevent double-dispatch race
 		this.markPromptDispatchStreaming(session);
+		const dispatchObservedTurnVersion = session.agentObservedTurnVersion ?? 0;
 
 		// Snapshot the rows we're about to dispatch so we can re-enqueue them
 		// if the agent rejects the prompt (e.g. "Agent is already processing."
@@ -2378,6 +2546,15 @@ export class SessionManager {
 			: [{ text: next.text, images: next.images, attachments: next.attachments, isSteered: !!next.isSteered }];
 
 		const recoverDispatchedRows = (reason: string) => {
+			// Suppress recovery only after an inbound agent event proves the dequeued
+			// turn was accepted/observed. Local status changes such as Stop →
+			// "aborting" can happen before prompt() is accepted; those rows must be
+			// recovered or the queued prompt is lost.
+			const observedTurnVersion = session.agentObservedTurnVersion ?? 0;
+			if (observedTurnVersion !== dispatchObservedTurnVersion) {
+				console.warn(`[session-manager] drainQueue dispatch for ${session.id} reported ${reason} after agent observed the turn (observedTurnVersion ${dispatchObservedTurnVersion} → ${observedTurnVersion}); not recovering ${dispatchedRowsForRecovery.length} row(s)`);
+				return;
+			}
 			this.recoverPromptDispatch(session, dispatchedRowsForRecovery, reason, "drainQueue");
 		};
 
@@ -2442,16 +2619,31 @@ export class SessionManager {
 			}
 		}
 
+		// Inbound agent events that carry turn progress prove a just-dispatched
+		// prompt was accepted. Keep this separate from statusVersion: local Stop /
+		// abort status broadcasts must not suppress recovery for a prompt that was
+		// dequeued but rejected before acceptance.
+		if (
+			event.type === "agent_start" ||
+			event.type === "tool_execution_start" ||
+			(event.type === "message_end" && (
+				event.message?.role === "user" ||
+				event.message?.role === "user-with-attachments" ||
+				event.message?.role === "assistant"
+			))
+		) {
+			session.agentObservedTurnVersion = (session.agentObservedTurnVersion ?? 0) + 1;
+		}
+
 		// Splice this echoed user message off the shadow ledger if it was a
 		// dispatched steer. Mirrors the SDK's _steeringMessages text-match
 		// removal (agent-session.js:265–280); harmless no-op for non-steer
 		// user messages (regular prompts, follow-ups, ask responses).
 		this._consumeSteerEcho(session, event);
 
-		// Tool boundary: dispatch accumulated steered messages as a batch
-		// (PI-10b). Steers sent during a long tool call are collected in the
-		// queue and delivered together when the tool finishes, before the
-		// agent starts its next step.
+		// Tool boundary: defensively flush any steered rows that remain queued
+		// (for example, recovered/pre-existing rows). Fresh live steers and
+		// steer_queued promotions dispatch immediately through _dispatchSteer.
 		if (event.type === "tool_execution_end") {
 			// If we're already aborting, do NOT dispatch steers via rpcClient.steer.
 			// The agent loop is being torn down — the SDK would queue the steer
@@ -2635,6 +2827,7 @@ export class SessionManager {
 		// emits one row per text / tool_use / tool_result block.
 		if (event.type === "message_end" && event.message) {
 			try {
+				const goalTitle = session.goalId ? this.resolveGoal(session.goalId)?.title : undefined;
 				this.resolveSearchIndex(session).indexMessage({
 					sessionId: session.id,
 					sessionTitle: session.title,
@@ -2642,6 +2835,7 @@ export class SessionManager {
 					timestamp: Date.now(),
 					projectId: session.projectId || undefined,
 					goalId: session.goalId,
+					goalTitle,
 				});
 			} catch {
 				// Non-critical — don't break message flow
@@ -2741,10 +2935,12 @@ export class SessionManager {
 		emitSessionEvent(session, pendingEvent);
 
 		if (session.pendingAutoRetryTimer) clearTimeout(session.pendingAutoRetryTimer);
+		const generation = session.lifecycleGeneration ?? 0;
 		session.pendingAutoRetryTimer = setTimeout(() => {
 			session.pendingAutoRetryTimer = undefined;
-			// Session may have been terminated in the meantime
-			if (!this.sessions.has(session.id)) return;
+			// Session may have been terminated or replaced in the meantime.
+			if ((session.lifecycleGeneration ?? 0) !== generation) return;
+			if (!this._sessionWriterIsCurrent(session)) return;
 			if (session.status !== "idle") return; // user sent something, or already retrying
 			// Auto path: preserve `transientRetryAttempts` so successive overload
 			// failures continue growing the backoff toward the 5-minute cap.
@@ -2887,7 +3083,7 @@ export class SessionManager {
 	 *
 	 * @param mode - Grant persistence mode:
 	 *   - "persistent" (default): updates role YAML permanently
-	 *   - "session-only": adds to session.allowedTools in memory only (survives until session ends/restarts)
+	 *   - "session-only": adds to session.allowedTools in memory only (survives Refresh agent, not gateway restart)
 	 *   - "one-time": adds to session.allowedTools + tracks for revocation on agent_end
 	 */
 	async grantToolPermission(sessionId: string, toolName: string, scope: "tool" | "group", group?: string, mode?: "persistent" | "session-only" | "one-time"): Promise<string[]> {
@@ -2945,13 +3141,14 @@ export class SessionManager {
 		if (mode === "one-time") {
 			// Temporary grant: add to session.allowedTools, track for revocation on agent_end
 			session.allowedTools = [...(session.allowedTools || []), ...newTools];
-			session.oneTimeGrantedTools = [...(session.oneTimeGrantedTools || []), ...newTools];
+			session.oneTimeGrantedTools = this.mergeToolNames(session.oneTimeGrantedTools, newTools);
 			await this._restartSessionWithUpdatedRole(session);
 			resultTools = session.allowedTools;
 
 		} else if (mode === "session-only") {
 			// Session-scoped grant: add to session.allowedTools only, don't write role YAML
 			session.allowedTools = [...(session.allowedTools || []), ...newTools];
+			session.sessionOnlyGrantedTools = this.mergeToolNames(session.sessionOnlyGrantedTools, newTools);
 			await this._restartSessionWithUpdatedRole(session);
 			resultTools = session.allowedTools;
 
@@ -3048,6 +3245,28 @@ export class SessionManager {
 		pending.resolve({ granted: false });
 	}
 
+	private recomputeAllowedToolsForRestart(session: SessionInfo, ps: PersistedSession): string[] | undefined {
+		const persistedAllowedTools = Array.isArray(ps.allowedTools) && ps.allowedTools.length > 0
+			? ps.allowedTools
+			: undefined;
+		const sessionGrants = this.mergeToolNames(session.sessionOnlyGrantedTools, session.oneTimeGrantedTools);
+
+		// Persisted allow-lists are true session-scoped constraints (delegate/read-only
+		// children, explicit createSession overrides). Preserve them exactly, with any
+		// live grants layered on top.
+		if (persistedAllowedTools) {
+			return this.mergeToolNames(persistedAllowedTools, sessionGrants);
+		}
+
+		// Normal sessions derive their tool surface from the current role/group/MCP
+		// policy cascade. Only one-time/session-only grants are carried across the
+		// respawn; the old live session.allowedTools is just a stale cache.
+		if (!sessionGrants) return undefined;
+		const restoredRole = this.resolveSessionRole(ps.role, ps.assistantType, ps.projectId);
+		const recomputedAllowed = this.resolveEffectiveAllowedTools(restoredRole).map(t => t.name);
+		return this.mergeToolNames(recomputedAllowed, sessionGrants);
+	}
+
 	/**
 	 * Restart a session's agent process so it picks up updated role/tools.
 	 * Stops the current agent, then restores from the persisted session file
@@ -3058,19 +3277,18 @@ export class SessionManager {
 		if (!ps) return;
 
 		// Save in-memory grant state that restoreSession doesn't persist.
-		const savedAllowedTools = session.allowedTools ? [...session.allowedTools] : undefined;
+		const savedSessionOnlyGrantedTools = session.sessionOnlyGrantedTools ? [...session.sessionOnlyGrantedTools] : undefined;
 		const savedOneTimeGrantedTools = session.oneTimeGrantedTools ? [...session.oneTimeGrantedTools] : undefined;
+		const overrideAllowedTools = this.recomputeAllowedToolsForRestart(session, ps);
 
 		const restored = await this._respawnAgentInPlace(session, ps, {
 			mutatePs: p => {
-				// restoreSession normally derives allowedTools from role YAML; session-only
-				// and one-time grants need the augmented list to round-trip.
-				(p as any)._overrideAllowedTools = savedAllowedTools;
+				if (overrideAllowedTools) (p as any)._overrideAllowedTools = overrideAllowedTools;
 			},
 		});
 
 		if (restored) {
-			if (savedAllowedTools) restored.allowedTools = savedAllowedTools;
+			if (savedSessionOnlyGrantedTools) restored.sessionOnlyGrantedTools = savedSessionOnlyGrantedTools;
 			if (savedOneTimeGrantedTools) restored.oneTimeGrantedTools = savedOneTimeGrantedTools;
 		}
 	}
@@ -3116,31 +3334,34 @@ export class SessionManager {
 		ps: PersistedSession,
 		opts?: { mutatePs?: (ps: PersistedSession) => void; finalStatus?: SessionStatus },
 	): Promise<SessionInfo | undefined> {
-		const savedClients = new Set(session.clients);
-		// Snapshot AFTER unsubscribe so no in-flight event races past lastSeq.
-		session.unsubscribe();
-		const frameOfRef = this._snapshotStreamingFrameOfReference(session);
-		try { await session.rpcClient.stop(); } catch { /* already dead */ }
+		return this._coalesceRestore(session.id, async (generation) => {
+			const savedClients = new Set(session.clients);
+			// Snapshot AFTER unsubscribe so no in-flight event races past lastSeq.
+			session.unsubscribe();
+			const frameOfRef = this._snapshotStreamingFrameOfReference(session);
+			this._fenceReplacedSession(session, generation);
+			try { await session.rpcClient.stop(); } catch { /* already dead */ }
 
-		this._untrackConnectedSession(session);
-		this.sessions.delete(session.id);
-		(ps as any)._restartFrameOfReference = frameOfRef;
-		opts?.mutatePs?.(ps);
-		try {
-			await this.restoreSession(ps);
-		} finally {
-			delete (ps as any)._restartFrameOfReference;
-			delete (ps as any)._overrideAllowedTools;
-		}
-		const restored = this.sessions.get(session.id);
-		if (restored) {
-			for (const ws of savedClients) {
-				if ((ws as any).readyState === 1) restored.clients.add(ws);
+			this.sessions.delete(session.id);
+			(ps as any)._restartFrameOfReference = frameOfRef;
+			opts?.mutatePs?.(ps);
+			try {
+				await this.restoreSession(ps);
+			} finally {
+				delete (ps as any)._restartFrameOfReference;
+				delete (ps as any)._overrideAllowedTools;
 			}
-			broadcastStatus(restored, opts?.finalStatus ?? "idle");
-			this._trackConnectedSession(restored);
-		}
-		return restored;
+			const restored = this.sessions.get(session.id);
+			if (restored) {
+				restored.lifecycleGeneration = generation;
+				for (const ws of savedClients) {
+					if ((ws as any).readyState === 1) restored.clients.add(ws);
+				}
+				broadcastStatus(restored, opts?.finalStatus ?? "idle");
+				this._trackConnectedSession(restored);
+			}
+			return restored;
+		});
 	}
 
 	/**
@@ -3176,15 +3397,18 @@ export class SessionManager {
 			throw zombieErr;
 		}
 
-		const savedAllowedTools = session.allowedTools ? [...session.allowedTools] : undefined;
+		const savedSessionOnlyGrantedTools = session.sessionOnlyGrantedTools ? [...session.sessionOnlyGrantedTools] : undefined;
 		const savedOneTimeGrantedTools = session.oneTimeGrantedTools ? [...session.oneTimeGrantedTools] : undefined;
+		const overrideAllowedTools = this.recomputeAllowedToolsForRestart(session, ps);
 
 		const restored = await this._respawnAgentInPlace(session, ps, {
-			mutatePs: p => { (p as any)._overrideAllowedTools = savedAllowedTools; },
+			mutatePs: p => {
+				if (overrideAllowedTools) (p as any)._overrideAllowedTools = overrideAllowedTools;
+			},
 		});
 
 		if (restored) {
-			if (savedAllowedTools) restored.allowedTools = savedAllowedTools;
+			if (savedSessionOnlyGrantedTools) restored.sessionOnlyGrantedTools = savedSessionOnlyGrantedTools;
 			if (savedOneTimeGrantedTools) restored.oneTimeGrantedTools = savedOneTimeGrantedTools;
 		} else {
 			throw new Error("Failed to restore session after restart");
@@ -3256,12 +3480,20 @@ export class SessionManager {
 				testSearchIndex.open({ goalStore, sessionStore: this._testStore });
 				// Wire index update callbacks
 				goalStore.onIndexUpdate = (goal) => {
-					try { testSearchIndex.indexGoal(goal, goal.projectId || ""); } catch (err) { console.error("[search] Failed to index goal:", err); }
+					try {
+						testSearchIndex.indexGoal(goal, goal.projectId || "");
+						for (const session of this._testStore?.getAll() ?? []) {
+							if (session.goalId !== goal.id) continue;
+							testSearchIndex.indexSession(session, goal.title, session.projectId || "");
+							testSearchIndex.reindexMessagesForSession(session, goal.title, session.projectId || "");
+						}
+					} catch (err) { console.error("[search] Failed to index goal:", err); }
 				};
 				this._testStore.onIndexUpdate = (session) => {
 					try {
 						const goalTitle = session.goalId ? this.resolveGoal(session.goalId)?.title : undefined;
 						testSearchIndex.indexSession(session, goalTitle, session.projectId || "");
+						testSearchIndex.reindexMessagesForSession(session, goalTitle, session.projectId || "");
 					} catch (err) { console.error("[search] Failed to index session:", err); }
 				};
 			} catch (err) {
@@ -3423,7 +3655,7 @@ export class SessionManager {
 		try {
 			sessionStore = this.getSessionStore(ps.projectId);
 		} catch {
-			console.warn(`[session-manager] Skipping session ${ps.id} — project "${ps.projectId}" no longer registered`);
+			if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Skipping session ${ps.id} — project "${ps.projectId}" no longer registered`);
 			return;
 		}
 		// Generalized boot-reap for ANY child linked by parentSessionId+childKind
@@ -3522,7 +3754,7 @@ export class SessionManager {
 			}
 		}
 		try {
-			await this.restoreSession(ps);
+			await this._restoreSessionCoalesced(ps);
 			// Per-session restore detail is debug-only — the `Restoring N session(s)`
 			// summary above covers the routine boot case; failures still log loudly.
 			if (process.env.BOBBIT_DEBUG) console.log(`[session-manager] Restored: "${ps.title}" (${ps.id})`);
@@ -3558,6 +3790,7 @@ export class SessionManager {
 			allowedTools: ps.allowedTools,
 			projectId: ps.projectId,
 			promptQueue: new PromptQueue(ps.messageQueue),
+			inFlightSteerTexts: Array.isArray(ps.inFlightSteerTexts) ? [...ps.inFlightSteerTexts] : undefined,
 		});
 	}
 
@@ -3814,6 +4047,7 @@ export class SessionManager {
 			cwd: ps.cwd,
 			status: "starting",
 			statusVersion: initialStatusVersion,
+			lifecycleGeneration: this._currentRespawnGeneration(ps.id),
 			createdAt: ps.createdAt,
 			lastActivity: ps.lastActivity,
 			clients: new Set(),
@@ -3840,6 +4074,7 @@ export class SessionManager {
 			promptQueue: new PromptQueue(ps.messageQueue),
 			streamingStartedAt: ps.streamingStartedAt,
 			projectId: ps.projectId,
+			inFlightSteerTexts: Array.isArray(ps.inFlightSteerTexts) ? [...ps.inFlightSteerTexts] : undefined,
 			repoPath: ps.repoPath,
 			branch: ps.branch,
 			repoWorktrees: ps.repoWorktrees && ps.repoPath
@@ -3923,6 +4158,11 @@ export class SessionManager {
 
 		this.sessions.set(ps.id, session);
 
+		// `switch_session` replays durable user message echoes and `_consumeSteerEcho`
+		// clears matching ledger entries. Anything left here was accepted for
+		// dispatch but not echoed before the gateway died, so re-enqueue it once.
+		this._reconcileInFlightSteers(session);
+
 		// Restore + re-attach this session's persisted background processes. The
 		// session now exists and (for sandboxed sessions) containerId has been
 		// re-resolved, so liveness/re-attach can target the live process.
@@ -3962,7 +4202,7 @@ export class SessionManager {
 		}
 	}
 
-	async createSession(cwd: string, agentArgs?: string[], goalId?: string, assistantType?: string, opts?: { rolePrompt?: string; roleName?: string; role?: string; accessory?: string; env?: Record<string, string>; taskId?: string; staffId?: string; allowedTools?: string[]; workflowContext?: string; worktreeOpts?: { repoPath: string }; reattemptGoalId?: string; sandboxed?: boolean; projectId?: string; sessionId?: string; sandboxBranch?: string; sandboxBaseBranch?: string; sandboxCwdOffset?: string; skipAutoModel?: boolean; skipAutoThinking?: boolean; initialModel?: string; initialThinkingLevel?: string; preExistingAgentSessionFile?: string; parentSessionId?: string; childKind?: string; readOnly?: boolean; title?: string }): Promise<SessionInfo> {
+	async createSession(cwd: string, agentArgs?: string[], goalId?: string, assistantType?: string, opts?: { rolePrompt?: string; roleName?: string; role?: string; accessory?: string; env?: Record<string, string>; taskId?: string; staffId?: string; allowedTools?: string[]; workflowContext?: string; worktreeOpts?: { repoPath: string }; reattemptGoalId?: string; sandboxed?: boolean; projectId?: string; sessionId?: string; sandboxBranch?: string; sandboxBaseBranch?: string; sandboxCwdOffset?: string; skipAutoModel?: boolean; skipAutoThinking?: boolean; initialModel?: string; initialThinkingLevel?: string; preExistingAgentSessionFile?: string; preExistingAgentSessionOldCwds?: string[]; parentSessionId?: string; childKind?: string; readOnly?: boolean; title?: string; awaitWorktreeSetup?: boolean; bypassWorktreePool?: boolean }): Promise<SessionInfo> {
 		const id = opts?.sessionId || randomUUID();
 		const optsAllowedTagged: EffectiveTool[] | undefined = opts?.allowedTools
 			? opts.allowedTools.map(n => tagAllowedTool(n, this.toolManager))
@@ -4013,7 +4253,7 @@ export class SessionManager {
 			// inside the container via ProjectSandbox.createWorktree, and the
 			// host-side worktree pool isn't reachable from the container.
 			const targetBranch = `session/${uuid8}`;
-			const poolForCreate = (!opts?.sandboxed && projectId) ? this.worktreePools.get(projectId) : undefined;
+			const poolForCreate = (!opts?.sandboxed && !opts?.bypassWorktreePool && projectId) ? this.worktreePools.get(projectId) : undefined;
 			const claimed = poolForCreate ? await poolForCreate.claim(targetBranch).catch((err) => {
 				console.warn(`[session-manager] pool.claim failed for ${id}, falling back to createWorktree: ${err instanceof Error ? err.message : err}`);
 				return null;
@@ -4039,7 +4279,7 @@ export class SessionManager {
 				isCompacting: false,
 				titleGenerated: false,
 				goalId,
-				assistantType: undefined,
+				assistantType,
 				taskId: opts?.taskId,
 				parentSessionId: opts?.parentSessionId,
 				childKind: opts?.childKind,
@@ -4078,6 +4318,7 @@ export class SessionManager {
 				title: opts?.title || "New session",
 				cwd,
 				goalId,
+				assistantType,
 				taskId: opts?.taskId,
 				// Load-bearing wire: threads staffId from opts → plan → persistOnce so it
 				// lands in PersistedSession on disk. Pinned by `tests/staff-session-staffid-persistence.test.ts`;
@@ -4108,6 +4349,7 @@ export class SessionManager {
 				initialModel: opts?.initialModel,
 				initialThinkingLevel: opts?.initialThinkingLevel,
 				preExistingAgentSessionFile: opts?.preExistingAgentSessionFile,
+				preExistingAgentSessionOldCwds: opts?.preExistingAgentSessionOldCwds,
 				bridgeOptions: { cwd },
 			};
 
@@ -4120,19 +4362,37 @@ export class SessionManager {
 			}
 			this.notifySessionCreated(session);
 
-			// Fire-and-forget: finish pipeline. If we got a pool worktree above,
-			// pass its path so executeWorktreeAsync skips createWorktree.
-			executeWorktreeAsync(plan, session, ctx, claimed?.worktreePath).then(() => {
+			// Finish the pipeline. Most callers keep the historical preparing-session UX
+			// and let setup complete in the background. Continue-Archived opts in to
+			// awaiting setup so fresh worktree/base-ref failures are returned by the POST
+			// instead of surfacing later as an asynchronously archived session.
+			const setupPromise = executeWorktreeAsync(plan, session, ctx, claimed?.worktreePath).then(() => {
 				// agentSessionFile is now persisted synchronously by spawnAgent before
 				// status flips to idle (see session-setup.ts). The post-resolve persist
 				// here is redundant but kept as a safety net for re-attempts where the
-				// agent may rotate its session file mid-run.
+				// agent may rotate its session file mid-run. Continue/Fork rehydration
+				// already adopted a cloned transcript and may have sanitized runtime-only
+				// metadata in that file; avoid a redundant get_state that can drop it.
+				if (plan.preExistingAgentSessionFile) return;
 				session.pendingMetadataPersist = this.persistSessionMetadata(session).catch((err) => {
 					console.warn(`[session-manager] Early persist failed for worktree session ${session.id}:`, err);
 				}).finally(() => { session.pendingMetadataPersist = undefined; });
-			}).catch((err) => {
-				handleSetupFailure(session, plan, err, ctx);
 			});
+
+			if (opts?.awaitWorktreeSetup) {
+				try {
+					await setupPromise;
+				} catch (err) {
+					const setupError = err instanceof Error ? err : new Error(String(err));
+					handleSetupFailure(session, plan, setupError, ctx);
+					throw setupError;
+				}
+			} else {
+				setupPromise.catch((err) => {
+					const setupError = err instanceof Error ? err : new Error(String(err));
+					handleSetupFailure(session, plan, setupError, ctx);
+				});
+			}
 
 			return session;
 		}
@@ -4172,6 +4432,7 @@ export class SessionManager {
 			initialModel: opts?.initialModel,
 			initialThinkingLevel: opts?.initialThinkingLevel,
 			preExistingAgentSessionFile: opts?.preExistingAgentSessionFile,
+			preExistingAgentSessionOldCwds: opts?.preExistingAgentSessionOldCwds,
 			bridgeOptions: { cwd },
 		};
 
@@ -4179,10 +4440,14 @@ export class SessionManager {
 		if (projectId) session.projectId = projectId;
 		this.notifySessionCreated(session);
 
-		// Persist session metadata (fire-and-forget, but tracked for terminate)
-		session.pendingMetadataPersist = this.persistSessionMetadata(session).catch((err) => {
-			console.warn(`[session-manager] Early persist failed for ${session.id}:`, err);
-		}).finally(() => { session.pendingMetadataPersist = undefined; });
+		// Persist session metadata (fire-and-forget, but tracked for terminate).
+		// Rehydrated sessions already have a cloned/adopted transcript path recorded;
+		// avoid a redundant get_state that can rewrite runtime-only metadata.
+		if (!plan.preExistingAgentSessionFile) {
+			session.pendingMetadataPersist = this.persistSessionMetadata(session).catch((err) => {
+				console.warn(`[session-manager] Early persist failed for ${session.id}:`, err);
+			}).finally(() => { session.pendingMetadataPersist = undefined; });
+		}
 
 		return session;
 	}
@@ -5611,7 +5876,7 @@ export class SessionManager {
 		} else {
 			// Cold restore — no in-memory session, no live clients, fresh
 			// `_highestSeq=0` baseline on whoever connects next.
-			await this.restoreSession(persisted);
+			await this._restoreSessionCoalesced(persisted);
 		}
 		console.log(`[session-manager] Restored session ${sessionId} via ensureSessionAlive`);
 	}
@@ -5843,11 +6108,13 @@ export class SessionManager {
 		// the persisted record we just archived.
 		const persistedForBranchDelete = terminateStore.get(id);
 		const sessionBranch = persistedForBranchDelete?.branch;
+		const repoPathForBranchDelete = persistedForBranchDelete?.repoPath;
+		const skipRemoteBranchDelete = shouldSkipRemotePush() || !repoPathForBranchDelete || await shouldSkipRemoteGitForTests(repoPathForBranchDelete);
 		eagerDeleteRemoteSessionBranch({
 			branch: sessionBranch,
-			repoPath: persistedForBranchDelete?.repoPath,
+			repoPath: repoPathForBranchDelete,
 			delegateOf: session.delegateOf,
-			skipPush: shouldSkipRemotePush(),
+			skipPush: skipRemoteBranchDelete,
 			detectPrimary: detectPrimaryBranch,
 			runGit: async (args, cwd) => {
 				await execFileAsync("git", args, { cwd, timeout: 15_000 });
@@ -6124,15 +6391,22 @@ export class SessionManager {
 		if (ps.worktreePath && ps.repoPath && !ps.worktreePath.startsWith("/workspace") && !ps.delegateOf) {
 			try {
 				const { cleanupWorktree } = await import("../skills/git.js");
+				const allPersisted = this.getAllPersistedSessionsForWorktreeGuard();
 				// Multi-repo: clean each repo's worktree in parallel + delete the
 				// shared branch from each repo's remote (Phase 4a).
 				if (ps.repoWorktrees && Object.keys(ps.repoWorktrees).length > 0) {
 					await Promise.allSettled(Object.entries(ps.repoWorktrees).map(([repo, wt]) => {
+						if (isWorktreePathReferencedByLiveSession(wt, allPersisted, { ignoreSessionId: ps.id })) {
+							console.log(`[session-manager] Skipping shared worktree cleanup for purged session ${ps.id}: ${wt}`);
+							return Promise.resolve();
+						}
 						const repoPath = repo === "." ? ps.repoPath! : path.join(ps.repoPath!, repo);
 						return cleanupWorktree(repoPath, wt, ps.branch, true);
 					}));
-				} else {
+				} else if (!isWorktreePathReferencedByLiveSession(ps.worktreePath, allPersisted, { ignoreSessionId: ps.id })) {
 					await cleanupWorktree(ps.repoPath, ps.worktreePath, ps.branch, true);
+				} else {
+					console.log(`[session-manager] Skipping shared worktree cleanup for purged session ${ps.id}: ${ps.worktreePath}`);
 				}
 			} catch (err) {
 				console.error(`[session-manager] Failed to cleanup worktree for ${ps.id}:`, err);
@@ -6257,18 +6531,25 @@ export class SessionManager {
 			const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd: repoPath });
 			const blocks = stdout.split("\n\n");
 
-			// Build a set of branches owned by live (non-archived) persisted sessions.
+			// Build a set of branches/paths owned by live (non-archived) persisted sessions.
 			// Prior to the fix, pool worktree directories were renamed on claim but
 			// `git worktree repair` could fail — git tracked the OLD path while
 			// the session stored the NEW path. Matching by branch prevents the
 			// cleanup from deleting worktrees that are actually in use.
 			const persistedBranches = new Set<string>();
-			const allPersisted = this.projectContextManager
-				? [...this.projectContextManager.getAllLiveSessions()]
-				: (this._testStore?.getLive() ?? []);
+			const allPersisted = this.getAllPersistedSessionsForWorktreeGuard();
 			for (const ps of allPersisted) {
-				if (ps.branch) persistedBranches.add(ps.branch);
+				if (!ps.archived && ps.branch) persistedBranches.add(ps.branch);
 			}
+			const runtimeRecords: WorktreeReferenceRecord[] = [...this.sessions.values()].map(s => ({
+				id: s.id,
+				worktreePath: s.worktreePath,
+				cwd: s.cwd,
+				repoWorktrees: s.repoWorktrees
+					? Object.fromEntries(s.repoWorktrees.map(w => [w.repo, w.worktreePath]))
+					: undefined,
+			}));
+			const allPathRecords: WorktreeReferenceRecord[] = [...allPersisted, ...runtimeRecords];
 
 			for (const block of blocks) {
 				const branchMatch = block.match(/^branch refs\/heads\/(session\/.+)$/m);
@@ -6280,15 +6561,8 @@ export class SessionManager {
 				const pathMatch = block.match(/^worktree (.+)$/m);
 				if (!pathMatch) continue;
 				const wtPath = pathMatch[1];
-				// Normalize paths for comparison — git uses forward slashes on Windows,
-				// but session store uses OS-native backslashes. Without normalization,
-				// every session worktree is considered "orphaned" and deleted on restart.
-				const normalize = (p: string | undefined) => p?.replace(/\\/g, "/").toLowerCase();
-				const normalizedWtPath = normalize(wtPath);
 				// Check if any active session uses this worktree (by path or branch)
-				const isActive = [...this.sessions.values()].some(
-					s => normalize(s.worktreePath) === normalizedWtPath || normalize(s.cwd) === normalizedWtPath
-				) || persistedBranches.has(branch);
+				const isActive = isWorktreePathReferencedByLiveSession(wtPath, allPathRecords) || persistedBranches.has(branch);
 				if (!isActive) {
 					console.log(`[session-manager] Cleaning up orphaned session worktree: ${wtPath} (branch: ${branch})`);
 					const { cleanupWorktree } = await import("../skills/git.js");
@@ -6310,12 +6584,19 @@ export class SessionManager {
 			const blocks = stdout.split("\n\n");
 
 			const persistedBranches = new Set<string>();
-			const allPersisted = this.projectContextManager
-				? [...this.projectContextManager.getAllLiveSessions()]
-				: (this._testStore?.getLive() ?? []);
+			const allPersisted = this.getAllPersistedSessionsForWorktreeGuard();
 			for (const ps of allPersisted) {
-				if (ps.branch) persistedBranches.add(ps.branch);
+				if (!ps.archived && ps.branch) persistedBranches.add(ps.branch);
 			}
+			const runtimeRecords: WorktreeReferenceRecord[] = [...this.sessions.values()].map(s => ({
+				id: s.id,
+				worktreePath: s.worktreePath,
+				cwd: s.cwd,
+				repoWorktrees: s.repoWorktrees
+					? Object.fromEntries(s.repoWorktrees.map(w => [w.repo, w.worktreePath]))
+					: undefined,
+			}));
+			const allPathRecords: WorktreeReferenceRecord[] = [...allPersisted, ...runtimeRecords];
 
 			const orphans: Array<{ path: string; branch: string }> = [];
 			for (const block of blocks) {
@@ -6326,11 +6607,7 @@ export class SessionManager {
 				const pathMatch = block.match(/^worktree (.+)$/m);
 				if (!pathMatch) continue;
 				const wtPath = pathMatch[1];
-				const normalize = (p: string | undefined) => p?.replace(/\\/g, "/").toLowerCase();
-				const normalizedWtPath = normalize(wtPath);
-				const isActive = [...this.sessions.values()].some(
-					s => normalize(s.worktreePath) === normalizedWtPath || normalize(s.cwd) === normalizedWtPath
-				) || persistedBranches.has(branch);
+				const isActive = isWorktreePathReferencedByLiveSession(wtPath, allPathRecords) || persistedBranches.has(branch);
 				if (!isActive) {
 					orphans.push({ path: wtPath, branch });
 				}
@@ -6450,10 +6727,10 @@ export class SessionManager {
 			const ps = this.resolveStoreForId(sessionId)?.get(sessionId);
 			if (ps && ps.agentSessionFile) {
 				console.log(`[session-manager] Client connected to dormant session "${session.title}" — attempting restore`);
-				this.restoreSession(ps)
+				this._restoreSessionCoalesced(ps)
 					.then(() => {
 						console.log(`[session-manager] Revived dormant session: "${session.title}" (${sessionId})`);
-						// restoreSession replaces the map entry — add client to the new one
+						// restoreSession replaces the map entry — add client to the canonical one.
 						const revived = this.sessions.get(sessionId);
 						if (revived && (ws as any).readyState === 1) {
 							revived.clients.add(ws);
@@ -6575,8 +6852,8 @@ export class SessionManager {
 		await session.rpcClient.stop();
 
 		// Reconcile any in-flight steers that died with the bridge: anything
-		// in the shadow ledger was accepted by the SDK but never echoed (the
-		// process is dead before its message_end could arrive). Re-enqueue
+		// left in the shadow ledger was recorded for dispatch but never echoed
+		// (the process is dead before its message_end could arrive). Re-enqueue
 		// at front so the post-respawn drainQueue redispatches them once.
 		this._reconcileAfterAbort(session);
 
@@ -6589,7 +6866,9 @@ export class SessionManager {
 
 		// Restart the agent process
 		try {
-			const bridgeOptions: RpcBridgeOptions = { cwd: session.cwd };
+			await this._coalesceRestore(id, async (generation) => {
+				session.lifecycleGeneration = generation;
+				const bridgeOptions: RpcBridgeOptions = { cwd: session.cwd };
 			if (this.agentCliPath) bridgeOptions.cliPath = this.agentCliPath;
 			if (this.systemPromptPath) bridgeOptions.systemPromptPath = this.systemPromptPath;
 			if (this.toolManager) bridgeOptions.toolManager = this.toolManager;
@@ -6688,10 +6967,12 @@ export class SessionManager {
 			broadcastStatus(session, "idle");
 			console.log(`[session-manager] Session ${id} agent restarted after force abort`);
 
-			// Drain any queued messages (steered first, then normal). Fresh
-			// retry budget — the old process (and its busy guard) is gone.
-			session.recoverDrainAttempts = 0;
-			this.drainQueue(session);
+				// Drain any queued messages (steered first, then normal). Fresh
+				// retry budget — the old process (and its busy guard) is gone.
+				session.recoverDrainAttempts = 0;
+				this.drainQueue(session);
+				return session;
+			});
 		} catch (err) {
 			console.error(`[session-manager] Failed to restart agent after force abort:`, err);
 			broadcastStatus(session, "terminated");

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFile as execFileCb } from "node:child_process";
+import fs from "node:fs";
 import { promisify } from "node:util";
 import path from "node:path";
 import { GoalStore, type GoalState, type PersistedGoal } from "./goal-store.js";
@@ -11,6 +12,8 @@ import type { Component } from "./project-config-store.js";
 import type { GateStore } from "./gate-store.js";
 import type { TeamStore } from "./team-store.js";
 import type { SessionStore } from "./session-store.js";
+import { isWorktreePathReferencedByLiveSession, type WorktreeReferenceRecord } from "./worktree-reference-guard.js";
+import { cleanupGateDiagnosticsForGoal } from "./gate-diagnostics-cleanup.js";
 
 const pExecFile = promisify(execFileCb);
 
@@ -108,6 +111,8 @@ export class GoalManager {
 	 * setupWorktreeAndStartTeam to create the worktree from the right base
 	 * branch. Set by server.ts on startup. */
 	private baseRefResolver?: (projectId: string) => string | undefined;
+	private liveSessionResolver?: () => WorktreeReferenceRecord[];
+	private readonly diagnosticsStateDir?: string;
 	setBaseRefResolver(resolver: (projectId: string) => string | undefined): void {
 		this.baseRefResolver = resolver;
 	}
@@ -116,9 +121,31 @@ export class GoalManager {
 		return this.baseRefResolver?.(projectId);
 	}
 
-	constructor(goalStore: GoalStore, workflowStore?: WorkflowStore) {
+	setLiveSessionResolver(resolver: () => WorktreeReferenceRecord[]): void {
+		this.liveSessionResolver = resolver;
+	}
+
+	private getSessionsForWorktreeGuard(): WorktreeReferenceRecord[] {
+		if (this.liveSessionResolver) return this.liveSessionResolver();
+		try {
+			const storeDir = (this.store as unknown as { storeDir?: string }).storeDir;
+			if (!storeDir) return [];
+			const sessionFile = path.join(storeDir, "sessions.json");
+			if (!fs.existsSync(sessionFile)) return [];
+			const raw = JSON.parse(fs.readFileSync(sessionFile, "utf8"));
+			if (Array.isArray(raw)) return raw as WorktreeReferenceRecord[];
+			if (Array.isArray(raw?.sessions)) return raw.sessions as WorktreeReferenceRecord[];
+			if (raw && typeof raw === "object") return Object.values(raw).filter(Array.isArray).flat() as WorktreeReferenceRecord[];
+		} catch {
+			// Best-effort guard; missing/corrupt session store should not block archive.
+		}
+		return [];
+	}
+
+	constructor(goalStore: GoalStore, workflowStore?: WorkflowStore, stateDir?: string) {
 		this.store = goalStore;
 		this.workflowStore = workflowStore;
+		this.diagnosticsStateDir = stateDir ?? (goalStore as unknown as { storeDir?: string }).storeDir;
 		// Lazy-migrate legacy paused=true + unresolved-deps goals to state='blocked'
 		// BEFORE recovering stuck setups, so that newly-blocked goals don't get
 		// their setupStatus incorrectly marked 'error'. See docs/design/pause-cascade.md.
@@ -760,12 +787,24 @@ export class GoalManager {
 		const goal = this.store.get(id);
 		if (!goal) return false;
 		const archived = this.store.archive(id);
+		if (archived) {
+			try {
+				await cleanupGateDiagnosticsForGoal(id, this.diagnosticsStateDir);
+			} catch (err) {
+				console.warn(`[goal-manager] Failed to clean gate diagnostics for archived goal ${id}:`, err);
+			}
+		}
 		// Multi-repo cleanup: best-effort per-repo worktree + remote-branch
 		// removal. Single-repo cleanup remains owned by session purge.
 		if (archived && goal.repoWorktrees && goal.repoPath && goal.branch && Object.keys(goal.repoWorktrees).length > 0) {
 			const { cleanupWorktree } = await import("../skills/git.js");
 			const entries = Object.entries(goal.repoWorktrees);
+			const sessions = this.getSessionsForWorktreeGuard();
 			Promise.allSettled(entries.map(([repo, wt]) => {
+				if (isWorktreePathReferencedByLiveSession(wt, sessions)) {
+					console.log(`[goal-manager] Skipping shared goal worktree cleanup for archived goal ${goal.id}: ${wt}`);
+					return Promise.resolve();
+				}
 				const repoPath = repo === "." ? goal.repoPath! : path.join(goal.repoPath!, repo);
 				return cleanupWorktree(repoPath, wt, goal.branch, true);
 			})).catch(() => { /* swallow — best-effort */ });
@@ -876,6 +915,12 @@ export class GoalManager {
 		// Worktrees preserved for 7-day archive (cleaned by periodic purge).
 		if (goal?.team) {
 			console.log(`[goal-manager] Deleting team goal "${goal.title}" — worktrees preserved for archived session review`);
+		}
+
+		try {
+			await cleanupGateDiagnosticsForGoal(id, this.diagnosticsStateDir);
+		} catch (err) {
+			console.warn(`[goal-manager] Failed to clean gate diagnostics for deleted goal ${id}:`, err);
 		}
 
 		this.store.remove(id);

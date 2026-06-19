@@ -44,16 +44,17 @@ These endpoints expose restart support only for gateways launched through `npm r
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/sessions` | List all sessions. Supports `?since=N` generation counter for conditional fetch. Response includes `archivedDelegates` array (see below) |
+| `GET` | `/api/sessions` | List sessions. Supports `?since=N` generation counter for conditional fetch. `?include=archived` adds archived rows; `q` filters the archived corpus by title/role before pagination. Response includes `archivedDelegates` array (see below). See [Archived session list and query search](#archived-session-list-and-query-search) |
 | `POST` | `/api/sessions` | Create a session (normal, delegate, or with role/traits/assistant type/reattemptGoalId) |
 | `POST` | `/api/sessions/:id/fork` | Fork a live session: clone its transcript (+ tool-content / proposal drafts) into a new session and preserve its context. Body `{ newWorktree?: boolean }` (default `true`). See [Fork session endpoint](#fork-session-endpoint) |
+| `POST` | `/api/sessions/:id/restart` | Restart a live session's agent process in place. Body `{ force?: boolean }`. See [Restart session agent endpoint](#restart-session-agent-endpoint) |
 | `GET` | `/api/sessions/:id` | Get session details |
 | `DELETE` | `/api/sessions/:id` | Terminate a session |
 | `PATCH` | `/api/sessions/:id` | Update session properties (title, colorIndex, preview, roleId, traits, assistantType, goalId) |
 | `PUT` | `/api/sessions/:id/title` | Rename a session (legacy endpoint) |
 | `POST` | `/api/sessions/:id/wait` | Block until session becomes idle, then return output |
 | `POST` | `/api/sessions/:id/mark-read` | Record that the user viewed this session. Sets `lastReadAt = Date.now()` on the persisted session row; clients compare `lastActivity > lastReadAt` to render the unseen-activity dot. Works on live, dormant, and archived sessions. See [docs/internals.md — Read/unread state](internals.md#readunread-state). 404 if the session id is unknown. |
-| `POST` | `/api/sessions/:archivedId/continue` | Create a new session whose agent CLI rehydrates from a byte-for-byte clone of the archived session's `.jsonl`. See [Continue-Archived endpoint](#continue-archived-endpoint) |
+| `POST` | `/api/sessions/:archivedId/continue` | Create a new session whose agent CLI rehydrates from a clone of the archived `.jsonl` while preserving user-visible transcript content losslessly. See [Continue-Archived endpoint](#continue-archived-endpoint) |
 | `GET` | `/api/sessions/:id/output` | Get final assistant output from the last turn |
 | `GET` | `/api/sessions/:id/draft?type=:type` | Read a persisted UI draft. Missing drafts return `404` by default; `optional=1` returns empty `204` for expected absence when the session exists. |
 | `GET` | `/api/sessions/:id/git-status` | Git status for session's working directory (branch, ahead/behind, dirty files) |
@@ -69,6 +70,35 @@ These endpoints expose restart support only for gateways launched through `npm r
 | `GET` | `/api/sessions/:id/tool-content/:messageIndex/:blockIndex` | Lazy-load full tool input content for a truncated block (see [Large content truncation](#large-content-truncation)) |
 | `GET` | `/api/sessions/:id/transcript` | Paginated, regex-filterable transcript reader. Backs the `read_session` tool. Query params: `offset` (negative = from end), `limit` (default 20, clamped 1..200), `pattern`, `case_sensitive`, `context` (±5 max), `verbose`. Same-project authorization via the `x-bobbit-session-id` request header. Errors: `session_not_found` (404), `transcript_unavailable` (404), `invalid_regex` / `invalid_params` (400), `permission_denied` (403). Pure parser lives in `src/server/agent/transcript-reader.ts`. |
 | `GET` | `/api/sessions/:id/transcript/before-compaction` | Paginated read of the orphaned pre-compaction entries for a single compaction event. Query params: `compactionId` (required, sidecar entry id), `cursor` (from previous response's `nextCursor`), `limit` (default 50, clamped 1..200). Response envelope `{ total, returned, nextCursor, messages[] }`. Same-project authorization via the `x-bobbit-session-id` header. Errors: `session_not_found` (404), `transcript_unavailable` (404), `compaction_not_found` (404), `invalid_params` (400), `permission_denied` (403). Branch-split via the sidecar's `firstKeptEntryId`; legacy fallback scans the JSONL for an inline `type:"compaction"` marker. Reader: `readOrphanedBeforeCompaction` in `src/server/agent/transcript-reader.ts`. See [docs/compaction-history.md](compaction-history.md). |
+
+### Archived session list and query search
+
+`GET /api/sessions?include=archived` keeps the live session list in the same response and adds archived sessions from visible project contexts. This powers Show Archived and the sidebar's server-backed archived filter; see [Sidebar Archived Search](sidebar-archived-search.md).
+
+Query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `include=archived` | Enables archived session rows. Without it, only live sessions are returned, plus `archivedDelegates` needed for live nesting. |
+| `q` | Optional archived-only search query. The server trims and lowercases it, then applies case-insensitive substring matching to archived session `title` and `role`. Live sessions are not filtered by this parameter. |
+| `limit` | Optional archived page size, clamped to `1..200`. When present, pagination metadata is returned for the matching archived corpus. |
+| `after` | Optional `archivedAt` cursor from the previous response's `nextCursor`; returns older matching archived rows. |
+| `projectId` | Optional project filter applied to live and archived rows. |
+
+With `limit`, the response shape is:
+
+```ts
+{
+  generation: number,
+  sessions: GatewaySession[],
+  total: number,
+  hasMore: boolean,
+  nextCursor?: number,
+  archivedDelegates: GatewaySession[]
+}
+```
+
+`total`, `hasMore`, and `nextCursor` describe only the filtered archived corpus. `sessions` contains the current live sessions followed by the requested archived page, so clients that need only archived results should filter for `archived === true` or `status === "archived"`. `q` is applied before pagination so older matching archived sessions can be found without loading non-matching pages.
 
 ### Side-panel workspace
 
@@ -86,6 +116,44 @@ The side-panel workspace endpoints persist the right-side panel tab set for a se
 | `POST` | `/api/sessions/:id/side-panel-workspace/migrate` | One-time import from legacy localStorage keys. Ignored once the workspace has tabs or `metadata.migratedFromLocalStorageAt`. |
 
 Each committed mutation increments `revision`, persists on the session record, and emits `side_panel_workspace` on the session WebSocket.
+
+### Restart session agent endpoint
+
+`POST /api/sessions/:id/restart` restarts the live agent process for an existing session. It is the REST contract behind the sidebar hamburger action labeled exactly `Refresh agent`.
+
+This endpoint exists alongside the active-session WebSocket `restart_agent` command. The WebSocket command is scoped to the session socket that sends it; the REST endpoint accepts an explicit `:id`, so sidebar actions can refresh an inactive row without switching the open chat. Both paths call `SessionManager.restartAgent(sessionId)`.
+
+Request body (optional):
+
+```json
+{ "force": false }
+```
+
+- Omit the body, omit `force`, or send `force: false` for an idle session.
+- Send `force: true` only after user confirmation when the session is `busy`, `streaming`, or compacting. Without force, those states return `409 SESSION_BUSY`.
+
+Success returns `200`:
+
+```json
+{ "ok": true, "sessionId": "session-id" }
+```
+
+Restart is in-place. It preserves the session id, transcript/history, persisted session metadata, and any connected WebSocket clients. The manager stops the existing process, restores the persisted session, reattaches clients, and switches the new process back to the existing transcript file. The restore path rebuilds the session prompt, tool definitions, tool activation, MCP proxy/guard extensions, MCP-backed tool surface, MCP server configuration/auth state, and per-session environment from the current server-side managers and config.
+
+For normal role-derived sessions, restart recomputes allowed tools from the current role/tool/group/MCP policy cascade instead of reusing the previous live allow-list. This is why an MCP group changed from `never` to `ask` or `allow` takes effect after `Refresh agent`. Persisted session allow-list constraints and live `session-only` / `one-time` grants are still carried across where appropriate, and explicit role-level `never` policies still take precedence over group defaults.
+
+Stable error codes:
+
+| Status | Code | Meaning |
+|---|---|---|
+| `404` | `SESSION_NOT_FOUND` | No live restartable session exists for `:id`, including missing, archived, or terminated sessions. |
+| `403` | `SESSION_NOT_RESTARTABLE` | The session is read-only or non-interactive. |
+| `409` | `SESSION_BUSY` | The session is `busy`, `streaming`, or compacting and the request did not include `{ "force": true }`. |
+| `500` | `RESTART_ERROR` or a manager-provided code | Restart was accepted but the session manager could not respawn the process. The response still uses the standard `{ error, code }` shape. |
+
+Clients should surface 5xx restart failures visibly rather than silently retrying. A manager-provided restart code, such as an unrecoverable archived-zombie condition, should be displayed or logged with the human-readable `error`.
+
+See [Sidebar Actions Menu — Refresh agent](sidebar-actions-menu.md#refresh-agent) for the user-facing behavior.
 
 ### Fork session endpoint
 
@@ -155,7 +223,7 @@ Older exited snapshots may omit `endTime` or set it to `null`. Clients must rend
 
 ### Proposal drafts
 
-In-flight `propose_*` payloads are mirrored to `.bobbit/state/proposal-drafts/<sessionId>/<type>.{md,yaml}` so the agent can tweak them via `view_proposal` / `edit_proposal` without re-emitting the full payload. The file is the single source of truth; the in-memory client slot (`state.activeProposals[type]`) is a parsed projection. See [docs/internals.md — Editable proposals](internals.md#editable-proposals) and [docs/design/editable-proposals.md](design/editable-proposals.md).
+In-flight `propose_*` payloads are mirrored to `.bobbit/state/proposal-drafts/<sessionId>/<type>.{md,yaml}` so the agent can tweak them via `view_proposal` / `edit_proposal` without re-emitting the full payload. The file is the source of truth for proposal draft content; the in-memory client slot (`state.activeProposals[type]`) is a parsed content projection. Side-panel tab presence is controlled separately by the server-backed workspace. See [docs/internals.md — Editable proposals](internals.md#editable-proposals) and [docs/design/editable-proposals.md](design/editable-proposals.md).
 
 `<type>` is one of `goal | project | role | tool | staff`. `goal` files are markdown with YAML frontmatter; the others are native YAML.
 
@@ -163,11 +231,11 @@ In-flight `propose_*` payloads are mirrored to `.bobbit/state/proposal-drafts/<s
 |---|---|---|
 | `GET` | `/api/sessions/:id/proposal/:type` | Read the raw proposal file body. `200` with `text/markdown` (goal) or `application/yaml` (others). `404 {ok:false, code:"FILE_NOT_FOUND", message}` if no draft. |
 | `GET` | `/api/sessions/:id/proposal/:type/snapshot?rev=N` | Read a historical revision without mutating the live draft. Parses `<type>.history/<rev>.<ext>` through the per-type plugin and returns `200 {ok:true, rev, fields}`. Does not broadcast `proposal_update` and does not update `state.activeProposals`. `400 {ok:false, code:"INVALID_BODY"}` for invalid rev; `404 {ok:false, code:"SNAPSHOT_NOT_FOUND", message}` if the snapshot file is missing; `400` with `ParseError` shape if the snapshot fails to parse. Used by read-only historical proposal tabs. |
-| `POST` | `/api/sessions/:id/proposal/:type/seed` | Called by `propose_*` tool `execute()`. Body `{ args: <propose-args object> }`. Serialises args via the per-type plugin, atomically writes the file, parses, broadcasts `proposal_update {source:"seed", rev}`. `200 {ok:true, rev}` on success; `400` with structured error on parse/validate failure. For `type=goal`, the named `workflow` and `options` are validated against the project's workflows **before** writing — unknown values are rejected with `400 {ok:false, code:"UNKNOWN_WORKFLOW", availableWorkflows}` or `400 {ok:false, code:"UNKNOWN_OPTIONAL_STEP", validOptionalSteps}` (skipped when the session has no project, the project has zero workflows, or `workflow` is empty). See [goals-workflows-tasks.md — Validating a proposed workflow at proposal time](goals-workflows-tasks.md#validating-a-proposed-workflow-at-proposal-time). |
-| `POST` | `/api/sessions/:id/proposal/:type/edit` | Surgical edit. Body `{ old_text: string, new_text: string }`. Exact-string replacement, first-and-only-occurrence rule, empty `new_text` deletes. On success: writes atomically, broadcasts `proposal_update {source:"edit", rev}`, returns `200 {ok:true, newContent, rev}`. On failure: file unchanged, returns 4xx with structured error. |
-| `POST` | `/api/sessions/:id/proposal/:type/restore` | Mutating rollback endpoint for explicit API restore flows. Body `{ rev: number }` (positive integer). Copies `<type>.history/<rev>.<ext>` back to the live draft AND writes a NEW snapshot at `currentRev+1` so the rollback appears in the timeline. Broadcasts `proposal_update {source:"restore", rev: newRev}`. `200 {ok:true, newRev, fields}` on success; `400 {ok:false, code:"INVALID_BODY"}` if `rev` is not a positive integer; `404 {ok:false, code:"SNAPSHOT_NOT_FOUND", message}` if the requested snapshot file is missing; `400` with `ParseError` shape if the snapshot fails to parse. Historical chat-card tabs use `GET /snapshot` instead so browsing old revisions is non-mutating. |
+| `POST` | `/api/sessions/:id/proposal/:type/seed` | Called by `propose_*` tool `execute()`. Body `{ args: <propose-args object> }`. Serialises args via the per-type plugin, atomically writes the file, parses, attempts to open/focus `proposal:<type>` in the side-panel workspace, then broadcasts `proposal_update {source:"seed", rev}`. `200 {ok:true, rev}` on success; `400` with structured error on parse/validate failure. For `type=goal`, the named `workflow` and `options` are validated against the project's workflows **before** writing. When project workflows are resolvable and non-empty, omitted, empty, or whitespace-only `workflow` is rejected with `400 {ok:false, code:"MISSING_WORKFLOW", message, availableWorkflows: [{ id, name }]}` so agents can retry with a valid workflow. Unknown values are rejected with `400 {ok:false, code:"UNKNOWN_WORKFLOW", availableWorkflows}` or `400 {ok:false, code:"UNKNOWN_OPTIONAL_STEP", validOptionalSteps}`. Workflow validation is skipped only when there are genuinely no resolvable workflows. See [goals-workflows-tasks.md — Validating a proposed workflow at proposal time](goals-workflows-tasks.md#validating-a-proposed-workflow-at-proposal-time). |
+| `POST` | `/api/sessions/:id/proposal/:type/edit` | Surgical content edit. Body `{ old_text: string, new_text: string }`. Exact-string replacement, first-and-only-occurrence rule, empty `new_text` deletes. On success: writes atomically, broadcasts `proposal_update {source:"edit", rev}`, returns `200 {ok:true, newContent, rev}`. Does not open or focus side-panel tabs; already-open proposal tabs refresh from the content slot. On failure: file unchanged, returns 4xx with structured error. |
+| `POST` | `/api/sessions/:id/proposal/:type/restore` | Mutating rollback endpoint for explicit API restore flows. Body `{ rev: number }` (positive integer). Copies `<type>.history/<rev>.<ext>` back to the live draft AND writes a NEW snapshot at `currentRev+1` so the rollback appears in the timeline. Attempts to open/focus `proposal:<type>` in the side-panel workspace, then broadcasts `proposal_update {source:"restore", rev: newRev}`. `200 {ok:true, newRev, fields}` on success; `400 {ok:false, code:"INVALID_BODY"}` if `rev` is not a positive integer; `404 {ok:false, code:"SNAPSHOT_NOT_FOUND", message}` if the requested snapshot file is missing; `400` with `ParseError` shape if the snapshot fails to parse. Historical chat-card tabs use `GET /snapshot` instead so browsing old revisions is non-mutating. |
 | `DELETE` | `/api/sessions/:id/proposal/:type` | Delete the draft. Broadcasts `proposal_cleared`. `204` on success (idempotent — `204` even if the file was absent). Called by accept handlers after a successful save. The per-session `<type>.history/` directory is cleaned with the rest of the per-session draft dir on the 7-day purge (deferred from archive so the [archived-proposal-reopen flows](archived-proposal-reopen.md) can read drafts after the source session is archived). |
-| `GET` | `/api/sessions/:id/proposals` | List every parsed proposal draft for the session in one call. Returns `200 { proposals: Array<{ proposalType, fields, rev }> }`; `proposals` is empty when the per-session directory is absent or empty. Mirrors the WS `proposal_update {source:"rehydrate"}` broadcast as a one-shot REST call — used by fast-path session switch-backs (no fresh WS auth, so the broadcast doesn't run) and by the archived-session footer to decide whether to surface a "Resubmit `<type>` proposal" button (see [docs/archived-proposal-reopen.md](archived-proposal-reopen.md)). `400` on invalid sessionId; `500` on unexpected enumeration failure. |
+| `GET` | `/api/sessions/:id/proposals` | List every parsed proposal draft for the session in one call. Returns `200 { proposals: Array<{ proposalType, fields, rev }> }`; `proposals` is empty when the per-session directory is absent or empty. Mirrors the WS `proposal_update {source:"rehydrate"}` broadcast as a one-shot REST call — used by fast-path session switch-backs (no fresh WS auth, so the broadcast doesn't run) and by the archived-session footer to decide whether to surface a "Resubmit `<type>` proposal" button (see [docs/archived-proposal-reopen.md](archived-proposal-reopen.md)). This is content hydration only and does not open or focus side-panel tabs. `400` on invalid sessionId; `500` on unexpected enumeration failure. |
 
 #### Error response shape
 
@@ -204,7 +272,7 @@ Structured proposal validation failures share this JSON shape across seed, edit,
 
 **Path safety.** `:id` is validated against `/^[A-Za-z0-9_-]+$/` and `:type` against the union literal; invalid values return `400 {error:"Unknown proposal type: ..."}` before any disk access.
 
-**Restart survival.** On WS attach, `src/server/ws/handler.ts` enumerates the per-session directory and re-emits one `proposal_update {source:"rehydrate", rev}` per surviving file (where `rev` is computed from the highest integer in the `<type>.history/` dir, or `0` for legacy sessions predating the snapshot system), so reloading a browser or restarting the server mid-edit yields the same UI state without a separate persistence layer.
+**Restart survival.** On WS attach, `src/server/ws/handler.ts` enumerates the per-session directory and re-emits one `proposal_update {source:"rehydrate", rev}` per surviving file (where `rev` is computed from the highest integer in the `<type>.history/` dir, or `0` for legacy sessions predating the snapshot system), so reloading a browser or restarting the server mid-edit yields the same proposal content without a separate content persistence layer. Rehydrate does not open tabs; the side-panel workspace remains authoritative for whether `proposal:<type>` is present.
 
 **Revision snapshots.** Every successful `seed` and `edit` write also writes an immutable per-rev snapshot under `<stateDir>/proposal-drafts/<sessionId>/<type>.history/<rev>.<ext>` (filename grammar `^(\d+)\.(md|yaml)$`; integer rev parsed back from filenames — no metadata file). The server stamps the resulting `rev` on every `proposal_update` WS event (single source of truth — the client overwrites `slot.rev` with the server value, never increments locally). Snapshot-write failures are non-fatal: the live draft is committed and the broadcast carries `rev: 0`, which the client treats as "snapshot system unavailable". Chat-card "Open proposal" buttons parse the `__proposal_rev_v1__:<n>` marker and, for older revisions, call the non-mutating `GET /snapshot` endpoint to populate read-only historical tabs. The mutating `restore` endpoint remains available for explicit rollback flows but is not used for ordinary history browsing. Full design: [docs/design/proposal-revision-snapshots.md](design/proposal-revision-snapshots.md).
 
@@ -226,7 +294,7 @@ Per-session review annotations are stored server-side so they survive browser cl
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/goals` | List all goals. `?archived=true` returns archived goals with an `archivedSessions` field. Supports `?since=N` generation counter for conditional fetch |
+| `GET` | `/api/goals` | List goals. `?archived=true` returns archived goals with an `archivedSessions` field; `q` filters archived goals by goal title or affiliated session title/role before pagination. Supports `?since=N` generation counter for conditional fetch. See [Archived goal list and query search](#archived-goal-list-and-query-search) |
 | `POST` | `/api/goals` | Create a goal (`{ title, cwd, spec, team?, worktree?, reattemptOf? }`) |
 | `GET` | `/api/goals/:id` | Get a goal |
 | `PUT` | `/api/goals/:id` | Update a goal (title, cwd, state, spec, team, repoPath, branch, reattemptOf) |
@@ -238,6 +306,34 @@ Per-session review annotations are stored server-side so they survive browser cl
 | `GET` | `/api/goals/:id/pr-status` | PR status for goal branch (cached, via `gh pr view`). Missing PRs return `404` by default; `optional=1` returns empty `204` when the goal exists. |
 | `GET` | `/api/goals/:id/github-link` | PR URL or sanitized GitHub branch fallback. Still available, but the sidebar `Open on GitHub` item now mirrors the goal-row PR badge instead of gating on this endpoint. See [Goal GitHub link endpoint](#goal-github-link-endpoint) |
 | `POST` | `/api/goals/:id/pr-merge` | Merge PR for goal branch (`{ method? }`) |
+
+### Archived goal list and query search
+
+`GET /api/goals?archived=true` aggregates archived goals across visible project contexts. It is used by Show Archived and by the sidebar's server-backed archived filter; see [Sidebar Archived Search](sidebar-archived-search.md).
+
+Query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `archived=true` | Selects archived goals instead of live goals. |
+| `q` | Optional archived-goal query. The server trims and lowercases it, then applies case-insensitive substring matching to goal `title`, or to `title` / `role` on an affiliated non-child session. |
+| `limit` | Archived page size, default `50`, clamped to `1..200`. |
+| `after` | Optional `archivedAt` cursor from the previous response's `nextCursor`; returns older matching archived goals. |
+| `projectId` | Optional project filter for archived goals and affiliated sessions considered during matching. |
+
+Response shape:
+
+```ts
+{
+  goals: Goal[],
+  total: number,
+  hasMore: boolean,
+  nextCursor?: number,
+  archivedSessions: GatewaySession[]
+}
+```
+
+`q` is applied before pagination across the full archived goal corpus. `total`, `hasMore`, and `nextCursor` describe the filtered goal corpus, not the `archivedSessions` side payload. `archivedSessions` contains archived sessions affiliated with goals in the returned page, plus related archived child/delegate rows needed for sidebar nesting.
 
 ### Goal GitHub link endpoint
 
@@ -297,6 +393,8 @@ Routes accept both `/team/` and legacy `/swarm/` paths.
 | `GET` | `/api/goals/:id/team/agents` | List agents for a team goal. `?include=archived` also returns archived agents with `teamLeadSessionId`, `teamGoalId`, and `delegateOf` fields |
 | `POST` | `/api/goals/:id/team/complete` | Complete a team (dismiss agents, keep team lead). Body `{ confirmBypassedGates?: boolean }` — the agent/MCP path is refused while any gate is `bypassed`; a human confirms with `confirmBypassedGates: true` (403 for sandbox tokens). See [Gate bypass endpoint](#gate-bypass-endpoint). |
 | `POST` | `/api/goals/:id/team/teardown` | Fully tear down a team (dismiss all + terminate team lead) |
+
+Restart semantics: boot restores persisted active team entries and re-subscribes their sessions; it does not call `/team/start` implicitly for existing teamless goals. After `/team/teardown`, or after creating a goal with `autoStartTeam: false`, the goal remains teamless across restart and this explicit start route remains the manual recovery path.
 
 ### Orchestration routes (child agents)
 
@@ -594,10 +692,34 @@ There is no `?scope=server` parameter on workflow endpoints — it was removed w
 |---|---|---|
 | `GET` | `/api/models` | List currently available models (`ApiModel[]`) |
 | `POST` | `/api/models/test` | Probe a model pref with a minimal "Reply with OK" call (body: `{ pref: "<provider>/<modelId>" }`). 10s timeout. |
+| `GET` | `/api/pi-ai/providers` | List built-in pi-ai provider IDs through a browser-safe server boundary |
+| `POST` | `/api/pi-ai/provider-key-test` | Test a built-in provider API key without persisting it |
 | `GET` | `/api/image-models` | List currently available image-generation models |
 | `POST` | `/api/image-generation/generate` | Generate images through the configured image model; used by the `generate_image` tool |
 
 `GET /api/models` includes each model's `cost` in pi-ai's per-million-token shape: `{ input, output, cacheRead, cacheWrite }`. For AI Gateway models, Bobbit derives this from `/v1/models` `pricing.prompt` and `pricing.completion` metadata and does not call gateway aggregate endpoints such as `/v1/usage`, `/v1/cost`, or `/v1/credits`.
+
+`GET /api/pi-ai/providers` and `POST /api/pi-ai/provider-key-test` are an internal browser-safe pi-ai boundary. Browser UI uses them instead of runtime bare value imports from `@earendil-works/pi-ai`, because the package index traverses Node-only exports such as environment API-key probing and causes browser builds to externalize `node:fs`. Keep provider catalog reads and key tests behind these server endpoints unless pi-ai exposes a browser-safe package export.
+
+`GET /api/pi-ai/providers` responses:
+
+- `200 { providers: string[] }` — built-in pi-ai provider IDs, e.g. `"anthropic"` or `"openai"`. The response is not wrapped in a broader status envelope.
+- Endpoint-specific validation errors are not expected; normal API auth and body-size failures still apply.
+
+`POST /api/pi-ai/provider-key-test` body:
+
+```json
+{ "provider": "anthropic", "modelId": "claude-sonnet-...", "key": "sk-..." }
+```
+
+The key is used only for a one-off minimal completion probe (`"Reply with: OK"`) and is not stored. The server trims string fields before testing.
+
+`POST /api/pi-ai/provider-key-test` responses:
+
+- `200 { ok: true, modelResolved, latencyMs }` — the provider key completed a minimal request successfully.
+- `400 { ok: false, status: 400, error: "Missing provider, modelId, or key" }` — any required body field is absent, non-string, or empty after trimming.
+- `404 { ok: false, status: 404, error: "Model \"<provider>/<modelId>\" is not in the built-in pi-ai catalog." }` — the requested built-in model cannot be resolved.
+- `502 { ok: false, modelResolved, latencyMs, error }` — pi-ai resolved the model but the provider request failed or timed out. The body has no `status` field in this path.
 
 `POST /api/models/test` responses:
 
@@ -1193,6 +1315,18 @@ Step `status` is one of `passed`, `failed`, `skipped`, `running`, `waiting`, or 
 
 Running command steps may include bounded live stdout/stderr reads via `liveLogs`. The server reads a capped portion of the live log file first, then applies the requested `tail`, `head`, `slice`, `grep`, or `full` selection and the aggregate output budget. Use those selection modes for deeper targeted logs instead of relying on the default 20-line tail.
 
+Completed command steps can include retained diagnostics. When a verification request uses an explicit `mode`, `steps[].diagnostics` may report:
+
+| Field | Meaning |
+|---|---|
+| `diagnostics.outputSource` | `"retained-logs"`, `"live-logs"`, or `"compact-tail"` |
+| `diagnostics.logs.stdout` / `stderr` | Retained log path, bytes, line count, and cap/truncation metadata |
+| `diagnostics.artifacts` | Count and retained file metadata for copied `test-results` / `playwright-report` artifacts; small `error-context.md` files may include markdown `content` |
+| `diagnostics.inspectHints` | Suggested `gate_inspect` calls for targeted follow-up |
+| `diagnostics.note` | Human-readable summary of which output source was used |
+
+Default `gate_status`, notifications, and omitted-mode inspection do not include retained log paths or artifact file lists. Retained stdout and stderr are capped at 20 MiB per stream, and explicit inspection exposes cap/truncation metadata. See [Retained gate diagnostics](gate-diagnostics.md) for artifact retention, symlink hardening, and cleanup lifecycle.
+
 **`section=signals`** — Returns bounded signal history. The `signals[]` field remains present for compatibility, and large histories include totals/truncation fields plus deterministic selected JSON-lines `text`.
 ```json
 {
@@ -1282,9 +1416,13 @@ The generation resets to 0 on server restart. Clients should initialize their tr
 
 ### Continue-Archived endpoint
 
-`POST /api/sessions/:archivedId/continue` creates a brand-new session whose agent CLI rehydrates from a byte-for-byte clone of an archived, non-goal, non-delegate session's `.jsonl`. Used by the "Continue in New Session" footer button on archived session transcripts.
+`POST /api/sessions/:archivedId/continue` creates a brand-new session whose agent CLI rehydrates from a clone of an archived, non-goal, non-delegate session's `.jsonl`. Used by the "Continue in New Session" footer button on archived session transcripts.
 
-**Why it exists**: Users often want to pick up work from a finished session without reanimating its runtime state (stale worktree, dead sandbox container, committed/uncommitted changes on an old branch). This endpoint copies the *configuration* (project, model, role, sandbox mode, worktree mode) plus a verbatim copy of the source `.jsonl`, while routing through the normal session-setup pipeline so the runtime is entirely fresh — new worktree, new container state, no branch/commit inheritance, no goal/team/delegate relationships. The agent CLI rehydrates the cloned transcript via `switch_session`, the same mechanism restart-resume uses for live sessions — lossless, no byte budget, no system-prompt injection.
+**Why it exists**: Users often want to pick up work from a finished session without reanimating its runtime state (stale worktree, dead sandbox container, committed/uncommitted changes on an old branch). This endpoint copies the *configuration* (project, model, role, sandbox mode, worktree mode) plus the source conversation history, while routing through the normal session-setup pipeline so the runtime is entirely fresh — new worktree, new container state, no branch/commit inheritance, no goal/team/delegate relationships. The agent CLI rehydrates the cloned transcript via `switch_session`, the same mechanism restart-resume uses for live sessions — lossless user-visible transcript content, no byte budget, no system-prompt injection.
+
+For archived worktree-backed sources, the persisted `worktreePath` is only a provenance marker that enables worktree mode for the continued session. The endpoint does not require that path or the archived `branch` to exist, and it does not reuse them. The continued session gets its own `session/<new-id8>` branch/worktree from the currently registered project repo and configured base ref. Archived cwd/worktree values may be used only as old values when rebasing runtime-only Pi cwd metadata in the cloned transcript.
+
+Non-sandboxed worktree-backed continues use the normal session worktree allocation path: claim a ready project worktree-pool entry when available, and fall back to cold `createWorktree` / `createWorktreeSet` if the pool is empty, returns `null`, or `claim()` throws. Sandboxed continues explicitly bypass the host-side pool because their worktrees live inside the project sandbox container. Single-repo and multi-repo projects use the same worktree-support resolver as `POST /api/sessions`, so Continue-Archived does not have a separate capability rule.
 
 **Request body**: empty (or absent). A legacy `mode` field is tolerated but ignored — there is no Summary vs Full distinction any more, and no transcript truncation. See [docs/design/lossless-continue-archived.md](design/lossless-continue-archived.md) for the design rationale.
 
@@ -1302,7 +1440,9 @@ The generation resets to 0 on server restart. Clients should initialize their tr
 }
 ```
 
-The new session's title is marked as generated, which prevents the first-message auto-titler from overwriting `Continued: …` on the user's first prompt. `assistantType` echoes the source value (or `null` for non-assistant sessions) so callers can confirm the identity carried over.
+The new session's title is marked as generated, which prevents the first-message auto-titler from overwriting `Continued: …` on the user's first prompt. `assistantType` echoes the source value (or `null` for non-assistant sessions) so callers can confirm the identity carried over. If the source was worktree-backed, the returned `cwd` points at the newly claimed or cold-created worktree path, not the archived source path.
+
+Before `switch_session`, worktree-backed continues move the cloned JSONL into the final worktree-cwd slug path, then may rewrite runtime-only Pi cwd/session metadata from archived cwd/worktree values to the fresh cwd. Message content and user-visible transcript text are preserved losslessly.
 
 **Error responses**:
 
@@ -1312,7 +1452,7 @@ The new session's title is marked as generated, which prevents the first-message
 | `409` | Source session is not archived |
 | `410` | Source project has been unregistered (session cannot be continued without its project context) |
 | `422` | Source is a goal, delegate, or team member (`goalId` / `delegateOf` / `teamGoalId` set) — not eligible for continuation; **or** the copy would cross realms (host↔sandbox or between two different sandboxed projects — `CrossRealmCopyError`) |
-| `500` | JSONL clone failed unexpectedly (e.g. disk full, permission denied) — the destination file is unlinked and no session row (including any partially-cloned proposal-drafts directory) is created. See server logs. |
+| `500` | JSONL clone failed unexpectedly (e.g. disk full, permission denied), or fresh session/worktree creation failed against the current project repo/base ref after any pool fallback. Clone failures unlink the destination file and create no session row; create-session failures clean up the cloned transcript and any copied proposal/tool-content directories. A pool miss, `null` claim, or claim exception is not an API error by itself. Errors for worktree setup should identify the current project/base/worktree problem, not the archived source path or branch. See server logs. |
 
 **Scope gate**: The endpoint refuses goal-linked, delegate, and team-member sessions on purpose. Goal coupling (team structure, gates, tasks, shared worktrees) and delegate scoping don't survive the continue-into-a-fresh-session model. Users wanting to iterate on a goal should create a new session inside the goal instead. Assistant sessions (`assistantType` set) are explicitly **not** in this gate — see the previous paragraph for the carry-over semantics.
 

@@ -10,7 +10,9 @@ A **goal** is a unit of work with a title, spec (markdown), working directory, a
 
 `POST /api/goals` requires the caller to identify the project: either an explicit `projectId` in the request body, or a `cwd` inside a registered project's `rootPath`. There is no default-project fallback — a request with neither resolvable returns **400**. See the [Project resolution contract](rest-api.md#project-resolution-contract) in the REST API docs for the exact error shape.
 
-Goals can run in **team mode**, where a Team Lead agent orchestrates multiple role agents (coders, reviewers, testers) working concurrently in their own worktrees. Goals carry an `autoStartTeam` flag (defaults to `true`). When enabled, the server automatically calls `teamManager.startTeam()` after worktree setup completes — no manual "Start Team" click needed. If auto-start fails but the worktree succeeded, the error is logged and the worktree remains usable; the user can start the team manually. The retry-setup handler also respects this flag.
+Goals can run in **team mode**, where a Team Lead agent orchestrates multiple role agents (coders, reviewers, testers) working concurrently in their own worktrees. Goals carry an `autoStartTeam` flag (defaults to `true`). That flag is evaluated only during the goal creation / setup flow: after worktree setup completes, the server may call `teamManager.startTeam()` so no manual "Start Team" click is needed. The retry-setup handler also respects the same flag.
+
+`autoStartTeam` is **not** a standing restart policy. On gateway/server restart, Bobbit restores persisted active teams and re-subscribes their existing sessions, but it does not create a new Team Lead for an existing goal that has no active team. A goal created with `autoStartTeam: false`, or a goal whose team was later stopped with `teardownTeam`, remains teamless across restart; once setup is ready the UI should continue to offer manual "Start Team". If creation-time auto-start fails but the worktree succeeded, the error is logged and the worktree remains usable for that same manual start path.
 
 ### Workflows
 
@@ -29,6 +31,8 @@ Goal creation never assumes a workflow named `"general"` exists. The default-wor
 1. **Explicit `workflowId` supplied** — used as-is. If the id doesn't resolve in the project's `WorkflowStore`, the request fails with `Workflow not found: <id>`.
 2. **No `workflowId` supplied** — the server falls back to **the first workflow in `workflowStore.getAll()`**. Order is the store's insertion order, which preserves the project-config cascade priority (project > user > defaults). The UI mirrors this: the workflow `<select>` is seeded to the first available id once `fetchWorkflows` resolves.
 3. **No workflows at all** — `createGoal` throws `NO_WORKFLOWS_MSG` ("This project has no workflows configured…"). The UI never reaches submit in this state because the empty-workflows banner disables the Accept button (see below).
+
+These defaults are final goal-creation and user-side acceptance safety nets. They do **not** relax proposal seed validation for agents: when project workflows are resolvable and non-empty, `propose_goal` must name an explicit workflow ID (see [Validating a proposed workflow at proposal time](#validating-a-proposed-workflow-at-proposal-time)).
 
 No source file outside seed data, tests, and documentation may use the literal string `"general"` as a workflow default. This is enforced by the pinning test [`tests/no-general-workflow-default.test.ts`](../tests/no-general-workflow-default.test.ts), which scans `src/server/agent/` and `src/app/` for the string and rejects new occurrences (the role named `"general"` is explicitly allowlisted; it is unrelated to workflows). The pin exists because `"general"` was historically a magic default hardcoded in five places — UI dropdown initial state, accept handler fallback, `GoalManager` lookup, the goal-assistant prompt, and the re-attempt context builder — but workflows are now project-scoped with no system-level builtins, so there is no guarantee any given project has a workflow with that id. Hardcoding the string produced confusing `Workflow not found: general` errors on projects whose assistant had generated a bespoke workflow set with different names. The fix routes everything through "first workflow in store" instead, with the pinning test preventing reintroduction. See [Workflows](#workflows) for why workflows are project-scoped.
 
@@ -58,16 +62,19 @@ Validation now happens **at seed time**, the moment the proposal is written. The
 
 Rejections are structured `400` JSON so the agent can self-correct:
 
-- **`UNKNOWN_WORKFLOW`** — `workflow` is explicitly named but is not a configured workflow ID. The body carries `availableWorkflows: [{id, name}]` and a `message` listing the valid IDs.
-- **`UNKNOWN_OPTIONAL_STEP`** — one or more `options` names don't match an optional step of the chosen workflow. The body carries `validOptionalSteps: string[]` and a `message` listing them. Optional steps are matched **only by the canonical `step.name`** of `verify` steps with `optional: true` — the same identifier the verification runtime (`verification-logic.ts`) and the goal-creation UI key on (see [Optional verify steps](#optional-verify-steps)). Accepting an `optionalLabel`/`label` here would be a false success that later fails to enable the step. When `workflow` is omitted, `options` are validated against the project's default (first) workflow, consistent with [Default workflow resolution](#default-workflow-resolution).
+- **`MISSING_WORKFLOW`** — `workflow` is omitted or blank while the session has resolvable, non-empty project workflows. The body carries `availableWorkflows: [{id, name}]` and a `message` instructing the agent to re-call `propose_goal` with one of those IDs.
+- **`UNKNOWN_WORKFLOW`** — `workflow` is named but is not a configured workflow ID. The body carries `availableWorkflows: [{id, name}]` and a `message` listing the valid IDs.
+- **`UNKNOWN_OPTIONAL_STEP`** — one or more `options` names don't match an optional step of the chosen workflow. The body carries `validOptionalSteps: string[]` and a `message` listing them. Optional steps are matched **only by the canonical `step.name`** of `verify` steps with `optional: true` — the same identifier the verification runtime (`verification-logic.ts`) and the goal-creation UI key on (see [Optional verify steps](#optional-verify-steps)). Accepting an `optionalLabel`/`label` here would be a false success that later fails to enable the step.
 
-**Validation is skipped** (no error) when:
+**Validation is skipped** (no error) only when there is genuinely nothing to validate against:
 
-- The session has no resolvable `projectId` — workflows can't be resolved, so there is nothing to check.
-- The project has **zero workflows** — the empty-workflows state is preserved (see [Goal creation in a zero-workflow project](#goal-creation-in-a-zero-workflow-project)); the UI dropdown supplies a default.
-- `workflow` is **empty or omitted** — not an error; the UI dropdown supplies the default, so only explicitly-named unknown IDs are rejected.
+- The session has no resolvable `projectId`, so project workflows can't be found.
+- Workflow resolution itself is unavailable for the session/project context.
+- The resolved workflow list is empty, preserving the zero-workflow state (see [Goal creation in a zero-workflow project](#goal-creation-in-a-zero-workflow-project)).
 
-On the tool side, `propose_goal` (in `defaults/tools/proposals/extension.ts`) surfaces a seed rejection as an `isError` tool result whose text is the server's `message` — including the available-workflow list or valid optional-step names — so the agent sees the correction it needs. The other `propose_*` tools keep their log-and-ack behaviour; only `propose_goal` validates a workflow. The happy-path ack and the `__proposal_rev_v1__:<rev>` success contract are unchanged. Coverage: [`tests/e2e/proposal-goal-workflow-validation.spec.ts`](../tests/e2e/proposal-goal-workflow-validation.spec.ts) (API) and [`tests/proposal-tools-goal-validation.test.ts`](../tests/proposal-tools-goal-validation.test.ts) (tool-level).
+The proposal panel and final user-side Accept flow may still display or normalize to a safe valid workflow after workflows load. That UI fallback protects manual acceptance from stale or phantom selections; it is not a default the agent may rely on. Agent-side `propose_goal` seed validation must include an explicit valid `workflow` whenever project workflows are resolvable and non-empty.
+
+On the tool side, `propose_goal` (in `defaults/tools/proposals/extension.ts`) surfaces a seed rejection as an `isError` tool result whose text is the server's `message` — including the missing/available-workflow list or valid optional-step names — so the agent sees the correction it needs. The other `propose_*` tools keep their log-and-ack behaviour; only `propose_goal` validates a workflow. The happy-path ack and the `__proposal_rev_v1__:<rev>` success contract are unchanged. Coverage: [`tests/e2e/proposal-goal-workflow-validation.spec.ts`](../tests/e2e/proposal-goal-workflow-validation.spec.ts) (API) and [`tests/proposal-tools-goal-validation.test.ts`](../tests/proposal-tools-goal-validation.test.ts) (tool-level).
 
 #### Phantom workflow IDs in the proposal panel
 
@@ -180,7 +187,7 @@ workflows:
 - `component:` referencing an unknown component name
 - a `(component, command)` pair where the component has no such command name
 
-The validator does **not** reject template tokens in free-form `run:` or `prompt:` strings. Runtime context tokens (`{{branch}}`, `{{baseBranch}}`, `{{goal_spec}}`, `{{goal_title}}`, etc. — `{{master}}` is still accepted as a legacy alias) are necessary for workflows to function and are substituted by the gate runner before each step executes. Any other tokens (e.g. a stale `{{project.foo}}` left from a hand edit) just pass through to the shell as literal strings and fail at runtime the same way any other typo would.
+The validator does **not** reject template tokens in free-form `run:` or `prompt:` strings. Runtime context tokens (`{{branch}}`, `{{baseBranch}}`, `{{goal_spec}}`, `{{goal_title}}`, etc. — `{{master}}` is still accepted as a legacy alias) are necessary for workflows to function and are substituted by the gate runner before each step executes. `{{baseBranch}}` is a built-in bare branch name derived from configured `base_ref` (`origin/master` → `master`), falling back to the detected primary branch when unset. `{{project.*}}` is unsupported in verification templates; use structural `{ component, command }` references instead of project-variable command lookups.
 
 #### Workflow editor authoring
 
@@ -346,7 +353,7 @@ Each signal is recorded in the gate's signal history with a unique ID, timestamp
 
 Gates can define automated verification that runs when signaled:
 
-- **Command** — runs shell commands, checks exit codes (e.g. `npm run check`)
+- **Command** — runs shell commands and checks exit codes (e.g. `npm run check`). Command steps default to a 300s timeout unless the workflow sets `timeout`; component-linked `command: unit` steps default to 1200s because the full unit suite can exceed the generic shell default under contention.
 - **LLM review** — spawns a sub-agent for qualitative review against a prompt
 - **Agent QA** — spawns a test-engineer session that drives browser-based QA testing via the `/qa-test` skill
 - **Human sign-off** — parks the gate on a deferred resolver until a person approves or rejects via the UI (see [Human sign-off steps](#human-sign-off-steps))
@@ -383,6 +390,8 @@ Verification log output is bounded by default: `gate_status` and `gate_inspect s
 
 Running command steps can include live stdout/stderr tails. The server reads those log files with bounded byte limits before applying the same selection and aggregate response budgets used for persisted output.
 
+Completed command steps also retain stdout/stderr under Bobbit state. Default status surfaces and implicit inspection stay compact, but any explicit `gate_inspect(section="verification", mode=...)` request can query the retained logs and returns diagnostics metadata when available. Playwright-style `test-results` and `playwright-report` artifacts are copied into the same retained diagnostics tree, including `error-context.md`, traces, screenshots, and reports. Retained log streams are capped at 20 MiB each, artifact copying is symlink-hardened, and diagnostics are cleaned up when the owning goal is archived or deleted. Team leads should inspect these persisted diagnostics before rerunning expensive suites. See [Retained gate diagnostics](gate-diagnostics.md) for the full storage, inspection, and cleanup model.
+
 ##### Targeting a single verification step
 
 A gate often runs several verify steps (e.g. type-check + lint + unit + e2e, or multiple review steps). By default `gate_inspect section=verification` returns *every* step, so a team lead chasing one failing step still receives all the others' output and cannot scope a `grep`/`slice` to the step they care about. The optional `step` parameter fixes that: pass the step **name** and the snapshot is scoped to just that one step.
@@ -394,6 +403,16 @@ A gate often runs several verify steps (e.g. type-check + lint + unit + e2e, or 
 Typical triage flow: `gate_status` reports a failure and names the culprit in `failedSteps`, then `gate_inspect(section="verification", step="<name>", mode="grep", pattern="error|failed", context=2)` focuses the search on that step's log alone. See the [`gate_inspect` tool docs](../defaults/tools/tasks/gate_inspect.yaml) for the full parameter table.
 
 The UI uses the same explicit-status model. Gate status cards, the `gate_inspect` renderer, and signaled gate live cards reconcile WebSocket events, active-verification fetches, and persisted signal rows without flickering back to placeholder failed or `0ms` states while verification is still running.
+
+#### Verification template semantics
+
+Verification `run:` strings and `prompt:` bodies use a small runtime template scope:
+
+- `{{baseBranch}}` is a built-in and resolves to the bare integration branch from the project's configured `base_ref` (`origin/master` → `master`). If `base_ref` is unset, it falls back to the detected primary branch.
+- `{{master}}` is a legacy alias for the detected primary branch. It does not honor `base_ref`; prefer `{{baseBranch}}` in new workflows.
+- `{{project.*}}` is unsupported in verification templates. Component commands should use `{ component, command }`; QA settings should live under the selected component's `config:` map.
+
+Unresolved optional metadata can still make an optional command step skip. That skip behavior must not apply to required Ready-to-Merge built-ins: a required Ready-to-Merge check that references `{{branch}}`, `{{baseBranch}}`, or `{{master}}` should execute when the project has a resolvable branch, or fail loudly if the built-in cannot be resolved. It must not pass solely because the template remained unresolved.
 
 #### Gate verification baselines
 
@@ -407,13 +426,13 @@ Gate verification is **baseline-aware** — different gate kinds compare against
 | Implementation & later | `origin/<primary>...HEAD`                 | All other verify-bearing gates        |
 | `ready-to-merge`       | `origin/<primary>` via `git merge-base`   | Hardcoded in workflow YAML            |
 
-**Why `origin/<primary>` and not local `<primary>`:** local refs are only as fresh as the last `git pull` on the host. Goal worktrees are created from `origin/<primary>`; verification must diff against the same anchor or it surfaces commits that have already been merged upstream as if they were goal-unique work. The harness runs `git fetch origin <primary>` before each review so `origin/<primary>` is current.
+**Why `origin/<primary>` and not local `<primary>`:** in remote-backed projects, local refs are only as fresh as the last `git pull` on the host. Goal worktrees are normally created from `origin/<primary>`; verification must diff against the same anchor or it surfaces commits that have already been merged upstream as if they were goal-unique work. Before verification, the harness checks whether an `origin` remote exists. If it does, it syncs the goal worktree from `origin/<branch>` and fetches the baseline branch so `origin/<primary>` / `origin/{{baseBranch}}` is current. If the repository is local-only and has no `origin`, remote sync and baseline fetch are skipped quietly, and verification continues from the current local worktree state.
 
 **Why pre-implementation gates skip the diff entirely:** a design-doc or issue-analysis gate, by workflow construction, runs before any code is committed. A branch with zero goal-unique commits is the normal expected state. Running a diff produces noise at best, and — if local `<primary>` is stale — false positives at worst. The reviewer prompt explicitly forbids `git diff` / `git log` for these gates.
 
 **Primary branch detection:** the harness calls `detectPrimaryBranch(cwd)` from `src/server/skills/git.ts`, which uses `git symbolic-ref refs/remotes/origin/HEAD` with a `master` → `main` fallback. Never hardcode `"master"` in new gate logic — always resolve via this helper. The resolved baseline (e.g. `origin/main@abc1234`) is printed into every review prompt's "Signal Context" so failures are trivial to diagnose.
 
-**Configurable integration target (`base_ref`):** the project-level `base_ref` setting lets workflows track a different branch (e.g. `develop`, a release branch) as the integration target. New built-in/seeded workflows substitute `{{baseBranch}}` — the bare branch name derived from `base_ref` (or `detectPrimaryBranch()` when unset). `{{master}}` is intentionally unchanged and continues to resolve via `detectPrimaryBranch()` regardless of `base_ref`, so existing user-authored workflows keep their meaning. Write `origin/{{baseBranch}}` explicitly when a remote ref is needed. Full semantics, validation rules, and error inventory: [design/base-ref.md](design/base-ref.md).
+**Configurable integration target (`base_ref`):** the project-level `base_ref` setting lets workflows track a different branch (e.g. `develop`, a release branch) as the integration target. New built-in/seeded workflows substitute `{{baseBranch}}` — a built-in bare branch name derived from `base_ref` (for example, `origin/master` → `master`, `origin/develop` → `develop`) or from `detectPrimaryBranch()` when unset. `{{master}}` is a legacy alias that continues to resolve via `detectPrimaryBranch()` regardless of `base_ref`, so existing user-authored workflows keep their meaning. Write `origin/{{baseBranch}}` explicitly when a remote ref is needed. Full semantics, validation rules, and error inventory: [design/base-ref.md](design/base-ref.md).
 
 **Branch publication safety:** Ready-to-Merge templates publish the goal branch with an explicit destination refspec:
 
@@ -431,11 +450,11 @@ Do not use bare forms such as `git push origin {{branch}}` in verification. Bare
 
 #### Phased verification
 
-Verification steps have an optional `phase` field (integer, default 0). Steps are grouped by phase and phases execute **sequentially** in ascending order. Within each phase, steps run in **parallel** (preserving pre-phase behavior for phase-0 steps).
+Verification steps have an optional `phase` field (integer, default 0). Steps are grouped by phase and phases execute **sequentially** in ascending order. Within a phase, steps run concurrently by default, including `type: command` steps. If two command checks must not overlap, put them in different phases instead of relying on step type for ordering.
 
 If any step in a phase fails, all subsequent phases are skipped immediately and the gate fails. Skipped steps are recorded with `skipped: true` on `GateSignalStep` and output `"Skipped — earlier phase failed"`. The `skipped` flag persists to disk so the UI can distinguish skipped steps from passed/failed ones after page reload.
 
-This avoids wasting expensive LLM reviews (phase 1) when cheap command checks (phase 0) have already failed. In the built-in `feature` and `bug-fix` workflows, type-checking and tests run at phase 0, while code quality and security reviews run at phase 1.
+This avoids wasting expensive LLM reviews (phase 1) when cheap command checks (phase 0) have already failed, while keeping the `phase` field as the sole source of verification ordering. In the built-in `feature` and `bug-fix` workflows, type-checking and tests run at phase 0, while code quality and security reviews run at phase 1.
 
 ```yaml
 verify:
@@ -456,7 +475,7 @@ verify:
       Review for correctness, completeness, and code quality.
 ```
 
-**Backward compatibility:** Steps without a `phase` field default to phase 0. Existing workflows and snapshotted goal workflows continue to work — all steps execute in parallel as before.
+**Backward compatibility:** Steps without a `phase` field default to phase 0. Existing workflows and snapshotted goal workflows continue to work without migration. Same-phase steps run concurrently by default; explicit ordering between command checks should be represented with different `phase` values.
 
 **WebSocket events:** The server broadcasts `gate_verification_phase_started` before each phase begins, including the phase number and which step indices belong to it. Step-level events (`gate_verification_step_started`, `gate_verification_step_complete`) include an optional `phase` field. The goal dashboard uses these to show phase progression in real time.
 
