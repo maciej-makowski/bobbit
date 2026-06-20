@@ -9,6 +9,7 @@ Each session is a running `pi-coding-agent` child process with its own conversat
 - **Persistence**: Session metadata (id, title, cwd, agent session file, `wasStreaming` flag) persists to `.bobbit/state/sessions.json`. On server restart, sessions restore by re-spawning agents and using `switch_session` RPC to resume from the agent's `.jsonl` file. If an agent was mid-turn when the server died, it is automatically re-prompted.
 - **Auto-titles**: When the user sends their first prompt, `tryGenerateTitleFromPrompt()` fires **immediately** (before the agent replies) and calls Claude Haiku for a 2–3 word summary. The explicit `generate_title` command uses the full conversation history instead.
 - **Multi-device**: Multiple browser tabs/devices can connect to the same session. Events are broadcast to all clients.
+- **Session actions**: Sidebar rows and open-session headers share one canonical action model for rename/edit staff, terminate/end team, refresh, fork, copy link, system prompt inspection, and opening sessions in new windows. See [session-actions.md](session-actions.md).
 - **Force abort**: If a graceful abort doesn't make the agent idle within 3 seconds, the process is killed, a synthetic `agent_end` is emitted, and a fresh agent is spawned to resume the session. An `"aborting"` status is broadcast immediately so the UI shows feedback during the grace period. After force-kill, any in-flight steers that the SDK accepted but never echoed are pulled off the per-session shadow ledger and re-enqueued at the front of `promptQueue`; `drainQueue()` then redispatches them as a single steered batch. See [prompt-queue.md](prompt-queue.md#abort-and-force-kill-recovery) for details.
 
 ## Goals
@@ -90,8 +91,8 @@ Server-side queuing of user messages when the agent is busy.
 - Steered messages sort before non-steered (priority interrupt).
 - Queue auto-drains when the agent finishes a turn (suppressed on error — user must retry first).
 - Client can promote queued messages to steered (`steer_queued`), remove them (`remove_queued`), edit them (remove + populate textarea), or drag-reorder them (`reorder_queue`).
-- Queue pills show drag handle, edit (pencil), steer, and remove buttons. Steered pills show a "Sent" badge instead.
-- Steered messages are batched — they reorder to the front of the queue and are delivered as a single combined prompt when the agent next becomes idle (on normal turn completion or after abort+restart).
+- Queue pills show drag handle, edit (pencil), steer, and remove buttons. Steered pills that remain queued show a "Sent" badge; rows promoted while streaming are removed from the queue as they dispatch.
+- Steered messages are batched — they reorder to the front of the queue and are delivered as a single combined prompt. Streaming `steer_queued` promotions dispatch immediately through `_dispatchSteer()`; idle or recovered steered rows drain first when the agent becomes idle.
 - `follow_up` flag is preserved through the queue: messages enqueued with `isFollowUp: true` dispatch via `followUp()` RPC on drain.
 - Queue state broadcast to clients via `queue_update` events.
 
@@ -125,7 +126,7 @@ Context compaction reduces token usage by summarising the conversation.
 
 ## System Prompt Assembly
 
-Each session's system prompt is assembled from eight sections. Sections are separated by `\n\n---\n\n` and written to `.bobbit/state/session-prompts/{sessionId}.md` at spawn time.
+Each session's system prompt is assembled from a fixed set of ordered sections (numbered below) plus an optional provider-supplied tail. Sections are separated by `\n\n---\n\n` and written to `.bobbit/state/session-prompts/{sessionId}.md` at spawn time.
 
 The sections are ordered so that the **stable prefix** (sections 1–5, which are deterministic functions of the project and allowed tools) comes before the **volatile suffix** (sections 6–8, which vary per goal/task/session). This ordering lets provider prompt caches (Anthropic ephemeral, OpenAI prompt cache) reuse the tool docs and skills catalog across team spawns and between turns, because the cache key only invalidates at the first changed byte.
 
@@ -139,8 +140,9 @@ The sections are ordered so that the **stable prefix** (sections 1–5, which ar
 | 6 | **Goal + Role** | Yes | Goal spec and/or role prompt; combined under a single `# Goal` heading. |
 | 7 | **Current Task** | Yes | Task title, type, spec, and dependency list. Omitted when no task is assigned. |
 | 8 | **Workflow upstream-gate context** | Yes | Passed gate content injected for context. Omitted when not in a workflow. |
+| 9 | **Dynamic Context** | Yes | Provider-supplied ambient context from the `sessionSetup` lifecycle hook, fenced in `<context-block>` envelopes. Appended last (freshest, lowest-authority). Omitted unless an active provider contributes blocks. See [lifecycle-hub.md](lifecycle-hub.md#session-setup-wiring-g13). |
 
-Implementation: `src/server/agent/system-prompt.ts::_assembleSystemPrompt`. The inspector UI uses `getPromptSections()` (same file) to show labeled sections in the same order.
+Implementation: `src/server/agent/system-prompt.ts::_assembleSystemPrompt`. The inspector UI uses `getPromptSections()` (same file) to show labeled sections in the same order. Section 9 is appended after section 8 by the `sessionSetup` provider wiring (Extension Platform G1.3); when no provider contributes, it is absent and the prompt is byte-identical to the 1–8 layout.
 
 ## Reconnection
 
@@ -155,3 +157,10 @@ When the agent finishes a turn, the browser client notifies the user via:
 4. **Favicon badge + sidebar unread dot** — Persists until the user opens the session
 
 These cues are scoped to **human attention**: standalone sessions notify on idle (as before), team members and delegates stay silent (they escalate to their team lead, not the user), and a team lead notifies when the goal is `complete`, needs immediate human action, or is persistently stuck. One-shot beeps do not fire merely because a team lead went idle to wait for workers or verification. Notification surfaces consult the predicates in `src/app/notification-policy.ts`. See [design/notification-policy.md](design/notification-policy.md).
+
+## Model Authentication
+
+Models become usable either via an **account OAuth login** (Settings → Account) or a **provider API key** (Settings → Models → Provider API Keys). OAuth credentials are provider-partitioned in `auth.json` and are propagated into agent sandboxes through the same sanitized path for every provider.
+
+- **Anthropic** and **OpenAI** account login work as before.
+- **Google** has two intentionally separate paths: account OAuth (`google-gemini-cli`, via the official Gemini Code Assist API) and a Google AI Studio API key (`google`, the session-usable Gemini path). Today, account-backed Gemini models are authenticated but **not yet selectable for agent sessions** — session-usable Gemini requires the API key. See [google-oauth-models.md](google-oauth-models.md) for the full split, propagation model, and current limitation.

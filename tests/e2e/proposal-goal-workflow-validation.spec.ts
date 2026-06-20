@@ -19,20 +19,56 @@
  *   - seed { workflow: "feature", options: "bad" }   → 400 UNKNOWN_OPTIONAL_STEP (+ validOptionalSteps)
  *   - seed { workflow: "feature", options: "QA testing" } → 200 { ok: true } (canonical name)
  *   - seed { workflow: "feature", options: "Enable QA Testing" } → 400 (label NOT a valid key)
- *   - seed { workflow: "feature" } / omitted workflow → 200 (no false rejection)
+ *   - seed { workflow: "feature" }                  → 200 (no false rejection)
+ *   - seed with omitted/empty workflow                → 400 MISSING_WORKFLOW (+ availableWorkflows)
  *   - project-less session (no workflows resolvable)  → 200 (validation skipped)
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test, expect } from "./in-process-harness.js";
-import { apiFetch, createSession, deleteSession, rawApiFetch, readE2EToken } from "./e2e-setup.js";
+import { apiFetch, createGoal, createSession, deleteGoal, deleteSession, rawApiFetch, readE2EToken, startTeam, teardownTeam } from "./e2e-setup.js";
 
 async function seedGoal(sid: string, args: Record<string, unknown>): Promise<Response> {
 	return apiFetch(`/api/sessions/${sid}/proposal/goal/seed`, {
 		method: "POST",
 		body: JSON.stringify({ args }),
 	});
+}
+
+async function setSubgoalsEnabled(enabled: boolean): Promise<void> {
+	const resp = await apiFetch("/api/preferences", {
+		method: "PUT",
+		body: JSON.stringify({ subgoalsEnabled: enabled }),
+	});
+	expect(resp.status).toBe(200);
+}
+
+async function persistedGoalProposalFields(sid: string): Promise<Record<string, unknown>> {
+	const resp = await apiFetch(`/api/sessions/${sid}/proposals`);
+	expect(resp.status).toBe(200);
+	const body = await resp.json() as { proposals?: Array<{ proposalType?: string; fields?: Record<string, unknown> }> };
+	const proposal = body.proposals?.find(p => p.proposalType === "goal");
+	expect(proposal?.fields).toBeTruthy();
+	return proposal!.fields!;
+}
+
+async function expectMissingWorkflow(r: Response): Promise<void> {
+	expect(r.status).toBe(400);
+	const b = await r.json();
+	expect(b.ok).toBe(false);
+	expect(b.code).toBe("MISSING_WORKFLOW");
+	expect(Array.isArray(b.availableWorkflows)).toBe(true);
+	expect(b.availableWorkflows).toEqual(expect.arrayContaining([
+		expect.objectContaining({ id: "feature" }),
+		expect.objectContaining({ id: "general" }),
+	]));
+	const ids = b.availableWorkflows.map((w: any) => w.id);
+	expect(ids).toContain("feature");
+	expect(ids).toContain("general");
+	expect(String(b.message)).toMatch(/workflow/i);
+	expect(String(b.message)).toMatch(/feature/);
+	expect(String(b.message)).toMatch(/general/);
 }
 
 test.describe("goal proposal — workflow validation @smoke", () => {
@@ -45,6 +81,89 @@ test.describe("goal proposal — workflow validation @smoke", () => {
 
 	test.afterAll(async () => {
 		await deleteSession(sid);
+	});
+
+	test("team-lead goal proposal auto-fills parent only when a child can be spawned", async () => {
+		await setSubgoalsEnabled(true);
+		let parentId: string | undefined;
+		try {
+			const parent = await createGoal({
+				title: `proposal-parent-${Date.now()}`,
+				workflowId: "feature",
+				autoStartTeam: false,
+			});
+			parentId = parent.id;
+			const leadId = await startTeam(parentId);
+
+			const seeded = await seedGoal(leadId, {
+				title: "Implicit Child",
+				workflow: "feature",
+				spec: "Team-lead proposal with a spawn-capable parent should become an implicit child proposal.",
+			});
+			expect(seeded.status).toBe(200);
+			const fields = await persistedGoalProposalFields(leadId);
+			expect(fields.parentGoalId).toBe(parentId);
+		} finally {
+			if (parentId) await teardownTeam(parentId).catch(() => {});
+			if (parentId) await deleteGoal(parentId).catch(() => {});
+			await setSubgoalsEnabled(true);
+		}
+	});
+
+	test("team-lead goal proposal stays top-level when parent disallows subgoals", async () => {
+		await setSubgoalsEnabled(true);
+		let parentId: string | undefined;
+		try {
+			const parent = await createGoal({
+				title: `proposal-parent-no-subgoals-${Date.now()}`,
+				workflowId: "feature",
+				autoStartTeam: false,
+				subgoalsAllowed: false,
+			});
+			parentId = parent.id;
+			const leadId = await startTeam(parentId);
+
+			const seeded = await seedGoal(leadId, {
+				title: "Implicit Root",
+				workflow: "feature",
+				spec: "Team-lead proposal with subgoals disabled on the parent should remain a top-level goal proposal.",
+			});
+			expect(seeded.status).toBe(200);
+			const fields = await persistedGoalProposalFields(leadId);
+			expect(fields.parentGoalId).toBeUndefined();
+		} finally {
+			if (parentId) await teardownTeam(parentId).catch(() => {});
+			if (parentId) await deleteGoal(parentId).catch(() => {});
+			await setSubgoalsEnabled(true);
+		}
+	});
+
+	test("team-lead goal proposal stays top-level when system subgoals are disabled", async () => {
+		await setSubgoalsEnabled(true);
+		let parentId: string | undefined;
+		try {
+			const parent = await createGoal({
+				title: `proposal-parent-system-off-${Date.now()}`,
+				workflowId: "feature",
+				autoStartTeam: false,
+			});
+			parentId = parent.id;
+			const leadId = await startTeam(parentId);
+			await setSubgoalsEnabled(false);
+
+			const seeded = await seedGoal(leadId, {
+				title: "Implicit Root Off",
+				workflow: "feature",
+				spec: "Team-lead proposal with system subgoals disabled should remain a top-level goal proposal.",
+			});
+			expect(seeded.status).toBe(200);
+			const fields = await persistedGoalProposalFields(leadId);
+			expect(fields.parentGoalId).toBeUndefined();
+		} finally {
+			await setSubgoalsEnabled(true);
+			if (parentId) await teardownTeam(parentId).catch(() => {});
+			if (parentId) await deleteGoal(parentId).catch(() => {});
+		}
 	});
 
 	test("unknown workflow id → 400 UNKNOWN_WORKFLOW listing available ids", async () => {
@@ -95,9 +214,19 @@ test.describe("goal proposal — workflow validation @smoke", () => {
 		expect((await r.json()).ok).toBe(true);
 	});
 
-	test("omitted workflow is NOT an error (UI supplies the default) → 200", async () => {
+	test("omitted workflow → 400 MISSING_WORKFLOW listing available ids", async () => {
 		const r = await seedGoal(sid, { title: "G", spec: "body\n" });
-		expect(r.status).toBe(200);
+		await expectMissingWorkflow(r);
+	});
+
+	test("empty string workflow → 400 MISSING_WORKFLOW listing available ids", async () => {
+		const r = await seedGoal(sid, { title: "G", spec: "body\n", workflow: "" });
+		await expectMissingWorkflow(r);
+	});
+
+	test("whitespace-only workflow → 400 MISSING_WORKFLOW listing available ids", async () => {
+		const r = await seedGoal(sid, { title: "G", spec: "body\n", workflow: "   " });
+		await expectMissingWorkflow(r);
 	});
 
 	test("project-less session (no resolvable workflows) skips validation → 200", async () => {

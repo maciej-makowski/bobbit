@@ -1,7 +1,7 @@
-import { ChatPanel } from "../ui/index.js";
+import { ChatPanel } from "../ui/ChatPanel.js";
 import { removePanelWorkspaceTabs, selectPanelWorkspaceTab, selectProposalWorkspaceTab, startPreviewPolling, stopPreviewPolling } from "./preview-panel.js";
 import { startInboxSubscription, stopInboxSubscription } from "./inbox-panel.js";
-import type { ConnectionStatus } from "./remote-agent.js";
+import type { ConnectionStatus, ProposalSource } from "./remote-agent.js";
 import { RemoteAgent } from "./remote-agent.js";
 import {
 	state,
@@ -14,7 +14,8 @@ import {
 	GW_SESSION_KEY,
 	type GatewaySession,
 } from "./state.js";
-import { gatewayFetch, saveDraftToServer, loadDraftFromServer, deleteDraftFromServer, refreshSessions, startSessionPolling, updateLocalSessionTitle, updateLocalSessionStatus, fetchGitStatus, refreshPrStatusCache, teardownTeam, promoteProject, fetchProjects, notifyProposalDecision } from "./api.js";
+import { gatewayFetch, saveDraftToServer, loadDraftFromServer, deleteDraftFromServer, refreshSessions, startSessionPolling, updateLocalSessionTitle, updateLocalSessionStatus, fetchGitStatus, refreshPrStatusCache, teardownTeam, promoteProject, fetchProjects, notifyProposalDecision, readProposalSnapshot, type GitStatusData } from "./api.js";
+import { getPiAiModel } from "./pi-ai-lazy.js";
 import { formatProjectAssistantAutoPrompt } from "./project-assistant-autoprompt.js";
 import { reconcilePackRenderersForProject } from "./pack-renderers.js";
 import { reconcilePackPanelsForProject, setSessionSwitcher } from "./pack-panels.js";
@@ -30,7 +31,7 @@ import { teardownMobileScrollTracking } from "./mobile-header.js";
 import { storage } from "./storage.js";
 import { markSessionVisited } from "./render-helpers.js";
 import { showHeaderToast } from "./render.js";
-import { setSelectedWorkflowId, showProposalToast, resetProposalAnnCount } from "./proposal-panels-lazy.js";
+import { setSelectedWorkflowId, showProposalToast, resetProposalAnnCount, resetProjectProposalPanel } from "./proposal-panels-lazy.js";
 import { clearProposalAnnotations } from "../ui/components/review/proposal-annotations.js";
 import { restorePersistedReviewDocuments } from "./review-sources.js";
 import { buildProjectConfigDiff } from "./project-proposal-diff.js";
@@ -44,6 +45,7 @@ async function invalidateProjectScopeConfig(projectId: string): Promise<void> {
 import {
 	isProposalDismissed as isProposalDismissedTyped,
 	markProposalDismissed as markProposalDismissedTyped,
+	hasProposalDismissalRecord,
 	clearProposalDismissed as clearProposalDismissedTyped,
 	deleteProposalFile,
 } from "./proposal-helpers.js";
@@ -198,6 +200,10 @@ function resolveProjectMode(sessionId: string): "provisional" | "registered" {
 
 function isAssistantProposalType(type: ProposalType): boolean {
 	return state.assistantType === type || (type === "project" && state.assistantType === "project-scaffolding");
+}
+
+function shouldRevealProposalForSource(source: ProposalSource | undefined): boolean {
+	return source === "tool" || source === "legacy" || source === "seed" || source === "restore";
 }
 
 function revealActiveProposalPanel(type: ProposalType, sessionId: string): void {
@@ -427,8 +433,11 @@ const goalDraft = createDraftManager({
 			previewCwdEdited: state.previewCwdEdited,
 			hasReceivedProposal: state.assistantHasProposal,
 			goalAssistantTab: state.assistantTab,
+			previewWorktreeSetupCommand: state.previewWorktreeSetupCommand,
+			previewWorktreeSetupTimeoutMs: state.previewWorktreeSetupTimeoutMs,
 		};
 	},
+
 	restore: (_sessionId, draft: any) => {
 		let dismissed = false;
 		if (draft.activeGoalProposal) {
@@ -457,6 +466,13 @@ const goalDraft = createDraftManager({
 					rev,
 				};
 			}
+		} else if (hasProposalDismissalRecord(_sessionId, "goal")) {
+			// Broad-suite race: a late debounced save after dismissal can overwrite the
+			// server draft with no activeGoalProposal but stale previewTitle/previewSpec.
+			// The dismissal fingerprint is still authoritative for this session, so keep
+			// the slot empty and clear the form mirror instead of restoring stale fields.
+			delete state.activeProposals.goal;
+			dismissed = true;
 		} else if (state.activeProposals.goal?.sessionId !== _sessionId) {
 			// Finding 2 — an OFF-SCREEN proposal's client draft was never saved
 			// (the unified/legacy callbacks early-return while the panel is inactive),
@@ -475,6 +491,8 @@ const goalDraft = createDraftManager({
 			state.previewSpecEdited = false;
 			state.previewCwdEdited = draft.previewCwdEdited ?? false;
 			state.assistantHasProposal = false;
+			state.previewWorktreeSetupCommand = draft.previewWorktreeSetupCommand ?? "";
+			state.previewWorktreeSetupTimeoutMs = draft.previewWorktreeSetupTimeoutMs ?? "";
 		} else {
 			state.previewTitle = draft.previewTitle ?? "";
 			state.previewSpec = draft.previewSpec ?? "";
@@ -484,6 +502,8 @@ const goalDraft = createDraftManager({
 			state.previewSpecEdited = draft.previewSpecEdited ?? false;
 			state.previewCwdEdited = draft.previewCwdEdited ?? false;
 			state.assistantHasProposal = draft.hasReceivedProposal ?? false;
+			state.previewWorktreeSetupCommand = draft.previewWorktreeSetupCommand ?? "";
+			state.previewWorktreeSetupTimeoutMs = draft.previewWorktreeSetupTimeoutMs ?? "";
 		}
 		state.assistantTab = draft.goalAssistantTab ?? "chat";
 	},
@@ -507,14 +527,34 @@ export function deleteGoalDraft(sessionId: string): void { goalDraft.delete(sess
  * next fast-path restore is correct. Returns true if a slot for this session was
  * reconciled.
  */
+/**
+ * Mirror the optional per-goal worktree-setup fields from a proposal/slot into
+ * the legacy form-mirror state (stored as strings for direct <input>/<textarea>
+ * round-tripping). Shared by all goal-proposal mirror paths so a propose_goal-
+ * seeded assistant proposal carries `worktreeSetupCommand` /
+ * `worktreeSetupTimeoutMs` through acceptance, not just title/spec/cwd/workflow.
+ */
+function mirrorGoalSetupFields(src: { worktreeSetupCommand?: unknown; worktreeSetupTimeoutMs?: unknown }): void {
+	if (typeof src.worktreeSetupCommand === "string") {
+		state.previewWorktreeSetupCommand = src.worktreeSetupCommand;
+	}
+	const t = src.worktreeSetupTimeoutMs;
+	if (typeof t === "number" && Number.isFinite(t)) {
+		state.previewWorktreeSetupTimeoutMs = String(t);
+	} else if (typeof t === "string" && t.trim() !== "") {
+		state.previewWorktreeSetupTimeoutMs = t.trim();
+	}
+}
+
 function reconcileGoalSlotIntoFormMirror(sessionId: string): boolean {
 	const goalSlot = state.activeProposals.goal;
 	if (!goalSlot || goalSlot.sessionId !== sessionId) return false;
-	const g = goalSlot.fields as { title?: string; spec?: string; cwd?: string; workflow?: string };
+	const g = goalSlot.fields as { title?: string; spec?: string; cwd?: string; workflow?: string; worktreeSetupCommand?: unknown; worktreeSetupTimeoutMs?: unknown };
 	if (!state.previewTitleEdited && typeof g.title === "string") state.previewTitle = g.title;
 	if (!state.previewSpecEdited && typeof g.spec === "string") state.previewSpec = g.spec;
 	if (!state.previewCwdEdited && g.cwd) state.previewCwd = g.cwd;
 	if (g.workflow) setSelectedWorkflowId(g.workflow);
+	mirrorGoalSetupFields(g);
 	state.assistantHasProposal = true;
 	if (state.assistantTab === "chat" && !isDesktop()) state.assistantTab = "preview";
 	saveGoalDraft(sessionId);
@@ -1115,6 +1155,8 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 		state.previewTitle = "";
 		state.previewSpec = "";
 		state.previewCwd = "";
+		state.previewWorktreeSetupCommand = "";
+		state.previewWorktreeSetupTimeoutMs = "";
 		// Restore previewProjectId from the session record on fast-path switch-back.
 		// The draft-restore on the slow path has a matching fallback at ~line 1488;
 		// without this, clicking "Create Goal" in the proposal form after switching
@@ -1262,8 +1304,7 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 			const savedModel = loadSessionModel(sessionId);
 			if (!savedModel) return null;
 			try {
-				const { getModel } = await import("@earendil-works/pi-ai");
-				return getModel(savedModel.provider as any, savedModel.modelId);
+				return await getPiAiModel(savedModel.provider, savedModel.modelId) ?? null;
 			} catch {
 				return null; // Model no longer available
 			}
@@ -1556,6 +1597,7 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 					if (!state.previewCwdEdited && proposal.cwd) state.previewCwd = proposal.cwd;
 					if (!state.previewSpecEdited) state.previewSpec = proposal.spec;
 					if (proposal.workflow) setSelectedWorkflowId(proposal.workflow);
+					mirrorGoalSetupFields(proposal);
 				}
 				state.assistantHasProposal = true;
 				if (state.assistantTab === "chat" && !isDesktop()) {
@@ -1679,15 +1721,15 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 
 		// Slice E gap-closure: unified onProposal callback. Runs IN ADDITION to
 		// the legacy onXProposal callbacks above so:
-		//   • `proposal_update` from edit_proposal broadcasts hits the UI.
-		//   • `proposal_update {source: "rehydrate"}` on WS attach restores the panel
-		//     across server restarts.
+		//   • `proposal_update` from edit_proposal broadcasts hits the UI content.
+		//   • `proposal_update {source: "rehydrate"}` on WS attach restores cached
+		//     proposal content without recreating closed workspace tabs.
 		//   • `proposal_cleared` after DELETE clears the in-memory slot.
 		// The legacy callbacks still own the bespoke side-effects (project mode
 		// resolution, goal title summarisation, workflow JSON parse → populateFromProposal,
 		// per-type form-mirror state). The plugin.mergeFields shallow-merge guarantees
 		// the second invocation per propose_* tool-use is idempotent.
-		remote.onProposal = (type, fields, streaming, serverRev?: number) => {
+		remote.onProposal = (type, fields, streaming, serverRev?: number, source?: ProposalSource) => {
 			if (activeSessionId() !== sessionId) return;
 			if (fields === null) {
 				// proposal_cleared event from DELETE / accept
@@ -1797,20 +1839,22 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 				if (typeof gf.workflow === "string" && gf.workflow) setSelectedWorkflowId(gf.workflow);
 			}
 			const isMatchingAssistant = isAssistantProposalType(type);
+			const shouldRevealProposal = shouldRevealProposalForSource(source);
 			if (isFirstEmit) {
-				plugin.onFirstEmit(slot, {
-					isAssistant: isMatchingAssistant,
-					isMobile: !isDesktop(),
-				});
-				if (state.assistantType && !isMatchingAssistant && !isDesktop()) {
-					state.assistantTab = "preview";
+				if (shouldRevealProposal) {
+					plugin.onFirstEmit(slot, {
+						isAssistant: isMatchingAssistant,
+						isMobile: !isDesktop(),
+					});
+					if (state.assistantType && !isMatchingAssistant && !isDesktop()) {
+						state.assistantTab = "preview";
+					}
 				}
-			} else {
-				// Side-panel tab contract: "Agent-driven events may create/update a
-				// tab and make it active." When a proposal is updated (not just
-				// created), re-focus its existing side-pane tab in place. The id
-				// upsert merges into the existing tab row without reordering, so
-				// preview/review tabs keep their visible positions.
+			} else if (shouldRevealProposal) {
+				// Only fresh explicit proposal outputs may create/focus workspace tabs.
+				// Content-only sources (`rehydrate`, ordinary `edit`) still update the
+				// active proposal slot above, so already-open panels refresh naturally
+				// without resurrecting tabs the user closed.
 				revealProposalPanel(type, { sessionId }, {
 					isAssistant: isMatchingAssistant,
 					isMobile: !isDesktop(),
@@ -1826,11 +1870,12 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 			// callback so in-progress user edits are never clobbered. Runs on every
 			// non-dismissed goal proposal (first-emit, revision, edit, rehydrate).
 			if (type === "goal" && state.assistantType === "goal") {
-				const g = merged as { title?: string; spec?: string; cwd?: string; workflow?: string };
+				const g = merged as { title?: string; spec?: string; cwd?: string; workflow?: string; worktreeSetupCommand?: unknown; worktreeSetupTimeoutMs?: unknown };
 				if (!state.previewTitleEdited && typeof g.title === "string") state.previewTitle = g.title;
 				if (!state.previewSpecEdited && typeof g.spec === "string") state.previewSpec = g.spec;
 				if (!state.previewCwdEdited && g.cwd) state.previewCwd = g.cwd;
 				if (g.workflow) setSelectedWorkflowId(g.workflow);
+				mirrorGoalSetupFields(g);
 				saveGoalDraft(sessionId);
 			}
 			renderApp();
@@ -1866,7 +1911,7 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 				const cb = callbackMap[type];
 				if (cb) cb(liveFields, /* streaming */ false);
 				if (remote.onProposal) {
-					remote.onProposal(type, liveFields, false, liveRev);
+					remote.onProposal(type, liveFields, false, liveRev, "tool");
 				}
 			};
 
@@ -1888,7 +1933,6 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 				renderApp();
 				if (proposalFields) return;
 				try {
-					const { readProposalSnapshot } = await import("./api.js");
 					const res = await readProposalSnapshot(sessionId, type, numericRev);
 					if (res && (res as any).ok && hasObjectFields((res as any).fields)) {
 						const snapshotFields = (res as any).fields as Record<string, unknown>;
@@ -2248,6 +2292,18 @@ export async function connectToSession(sessionId: string, isExisting: boolean, o
 						state.previewSpecEdited = false;
 						state.assistantHasProposal = false;
 					}
+
+
+					state.previewTitle = "";
+					state.previewCwd = "";
+					state.previewSpec = "";
+					state.previewWorktreeSetupCommand = "";
+					state.previewWorktreeSetupTimeoutMs = "";
+					state.previewTitleEdited = false;
+					state.previewCwdEdited = false;
+					state.previewSpecEdited = false;
+					state.assistantHasProposal = false;
+
 					// Keep previewProjectId if set by showGoalDialog (pre-filled from project button)
 					// Only clear if not already set
 					if (!state.previewProjectId) {
@@ -2775,9 +2831,9 @@ async function acceptRegisteredProjectProposal(): Promise<void> {
 	state.projectProposalAcceptedBySessionId[propSessionId] = true;
 	delete state.activeProposals.project;
 	state.assistantHasProposal = false;
-	const keepAssistantPanelOpen = (state.assistantType === "project" || state.assistantType === "project-scaffolding") && propSessionId === activeSessionId();
-	if (keepAssistantPanelOpen) openAssistantProposalWorkspaceTab("project", propSessionId);
-	else removePanelWorkspaceTabs([proposalPanelTabId("project")], { sessionId: propSessionId, select: false, clearCollapse: false });
+	// Apply/Accept is a proposal-specific close path: the server workspace's
+	// absence is authoritative, so accepted saved-state must not reopen the tab.
+	removePanelWorkspaceTabs([proposalPanelTabId("project")], { sessionId: propSessionId, select: false, clearCollapse: false });
 	// Persist the accepted flag in the on-disk draft so it survives reload.
 	saveProjectDraft(propSessionId);
 	// Slice E: drop the on-disk proposal file once accepted.
@@ -2805,12 +2861,9 @@ export function backToSessions(): void {
 		delete state.projectProposalAcceptedBySessionId[state.activeProposals.project.sessionId];
 	}
 	delete state.activeProposals.project;
-	void (async () => {
-		try {
-			const { resetProjectProposalPanel } = await import("./proposal-panels-lazy.js");
-			resetProjectProposalPanel();
-		} catch { /* ignore */ }
-	})();
+	try {
+		resetProjectProposalPanel();
+	} catch { /* ignore */ }
 	state.assistantType = null;
 	state.assistantTab = "chat";
 	state.assistantHasProposal = false;
@@ -2936,7 +2989,7 @@ async function rehydrateProposalsForSession(sessionId: string): Promise<void> {
 		for (const p of body.proposals) {
 			if (p.proposalType === "goal" || p.proposalType === "role" || p.proposalType === "staff"
 				|| p.proposalType === "project" || p.proposalType === "tool") {
-				onProposal(p.proposalType, p.fields, false, p.rev);
+				onProposal(p.proposalType, p.fields, false, p.rev, "rehydrate");
 			}
 		}
 	} catch { /* best-effort */ }
@@ -3007,6 +3060,79 @@ if (typeof document !== "undefined") {
 	});
 }
 
+type GitStatusFile = { file: string; status: string };
+type GitStatusRepoEntry = {
+	status?: GitStatusFile[];
+	statusFiles?: GitStatusFile[];
+	clean?: boolean;
+	untrackedIncluded?: boolean;
+	[key: string]: unknown;
+};
+type ClientGitStatus = GitStatusData & {
+	partial?: boolean;
+	untrackedIncluded?: boolean;
+	repos?: Record<string, GitStatusRepoEntry>;
+};
+
+function isUntrackedStatusFile(file: GitStatusFile): boolean {
+	return file.status.includes("?");
+}
+
+function mergeStatusFilesPreservingUntracked(summaryFiles: GitStatusFile[] | undefined, fullFiles: GitStatusFile[] | undefined): GitStatusFile[] | undefined {
+	if (!fullFiles?.length) return summaryFiles;
+	const merged = [...(summaryFiles ?? [])];
+	const seen = new Set(merged.map((file) => file.file));
+	for (const file of fullFiles) {
+		if (!isUntrackedStatusFile(file) || seen.has(file.file)) continue;
+		merged.push(file);
+		seen.add(file.file);
+	}
+	return merged.length > 0 ? merged : summaryFiles;
+}
+
+function repoFiles(repo: GitStatusRepoEntry | undefined): GitStatusFile[] | undefined {
+	return repo?.statusFiles ?? repo?.status;
+}
+
+function withUntrackedStatusPreserved(current: ClientGitStatus | undefined, incoming: ClientGitStatus, requestedUntracked: boolean): ClientGitStatus {
+	const incomingIncludesUntracked = requestedUntracked || incoming.untrackedIncluded === true;
+	if (incomingIncludesUntracked) {
+		return { ...incoming, untrackedIncluded: true };
+	}
+	if (current?.untrackedIncluded !== true) return incoming;
+
+	const mergedStatus = mergeStatusFilesPreservingUntracked(incoming.status, current.status) ?? incoming.status;
+	const merged: ClientGitStatus = {
+		...incoming,
+		status: mergedStatus,
+		clean: incoming.clean && mergedStatus.length === 0,
+		untrackedIncluded: true,
+	};
+
+	if (incoming.repos || current.repos) {
+		const repos: Record<string, GitStatusRepoEntry> = { ...(incoming.repos ?? {}) };
+		for (const [repoName, currentRepo] of Object.entries(current.repos ?? {})) {
+			const incomingRepo = repos[repoName];
+			if (!incomingRepo) {
+				repos[repoName] = currentRepo;
+				continue;
+			}
+			const mergedRepoFiles = mergeStatusFilesPreservingUntracked(repoFiles(incomingRepo), repoFiles(currentRepo));
+			const files = mergedRepoFiles ?? repoFiles(incomingRepo) ?? [];
+			repos[repoName] = {
+				...incomingRepo,
+				...(mergedRepoFiles ? { status: mergedRepoFiles, statusFiles: mergedRepoFiles } : {}),
+				clean: incomingRepo.clean === true ? files.length === 0 : incomingRepo.clean,
+				untrackedIncluded: true,
+			};
+		}
+		merged.repos = repos;
+		merged.clean = merged.clean && !Object.values(repos).some((repo) => (repoFiles(repo)?.length ?? 0) > 0);
+	}
+
+	return merged;
+}
+
 async function refreshGitStatusForSession(
 	sessionId: string,
 	opts?: { fetch?: boolean; untracked?: boolean; source?: "event" | "poll" | "user" },
@@ -3037,10 +3163,11 @@ async function refreshGitStatusForSession(
 		isStale: () => activeSessionId() !== sessionId,
 		onOk: (data) => {
 			if (activeSessionId() !== sessionId) return;
-			ai.gitStatus = data as any;
-			ai.partial = !!(data as any).partial;
+			const next = withUntrackedStatusPreserved(ai.gitStatus as ClientGitStatus | undefined, data as ClientGitStatus, !!opts?.untracked);
+			ai.gitStatus = next as any;
+			ai.partial = !!next.partial;
 			(ai as any).gitRepoKnown = "yes";
-			if ((data as any).branch) ai.branch = (data as any).branch;
+			if (next.branch) ai.branch = next.branch;
 		},
 		onNotARepo: () => {
 			if (activeSessionId() !== sessionId) return;

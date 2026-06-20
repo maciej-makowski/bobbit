@@ -1,4 +1,4 @@
-import type { ChatPanel } from "../ui/index.js";
+import type { ChatPanel } from "../ui/ChatPanel.js";
 import type { RemoteAgent, ConnectionStatus } from "./remote-agent.js";
 import type { InboxEntry } from "../server/agent/inbox-store.js";
 import type { PanelWorkspaceTab } from "./panel-workspace.js";
@@ -101,6 +101,11 @@ export interface Goal {
 	workflowId?: string;
 	setupStatus?: "ready" | "preparing" | "error";
 	setupError?: string;
+	/** Optional host command run once after component setup during this goal's
+	 *  worktree provisioning. */
+	worktreeSetupCommand?: string;
+	/** Optional per-goal worktree-setup timeout override in milliseconds. */
+	worktreeSetupTimeoutMs?: number;
 	archived?: boolean;
 	archivedAt?: number;
 	/** If this goal is a re-attempt of another goal, the original goal's ID */
@@ -369,6 +374,17 @@ export const state = {
 	archivedSessionsHasMore: false,
 	archivedSessionsTotal: 0,
 
+	// Pagination/loading for archived search results. Kept separate from normal archive pagination.
+	archivedSearchQuery: "",
+	archivedSearchGoalsCursor: null as number | null,
+	archivedSearchGoalsHasMore: false,
+	archivedSearchGoalsTotal: 0,
+	archivedSearchGoalsLoading: false,
+	archivedSearchSessionsCursor: null as number | null,
+	archivedSearchSessionsHasMore: false,
+	archivedSearchSessionsTotal: 0,
+	archivedSearchSessionsLoading: false,
+
 
 	// Unified assistant state
 	assistantType: null as string | null,
@@ -384,6 +400,10 @@ export const state = {
 	previewSpecEdited: false,
 	hasReceivedProposal: false,
 	previewProjectId: "" as string,
+	// Per-goal worktree setup hook (assistant goal-draft flow). Stored as strings
+	// for direct <input>/<textarea> round-tripping; parsed/validated at submit.
+	previewWorktreeSetupCommand: "",
+	previewWorktreeSetupTimeoutMs: "",
 	previewSpecEditMode: false,
 	cwdDropdownOpen: false,
 	cwdHighlightIndex: -1,

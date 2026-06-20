@@ -141,7 +141,7 @@ Callers should always pass an explicit `projectId` when one is available. `cwd`-
 
 `SessionManager` does not hold default store fields (`this.store`, `this.costTracker`, etc.). All store access goes through PCM resolution. `TeamManager`, `StaffManager`, and `VerificationHarness` follow the same pattern - they resolve stores per-goal or per-entity via PCM, with no fallback store references. `resolveStoreForId()` returns `null` instead of falling back, and callers use optional chaining.
 
-**Verification harness project config resolution.** `VerificationHarness` resolves `ProjectConfigStore` per-goal via the private `resolveProjectConfigStore(goalId)` helper (alongside `resolveGateStore` etc.), not the server-level `projectConfigStore` injected at construction. This is what makes `{{project.*}}` substitution (e.g. `typecheck_command`, `test_unit_command`) and the `agent-qa` step's `qa_max_duration_minutes` lookup (now `getQaMaxDurationMinutes(componentName)`) pull from the **goal's owning project** config rather than the server's default. All four call sites - command-type verify steps in `runVerification`, LLM-review retry prompts in `_rerunLlmReviewStep`, agent-QA retry prompts in `_rerunAgentQaStep`, and the QA timeout lookup - go through the helper. If `projectContextManager` is unset (tests, legacy wiring) the helper silently falls back to the injected store; if it is set but the goal is not found in any context, the helper logs a `[verification]` warning and falls back, so the class of bug is diagnosable from logs.
+**Verification harness project config resolution.** `VerificationHarness` resolves `ProjectConfigStore` per-goal via the private `resolveProjectConfigStore(goalId)` helper (alongside `resolveGateStore` etc.), not the server-level `projectConfigStore` injected at construction. This is what makes component command resolution, `{{baseBranch}}` from the owning project's configured `base_ref`, and the `agent-qa` step's `qa_max_duration_minutes` lookup (now `getQaMaxDurationMinutes(componentName)`) pull from the **goal's owning project** config rather than the server's default. Verification `run:` strings and `prompt:` bodies do not support `{{project.*}}`; workflows should use structural `{ component, command }` references and component `config:` instead. If `projectContextManager` is unset (tests, legacy wiring) the helper silently falls back to the injected store; if it is set but the goal is not found in any context, the helper logs a `[verification]` warning and falls back, so the class of bug is diagnosable from logs.
 
 This design prevents a class of data corruption bugs where missing `projectId` values silently route data to the wrong project's store.
 
@@ -163,6 +163,18 @@ The migration is idempotent and handles missing files gracefully (fresh installs
 **What stays global**: `projects.json`, auth token, gateway URL, preferences, session colors, PR status.
 
 **Known limitations**: `active-verifications.json` stays in the central state dir (transient operational state).
+
+### Team restart restoration
+
+Team state is restored from each project's `team-state.json` so live teams survive gateway restarts without losing their lead/worker wiring. The restart path is restorative only:
+
+- `TeamManager.restoreTeams()` loads persisted team entries, repairs recoverable dangling records, and drops unrecoverable team-store entries so a future manual "Start Team" is not blocked by stale state.
+- After `SessionManager.restoreSessions()`, `TeamManager.resubscribeTeamEvents()` re-attaches lead/worker event listeners for those restored entries and may nudge an already-restored idle lead that has concrete outstanding work.
+- Restart does **not** scan team-mode goals and call `startTeam()` for goals that lack a restored team entry. A teamless existing goal stays teamless even if its persisted `autoStartTeam` flag is `true`.
+
+This distinction matters because `autoStartTeam` is a creation/setup affordance, not a supervisor. Goals created with `autoStartTeam: false` and goals explicitly stopped through `teardownTeam()` have no active team-store entry after setup/teardown, so they remain manual-start goals across restart. The UI should show "Start Team" rather than a silently recreated lead.
+
+Regression coverage pins that boot resubscribe does not call `startTeam()` for a sessionless ready team goal, and that start → teardown → restart leaves the goal teamless until manual start.
 
 ### Verification architecture
 
@@ -384,7 +396,7 @@ The marker is `.bobbit/config/project.yaml` rather than the mere presence of a `
 
 Each registered project can override system-level settings (from `project.yaml`). This allows different projects to use different build commands, default models, sandbox settings, etc., while inheriting everything they don't explicitly override.
 
-A notable config key is `base_ref` — the branch ref new worktrees branch off and the source for the `{{baseBranch}}` template variable. It also drives status baselines; branch publication still targets the work branch with explicit refspecs. Empty/unset preserves today's `resolveRemotePrimary()` behaviour. PUT-time validation rejects tags, SHAs, invalid grammar, non-`origin` prefixes, and (for sandboxed projects) local refs, with a structured `{ field, error, details? }` payload. See [design/base-ref.md](design/base-ref.md).
+A notable config key is `base_ref` — the branch ref new worktrees branch off and the source for the `{{baseBranch}}` template variable. Verification normalizes it to a bare branch name (`origin/master` → `master`) for templates. It also drives status baselines; branch publication still targets the work branch with explicit refspecs. Empty/unset preserves today's `resolveRemotePrimary()` behaviour. PUT-time validation rejects tags, SHAs, invalid grammar, non-`origin` prefixes, and (for sandboxed projects) local refs, with a structured `{ field, error, details? }` payload. See [design/base-ref.md](design/base-ref.md).
 
 **Resolution cascade**: For each config key, `resolveScalarConfig()` checks project → server → global → built-in default. The first defined value wins. This reuses the same `config-resolver.ts` infrastructure described in [Config resolution](#config-resolution-3-tier-hierarchy) above.
 
@@ -565,7 +577,7 @@ The **multi-repo invariant** - every configured repo is checked out as a sibling
 
 Free-form `{ run }` steps that need a different working directory use `cd ... && ...` inside the `run` string. This keeps the schema small and the working-dir rule unambiguous: it is structurally derived from the component, or it is the per-branch container root.
 
-`llm-review` and `agent-qa` step shapes are unchanged - they keep their `prompt:` body and runtime context tokens (`{{branch}}`, `{{baseBranch}}`, `{{goal_spec}}`; `{{master}}` is still accepted as a legacy alias) which are substituted by the gate runner before execution. `agent-qa` additionally carries an optional `component:` field that selects which component's `config:` map the `/qa-test` skill reads (and which workspace to start). When omitted, the verification harness falls back to the first component whose `config.qa_start_command` is set, then to a name-match against the project, then to `components[0]`.
+`llm-review` and `agent-qa` step shapes are unchanged - they keep their `prompt:` body and runtime context tokens (`{{branch}}`, `{{baseBranch}}`, `{{goal_spec}}`; `{{master}}` is still accepted as a legacy alias) which are substituted by the gate runner before execution. `{{baseBranch}}` is resolved from configured `base_ref` to a bare branch name; `{{master}}` remains a legacy detected-primary alias. `{{project.*}}` is unsupported in verification `run:`/`prompt:` templates. `agent-qa` additionally carries an optional `component:` field that selects which component's `config:` map the `/qa-test` skill reads (and which workspace to start). When omitted, the verification harness falls back to the first component whose `config.qa_start_command` is set, then to a name-match against the project, then to `components[0]`.
 
 The workflow validator (`workflow-validator.ts`) rejects, at load time:
 
@@ -598,7 +610,7 @@ If the `workflows:` block is empty or missing, goal creation surfaces a clear er
 
 ### Session worktrees
 
-Every non-goal, non-assistant session automatically gets its own git worktree branch. This eliminates conflicts between concurrent sessions that would otherwise all work on the same branch (usually master).
+Non-goal, non-assistant sessions normally get their own git worktree branch. This eliminates conflicts between concurrent sessions that would otherwise all work on the same branch (usually master). When worktrees are not supported — for example a freshly `git init`-ed repo whose `HEAD` has no commit yet — Bobbit keeps the session in the original project directory and records no worktree until the repo can safely branch.
 
 **Which sessions get worktrees:**
 
@@ -613,6 +625,10 @@ Every non-goal, non-assistant session automatically gets its own git worktree br
 | Staff permanent sessions | Auto when supported; no-worktree on `worktree:false` or non-git projects | `staff-<name>-<id>` when a worktree is used |
 
 **Pool branch namespace.** Pool entries pre-create worktrees under the `pool/_pool-<id>` branch prefix (was `session/_pool-*` pre-Phase 3). The `pool/` namespace lets the boot sweeper distinguish pool entries from session worktrees by branch prefix alone, and prevents pool entries from polluting the user's session branch list. Both prefixes (`pool/_pool-*` and the legacy `session/_pool-*`) are recognised on startup so sweeping is idempotent across version upgrades.
+
+**Unborn or unresolved `HEAD`.** Git cannot create a worktree from literal `HEAD` until the repository has an initial commit. Bobbit checks `git rev-parse --verify HEAD` before any implicit-`HEAD` worktree creation path. If a fresh local-only repo has no commits and no configured `base_ref`, regular sessions, staff auto-worktrees, goals, and pool prefill degrade to the same no-worktree behavior used for non-git projects. The warning is actionable (`Make an initial commit to enable worktrees`) and avoids surfacing raw `fatal: invalid reference HEAD` as the primary error.
+
+This check only applies when Bobbit would otherwise branch from implicit `HEAD`. A local-only repo with at least one commit still gets worktrees based on local `HEAD`. A configured `base_ref` is an explicit start point: it can enable worktree creation even while local `HEAD` is unborn, and if that configured ref is stale or missing, Bobbit fails loudly with the `base_ref '<value>' no longer exists` error instead of silently falling back to no-worktree.
 
 **Multi-repo worktree set.** In multi-repo projects every configured component repo (including data-only ones) gets a sibling worktree on the same branch. Layout under the default worktree parent (`<rootPath>-wt/` unless `worktree_root` is set):
 
@@ -646,6 +662,18 @@ Multi-repo pool entries are sets: each pool slot pre-builds N worktrees (one per
 
 **Session flow.** Pool entries pre-build on `pool/_pool-<id>`. On claim, `pool.claim(targetBranch)` runs the single branch-rename + worktree-move to the final `session/<id8>` name and the session is persisted with that name immediately. There is no first-prompt rename. The display title is independent of the git ref - `PUT /api/sessions/:id/title` updates metadata only. Archive cleanup operates on the final branch. See [Remove session worktree & branch renaming](design/remove-session-worktree-rename.md) for the full rationale and the test plan.
 
+**Shared worktree deletion guard.** Cleanup must never remove a worktree just because the session or goal currently being archived, purged, or repaired owns a stale record for it. Delegates, continued sessions, read-only children, shared session flows, and multi-repo goal/session sets can leave more than one persisted session pointing at the same host path. Deleting that path while any non-archived session still references it loses the other session's working tree and branch context.
+
+Before deleting a host worktree, cleanup checks persisted sessions across visible project contexts and skips deletion if any other non-archived session references the same normalized path. The guard considers:
+
+- `worktreePath` - the single-repo worktree root.
+- `cwd` - protects the candidate when the live session cwd is the same path or a child of it, which covers subdirectory projects.
+- `repoWorktrees` - every per-repo worktree path in a multi-repo session.
+
+Normalization is intentionally host-path focused: paths are trimmed, backslashes are treated as forward slashes, trailing separators are ignored, and comparison is case-insensitive. This lets Windows and Linux-style separators, casing differences, and stored `cwd` offsets compare consistently. It is not a broad ownership lock: if no live session references the normalized path, true orphan cleanup is still allowed.
+
+Protected cleanup paths include archived-session purge, manual maintenance orphan listing and cleanup, boot worktree sweeper classification/cleanup, multi-repo goal archive cleanup, and setup-failure cleanup. The existing delegate skip remains, but shared-path detection is the authoritative protection.
+
 **Boot sweeper.** `worktree-sweeper.ts` runs at server boot and reconciles `.git/worktrees/*` against persisted session/goal/staff records. It detects:
 
 - `pool/_pool-<id>` worktrees not in the in-memory pool - reclaimed.
@@ -661,8 +689,8 @@ This means crash recovery doesn't require the user to manually clean up pool det
 
 1. **Creation**: When `POST /api/sessions` creates a non-goal, non-assistant session in a git repo, the server auto-generates worktree options. For host sessions, the pool claim (or fallback `git worktree add`) creates the branch. For sandbox sessions, `ProjectSandbox.createWorktree()` creates it inside the container. In multi-repo projects, this provisions a worktree set (one per configured repo) at the `pool/_pool-<id>` branch; all repos share the same branch name; on first claim the pool entry's `pool/_pool-<id>` is renamed once to `session/<id8>` (or the goal branch as appropriate). Staff worktrees are provisioned by `StaffManager` directly and use the same project worktree-root/base-ref/component setup helpers when auto mode chooses a worktree. **Subdirectory projects**: When a project's `rootPath` is a subdirectory of a git repo (e.g. `/repo/packages/my-app`), worktrees are still created at the git repo root level (full checkout), but the session `cwd` is offset to the corresponding subdirectory within the worktree. The `worktreePath` remains the worktree root (for cleanup). This offset is computed via `path.relative(repoRoot, project.rootPath)` and applied consistently in goal creation, `executeWorktreeAsync`, pool claims, staff provisioning, and team member spawning.
 2. **Working**: The agent works in the worktree directory (or subdirectory for offset projects). The git status widget shows ahead/behind master, and push/pull controls work the same as for goal branches.
-3. **Cleanup**: On session terminate or archive, the worktree and branch are removed via `cleanupWorktree()` (host) or `ProjectSandbox.removeWorktree()` (sandbox).
-4. **Orphan detection**: Orphaned `session/*` worktrees (from ungraceful shutdowns where cleanup didn't run) are **not** removed automatically on startup. Use Settings → Maintenance tab to preview orphaned worktrees and clean them up manually. The REST API (`GET /api/maintenance/orphaned-worktrees`) lists orphans; `POST /api/maintenance/cleanup-worktrees` removes them after validation.
+3. **Cleanup**: On session terminate or archive, the worktree and branch are removed via `cleanupWorktree()` (host) or `ProjectSandbox.removeWorktree()` (sandbox) only after the shared worktree deletion guard confirms no other non-archived session still references the same host path.
+4. **Orphan detection**: Orphaned `session/*` worktrees (from ungraceful shutdowns where cleanup didn't run) are exposed in Settings → Maintenance and through the REST API (`GET /api/maintenance/orphaned-worktrees`, `POST /api/maintenance/cleanup-worktrees`). The same shared-path guard keeps live referenced paths out of the orphan list; unreferenced worktrees remain eligible for cleanup.
 5. **Restore**: After a restart, existing session worktrees are reused - the server reconnects to the worktree on disk without recreating it.
 
 **Session creation modes:** The session-setup pipeline (`src/server/agent/session-setup.ts`) handles four modes, all routed through the same plan/execute structure:
@@ -741,6 +769,8 @@ Bobbit creates four classes of remote branch and is responsible for deleting eac
 
 **Test-mode gate:** every push-delete call - existing (`cleanupWorktree`) and new (`deleteRemoteGoalBranches`, `eagerDeleteRemoteSessionBranch`) - short-circuits when `shouldSkipRemotePush()` returns true (`BOBBIT_TEST_NO_PUSH=1`). The eager session helper checks this flag *before* invoking `git merge-base --is-ancestor`, so test mode never touches git at all.
 
+**Goal delete errors are best effort:** `deleteRemoteGoalBranches` runs after the goal has been archived, and cleanup failures must not change the archive API result. When GitHub or a human has already deleted the goal branch, Git reports phrases such as `remote ref does not exist` or `unable to delete '<branch>': remote ref does not exist`; the handler treats that as an idempotent no-op and emits no warning. Auth, permission, network, timeout, and unknown Git failures still warn because they may leave remote branches behind.
+
 **Merge check (sessions only):** `eagerDeleteRemoteSessionBranch` runs `git merge-base --is-ancestor <branch> origin/<primary>` and only push-deletes on exit 0. If `origin/<primary>` is stale locally the check is conservative (skip delete) and `purgeExpiredArchives` mops up after 7 days. Local worktree cleanup remains in `purgeOneSession` so the archived-session review experience is preserved.
 
 **Why the goal handler snapshots eagerly:** `teamStore.get(id)` returns the live `PersistedTeamEntry`; `teardownTeam → dismissRole` calls `entry.agents.splice(...)` on that same object. Reading `teamEntry.agents` *after* teardown sees an empty array and only the team-lead branch gets deleted - every per-role branch leaks. The fix copies branch names into a fresh `readonly string[]` before teardown.
@@ -786,24 +816,28 @@ Archived, non-goal, non-delegate sessions render a "Continue in New Session" but
 
 **Why split settings from runtime state**: Users reopening an archived session usually want to resume the task, not resurrect the exact environment. The old worktree may be gone, the sandbox container may have been pruned, and the branch may be merged or abandoned. Continue-Archived gives them the same tools (model, role, sandbox/worktree flags) in a fresh runtime, with the prior conversation available as context only.
 
+For worktree-backed archived sessions, the archived `worktreePath` is provenance only: it says the source had worktree mode enabled. Continue never stats, repairs, revives, or reuses that path, and it never checks out the archived `branch`. The new session creates a fresh `session/<new-id8>` branch and worktree from the currently registered project configuration. Archived cwd/worktree values may be used only as old values to replace in runtime-only transcript metadata.
+
+Non-sandboxed continues use the same worktree allocation path as normal session creation: claim from the project worktree pool first, then fall back to cold `createWorktree` / `createWorktreeSet` if the pool is empty, returns `null`, or `claim()` throws. Sandboxed continues bypass the host-side pool explicitly because their worktrees live inside the project sandbox container. Single-repo and multi-repo capability is resolved through the same `resolveWorktreeSupport` path as `POST /api/sessions`, so there is no Continue-specific multi-repo rule.
+
 **What is copied:**
 
 - `projectId`
 - `modelProvider`, `modelId` (applied post-create via `setModel` + persisted immediately; worktree sessions set the model once the agent is ready)
 - `role` (resolved via `roleManager.getRole()`, so prompt/accessory/tool policies are re-applied fresh)
 - `sandboxed` flag (new container state per normal per-project sandbox rules)
-- `worktreePath` presence - if the source had a worktree, the new session gets one via the standard pipeline (pool claim or `git worktree add`)
+- `worktreePath` presence - if the source had a worktree, the new session requests a fresh worktree via the standard create-session pipeline against the current project repo/base ref, including normal pool claim/fallback semantics for non-sandboxed sessions
 
 **What is explicitly NOT copied:**
 
-- Working directory, worktree path, branch, uncommitted changes
+- Working directory, worktree path, branch, uncommitted changes (including deleted/stale archived worktree paths or branches)
 - Sandbox container identity or in-container state (the new session joins the project's container per normal semantics)
 - `goalId`, `teamGoalId`, `teamLeadSessionId`, `delegateOf` - guaranteed absent because the scope gate rejects those source types up front
 - Task/gate signals, streaming state, tool state
 
 **Scope gate** (enforced server-side in `handleApiRoute()` and client-side in `AgentInterface.ts`): the source must be archived, have no `goalId`, no `delegateOf`, no `teamGoalId`, and its project must still be registered. Violations return `409` / `422` / `410` respectively. Assistant sessions (`assistantType` set) are accepted — the new session inherits `assistantType`, `role`, and `accessory`, and the source's proposal-draft directory is cloned into the new session's slot so the resumed agent picks up the in-progress draft. See [docs/rest-api.md - Continue-Archived endpoint](rest-api.md#continue-archived-endpoint) for the full error table and [docs/archived-proposal-reopen.md](archived-proposal-reopen.md) for the assistant-continue flow.
 
-**Lossless transcript carry-over**: Continue-Archived used to render the archived transcript back to plain text and inject it into the new session's system prompt as `seedContext`, capped at 128 KB - any non-trivial session was truncated. The endpoint now clones the source `.jsonl` byte-for-byte and lets the agent CLI rehydrate from it via `switch_session`, the same mechanism `restoreSession()` uses for live-session restart. Full transcript fidelity, no byte budget, no system-prompt section, no Summary vs Full distinction. Full design rationale: [docs/design/lossless-continue-archived.md](design/lossless-continue-archived.md).
+**Lossless transcript carry-over**: Continue-Archived used to render the archived transcript back to plain text and inject it into the new session's system prompt as `seedContext`, capped at 128 KB - any non-trivial session was truncated. The endpoint now clones the source `.jsonl` and lets the agent CLI rehydrate from it via `switch_session`, the same mechanism `restoreSession()` uses for live-session restart. Conversation and user-visible transcript content remain lossless, with no byte budget, system-prompt section, or Summary vs Full distinction. Runtime-only Pi metadata inside the JSONL, such as Pi `session` cwd records or `system`/`init` cwd records, may be rebased so the clone can load in the fresh runtime. Full design rationale: [docs/design/lossless-continue-archived.md](design/lossless-continue-archived.md).
 
 **Endpoint flow** (`src/server/server.ts`, `POST /api/sessions/:archivedId/continue`):
 
@@ -815,10 +849,12 @@ Archived, non-goal, non-delegate sessions render a "Continue in New Session" but
    - **host↔sandbox** or **cross-project sandboxed**: throws `CrossRealmCopyError` → handler returns **422**.
    Other copy failures unlink the destination and return **500** with cleanup.
 4. Best-effort `copyToolContentDirIfPresent(srcId, dstId, stateDir)` recursively copies `<stateDir>/tool-content/<srcId>/` if present. The directory does not exist on disk today - `GET /api/sessions/:id/tool-content/:mi/:bi` reads through `rpcClient.getMessages()` from the JSONL - but the helper is shipped as defensive forward-compat for any future on-disk cache.
-5. Build `createSession` opts with `preExistingAgentSessionFile: <destPath>`. The `seedContext` / `seedContextSourceId` opts have been removed entirely - they had no other callers.
-6. Inside the session-setup pipeline (`src/server/agent/session-setup.ts`), `persistOnce` writes the cloned path as `agentSessionFile` on the `PersistedSession` row **before** spawn, so a hard kill between persist and spawn cannot strand the clone. After `rpcClient.start()` succeeds and before `persistSessionMetadata`, the pipeline issues `{type: "switch_session", sessionPath: plan.preExistingAgentSessionFile}` - the same RPC restart-resume uses (`session-manager.ts::restoreSession`). The agent CLI loads the cloned transcript before the user's first prompt.
+5. Build `createSession` opts with `preExistingAgentSessionFile: <destPath>`. The `seedContext` / `seedContextSourceId` opts have been removed entirely - they had no other callers. If the archived source was worktree-backed, the handler derives `worktreeOpts` from current project components via `resolveWorktreeSupport` and sets `awaitWorktreeSetup` so fresh-worktree failures are returned synchronously. It sets `bypassWorktreePool` only for sandboxed continues.
+6. Inside the session-setup pipeline (`src/server/agent/session-setup.ts`), `persistOnce` writes the cloned path as `agentSessionFile` on the `PersistedSession` row **before** spawn, so a hard kill between persist and spawn cannot strand the clone. Worktree-backed continues allocate a new `session/<new-id8>` branch/worktree from the current project base ref. Non-sandboxed sessions first call `worktreePool.claim(targetBranch)` and use the claimed path when it succeeds; `null` or thrown claims fall through to the existing cold worktree path. The archived source `worktreePath` and `branch` are not inputs to this allocation. After `rpcClient.start()` succeeds and before `persistSessionMetadata`, the pipeline rebases eligible runtime-only cwd metadata, then issues `{type: "switch_session", sessionPath: plan.preExistingAgentSessionFile}` - the same RPC restart-resume uses (`session-manager.ts::restoreSession`). The agent CLI loads the cloned transcript before the user's first prompt.
 
-**Worktree-cwd slug rebase**: Step 2 computes `destJsonl` against `proj.rootPath` because that's the only `cwd` known at request time. For worktree-backed sources, however, the agent CLI boots with `cwd = offsetCwd` (the per-branch worktree container), and `formatAgentSessionFilePath` embeds a `slugify(cwd)` segment in the path - so a clone left under the project-root slug-dir is invisible to the agent CLI and `switch_session` fails. To bridge this, `executeWorktreeAsync` in `src/server/agent/session-setup.ts` rebases the cloned `.jsonl` after `plan.cwd` is finalised to the worktree path and before `switch_session` is issued: it re-derives the correct path via `formatAgentSessionFilePath(plan.cwd, Date.now(), session.id)`, moves the file (host-side `fs.promises.rename` with a `copyFile + unlink` cross-device fallback for non-sandboxed sessions; container-side `sessionFileCopy + sessionFileDelete` for sandboxed sessions), `mkdir { recursive: true }`s the target dir, and updates both `plan.preExistingAgentSessionFile` and the persisted `agentSessionFile` field so a hard kill in the post-spawn window restores the right path. The rebase only fires on the worktree branch when `plan.preExistingAgentSessionFile` is set; the non-worktree continue path is untouched. Regression test: `tests/e2e/continue-archived-worktree.spec.ts`.
+**Worktree-cwd slug rebase**: Step 2 computes `destJsonl` against `proj.rootPath` because that's the only `cwd` known at request time. For worktree-backed sources, however, the agent CLI boots with `cwd = offsetCwd` (the per-branch worktree container), and `formatAgentSessionFilePath` embeds a `slugify(cwd)` segment in the path - so a clone left under the project-root slug-dir is invisible to the agent CLI and `switch_session` fails. To bridge this, `executeWorktreeAsync` in `src/server/agent/session-setup.ts` rebases the cloned `.jsonl` after `plan.cwd` is finalised to the worktree path and before `switch_session` is issued: it re-derives the correct path via `formatAgentSessionFilePath(plan.cwd, Date.now(), session.id)`, moves the file (host-side `fs.promises.rename` with a `copyFile + unlink` cross-device fallback for non-sandboxed sessions; container-side `sessionFileCopy + sessionFileDelete` for sandboxed sessions), `mkdir { recursive: true }`s the target dir, and updates both `plan.preExistingAgentSessionFile` and the persisted `agentSessionFile` field so a hard kill in the post-spawn window restores the right path. After the move and before `switch_session`, `rebaseAgentTranscriptCwdMetadataFile` may rewrite runtime-only Pi cwd/session metadata. Today that means top-level `cwd` on Pi `session` records, `system`/`init` records, or legacy `system` records with no subtype is rewritten from archived `ps.cwd`/`ps.worktreePath` values to the fresh `plan.cwd`; message content is not inspected or rewritten. The rebase only fires on the worktree branch when `plan.preExistingAgentSessionFile` is set; the non-worktree continue path is untouched. Regression tests: `tests/e2e/continue-archived-worktree.spec.ts` and `tests/e2e/continue-archived-worktree-stale-source.spec.ts`.
+
+**Fresh worktree failure reporting**: If the source was worktree-backed and the current project repo/base ref is invalid, Continue returns the fresh-create failure from the current project setup path. Pool miss, `claim()` returning `null`, and `claim()` throwing are not surfaced as API errors; they fall back to cold creation first. The final error, if any, should mention the current repo/base/worktree problem, not the archived source `worktreePath` or `branch`, because those archived fields are not dependencies. Regression test: `tests/e2e/continue-archived-worktree-invalid-base.spec.ts`.
 
 **Title**: The new session is titled `Continued: <original title>` and marked `markGenerated: true` so the first-message auto-titler does not overwrite it.
 
@@ -830,6 +866,7 @@ Archived, non-goal, non-delegate sessions render a "Continue in New Session" but
 - `src/server/server.ts` - `POST /api/sessions/:archivedId/continue` handler (scope gate, copy, session creation, cleanup-on-failure).
 - `src/server/agent/session-manager.ts` - `recoverSessionFile` is public; `createSession` opts carry `preExistingAgentSessionFile?: string` (no `seedContext` plumbing).
 - `src/server/agent/session-setup.ts` - `SessionSetupPlan.preExistingAgentSessionFile`; both `spawnAgent` and `executeWorktreeAsync` issue `switch_session` after `rpcClient.start()` succeeds, before `persistSessionMetadata`. `persistOnce` writes the path up front.
+- `src/server/agent/transcript-sanitizer.ts` - runtime-only cwd metadata rebase plus blank user-message sanitizer at the rehydration boundary.
 - `src/server/agent/system-prompt.ts` - `seedContext` / `seedContextSource` and the `## Prior Session Transcript` section have been removed from `PromptParts`.
 - `src/ui/components/AgentInterface.ts` - footer renderer, keyed by `[data-continue-archived-footer]`.
 - `src/ui/components/ContinueSessionChooser.ts` - confirm-only modal (no mode radio, no large-transcript warning, empty POST body).
@@ -892,8 +929,8 @@ The collapsed (icon-only) sidebar buckets staff under their owning project group
 - **Global visibility toggle**: The bottom-bar "See Archived" button (localStorage `bobbit-show-archived`, state `state.showArchived`) still controls whether any archived content is rendered at all. It is global, not per-project - one toggle flips every per-project Archived subsection at once. This keeps the user-visible UX contract of the pre-existing toggle unchanged.
 - **Per-project collapse state**: Each project's Archived subsection defaults to **expanded** when `showArchived` is on; users can collapse individual projects' subsections independently. Collapsed project IDs are persisted in localStorage `bobbit-archived-collapsed-projects` (mirrors `bobbit-collapsed-ungrouped` / `bobbit-collapsed-staff`). Access via `isArchivedSectionExpanded(projectId)` / `setArchivedSectionExpanded(projectId, value)` in `state.ts`. Default-expanded is deliberate: before the per-project split there was no intermediate "collapsed but visible" state, so expanded-by-default preserves the old behaviour of "See Archived on = archived items are visible".
 - **Orphaned-item fallback**: Archived goals or sessions whose `projectId` is missing or does not resolve to a registered project are bucketed into the first project's Archived subsection so they remain visible to the user rather than silently disappearing. This is a UI rendering fallback for data inconsistencies - it does not imply a runtime default project on the server side. On desktop the fallback emits a `console.warn` to make the inconsistency debuggable; on mobile (via `bucketArchivedByProject` in `render-helpers.ts`) the fallback is silent.
-- **Pagination (v1)**: Archived goals and sessions are still fetched globally (not per-project) via `GET /api/goals?archived=true` and `GET /api/sessions?include=archived`. The "Load more archived goals..." / "Load more archived sessions..." buttons are rendered **once**, below the project list, not per project. Per-project pagination would require server-side `projectId` filters on those endpoints and is intentionally deferred. On mobile the pagination buttons are additionally hidden while a search query is active, since search results collapse the per-project layout.
-- **Search**: The `_archivedBySearch` / `_ensureArchivedForSearch` auto-open behaviour is unchanged - a search match inside any archived item still forces `state.showArchived` on globally. When a search query is active, each project's subsection only renders matching items; projects with no matches render no Archived subsection at all.
+- **Pagination**: Archived goals and sessions are fetched through the archived list endpoints: `GET /api/goals?archived=true` and `GET /api/sessions?include=archived`. With no sidebar query, the "Load more archived goals..." / "Load more archived sessions..." buttons are rendered **once**, below the project list, not per project, and page by `archivedAt` recency. With an active sidebar query, normal archive pagination is replaced by query-aware pagination against `q`-filtered results; the controls become "Load more matching archived goals..." / "Load more matching archived sessions..." and keep the active query instead of loading arbitrary non-matching pages.
+- **Search**: The `_archivedBySearch` / `_ensureArchivedForSearch` auto-open behaviour opens archived sections globally when the sidebar query is non-empty. Live sessions/goals/staff and already-loaded archived rows are filtered instantly in the client, but full-corpus archived lookup is debounced and backed by `GET /api/goals?archived=true&q=<query>` plus `GET /api/sessions?include=archived&q=<query>`. When a search query is active, each project's subsection only renders matching items; projects with no matches render no Archived subsection at all. See [Sidebar Archived Search](sidebar-archived-search.md).
 - **Collapsed sidebar**: `renderCollapsedSidebar` is unchanged - archived goals continue to render inline with live goals in the icon-only rail.
 
 ### Sidebar keyboard navigation
@@ -937,7 +974,7 @@ Session/goal/search endpoints accept optional `?projectId=` filter:
 
 ## Editable proposals
 
-Every `propose_*` payload (`goal`, `project`, `role`, `tool`, `staff`) is mirrored to a real file under `.bobbit/state/proposal-drafts/<sessionId>/<type>.{md,yaml}`. The file is the single source of truth; the in-memory `state.activeProposals[type]` slot is a parsed projection rebuilt on every change. Two new tools - `view_proposal(type)` and `edit_proposal(type, old_text, new_text)` - let the agent apply surgical changes via exact-string replacement, with structured rollback on parse failure.
+Every `propose_*` payload (`goal`, `project`, `role`, `tool`, `staff`) is mirrored to a real file under `.bobbit/state/proposal-drafts/<sessionId>/<type>.{md,yaml}`. The file is the single source of truth for draft content; the in-memory `state.activeProposals[type]` slot is a parsed content projection rebuilt on every change. Side-panel tab presence is separate and comes from the server-backed workspace. Two new tools - `view_proposal(type)` and `edit_proposal(type, old_text, new_text)` - let the agent apply surgical changes via exact-string replacement, with structured rollback on parse failure.
 
 ### Why
 
@@ -990,7 +1027,7 @@ Per-type metadata lives in `src/server/proposals/proposal-types.ts`: `filename`,
 
 ### Unified client state
 
-The legacy per-type slots (`activeGoalProposal`, `activeProjectProposal`, `activeRoleProposal`, `activeStaffProposal`, plus the implicit `tool` slot) are collapsed into one map in `src/app/state.ts`:
+The legacy per-type content slots (`activeGoalProposal`, `activeProjectProposal`, `activeRoleProposal`, `activeStaffProposal`, plus the implicit `tool` slot) are collapsed into one map in `src/app/state.ts`:
 
 ```ts
 activeProposals: Partial<Record<ProposalType, ProposalSlot>>;
@@ -1007,7 +1044,7 @@ interface ProposalSlot {
 `src/app/proposal-registry.ts` exports `ProposalType`, `ProposalSlot`, `ProposalTypePlugin`, and `PROPOSAL_TYPE_REGISTRY`. Each plugin contributes:
 
 - `mergeFields(prev, incoming)` - streaming shallow-merge. Project carries `components` and `workflows` forward when the partial omits them; goal carries the markdown body across frontmatter-only deltas; the others use a plain spread.
-- `onFirstEmit(slot, opts)` - tab auto-select on the first emit (e.g. project flips `previewPanelActiveTab="project"`, mobile flips the assistant tab).
+- `onFirstEmit(slot, opts)` - reveal helper used only by explicit proposal-open sources (e.g. project flips `previewPanelActiveTab="project"`, mobile flips the assistant tab).
 - `validate(fields)` - returns blocking errors that disable the submit button.
 - `accept(slot)` - reserved hook; current accept paths (`createGoal`, `acceptProjectProposal`, role/tool/staff save flows) are unchanged.
 
@@ -1020,13 +1057,13 @@ LocalStorage key for dismissal is `bobbit-${type}-proposal-dismissed-${sessionId
 
 ### Panel routing and tabs
 
-`state.activeProposals[type]` is the routing source for every proposal surface. A proposal is openable when the active session has a slot for one of the supported `ProposalType`s (`goal`, `project`, `role`, `tool`, `staff`); `assistantType` does not filter the slot.
+Proposal content and proposal tab presence are separate. `state.activeProposals[type]` is a parsed content/cache slot used by proposal panels once a tab is open; it is not the routing source for side-panel tabs. The server-backed side-panel workspace is authoritative for open proposal tabs, active tab selection, and closed-tab absence. Chat is not a workspace tab, and content caches (`activeProposals`, draft files, legacy mirrors, review/preview caches, localStorage) must not derive tabs that are absent from the workspace.
 
-Normal and assistant sessions render active slots through the same workspace dispatcher. Tab order is deterministic: `Chat`, then `Preview` when present, active proposal tabs in `PROPOSAL_TYPES` order, then `Review` and `Inbox` tabs when those surfaces are present. Proposal labels are `Goal`, `Project`, `Role`, `Tool`, and `Staff`; each live proposal tab shows the existing proposal dot. Desktop tabs and the mobile slider use the same tab list.
+Current proposal tabs are keyed as `proposal:<type>` for `goal`, `project`, `role`, `tool`, and `staff`. Historical proposal snapshots use `proposal:<type>:rev:<N>` and are created only by explicit historical reopen actions. Matching assistant types use their normal preview surface when the workspace tab is open; non-matching active slots route through `proposalPanelForType(type)`. `role`, `tool`, and `staff` therefore reuse `rolePreviewPanel()`, `toolPreviewPanel()`, and `staffPreviewPanel()` outside assistant sessions instead of introducing duplicate forms.
 
-Matching assistant types use their normal preview surface; non-matching active slots route through `proposalPanelForType(type)`. `role`, `tool`, and `staff` therefore reuse `rolePreviewPanel()`, `toolPreviewPanel()`, and `staffPreviewPanel()` outside assistant sessions instead of introducing duplicate forms.
+`session-manager.ts::shouldRevealProposalForSource` gates content updates from tab reveals. Explicit reveal sources are `tool`, `legacy`, `seed`, and `restore`, plus user actions that dispatch `proposal-open` from Open Proposal / Resubmit Proposal / historical reopen renderers. Content-only sources are `edit` and `rehydrate`; they update `state.activeProposals[type]` and refresh already-open tabs, but must not create or focus a workspace tab. This is what makes a closed proposal tab durable across navigation, reload, reconnect, and rehydrate while still allowing an explicit reopen.
 
-The `ProposalRenderer` "Open proposal" button dispatches `proposal-open { type, rev | fields }`. `session-manager.ts` clears any dismissal fingerprint, selects the live proposal tab for the current rev, or reads an older snapshot into a read-only historical workspace tab. Legacy archived cards without a rev marker still replay `fields`. Rehydrated drafts (`proposal_update { source: "rehydrate" }`) and archived-session resubmit/continue flows feed the same `remote.onProposal(type, fields, ...)` path, so restored sessions do not need type-specific reopen code.
+The `ProposalRenderer` "Open proposal" button dispatches `proposal-open { type, rev | fields }`. `session-manager.ts` clears any dismissal fingerprint, explicitly opens/selects the live proposal tab for the current rev, or reads an older snapshot into a read-only historical workspace tab. Legacy archived cards without a rev marker still replay `fields`. Rehydrated drafts (`proposal_update { source: "rehydrate" }`) and `GET /api/sessions/:id/proposals` populate content slots only; the archived footer's Resubmit button is the explicit tab reopen path.
 
 ### Flow: `propose_*` → file-seed → broadcast → parsed projection
 
@@ -1034,31 +1071,32 @@ The `ProposalRenderer` "Open proposal" button dispatches `proposal-open { type, 
 agent calls propose_<type>(args)
   └─> defaults/tools/proposals/extension.ts execute()
         └─> POST /api/sessions/:id/proposal/:type/seed { args }
-              └─> writeProposalFile (serialize + write)
-                    └─> parseProposalFile
-                          └─> _broadcastToSession({ type: "proposal_update",
-                                                       proposalType, fields,
-                                                       streaming: false,
-                                                       source: "seed" })
-                                └─> client remote.onProposal(type, fields, false)
-                                      └─> mergeFields, onFirstEmit (if first), renderApp
+              ├─> writeProposalFile (serialize + write)
+              ├─> parseProposalFile
+              ├─> open/focus side-panel workspace tab `proposal:<type>`
+              └─> _broadcastToSession({ type: "proposal_update",
+                                           proposalType, fields,
+                                           streaming: false,
+                                           source: "seed" })
+                    └─> client remote.onProposal(type, fields, false)
+                          └─> mergeFields, reveal only because source is explicit, renderApp
 ```
 
-`edit_proposal` follows the same flow except the entry point is `POST /api/sessions/:id/proposal/:type/edit` and `source: "edit"`. `view_proposal` is a pure `GET` that returns the raw file body for the agent to read.
+`seed` opens the workspace tab on the server before broadcasting the content update, so all clients converge on the same server-backed tab state. `restore` has the same explicit open/focus side effect after copying a historical snapshot back to the live draft. `edit_proposal` follows the content-write/broadcast flow via `POST /api/sessions/:id/proposal/:type/edit` with `source: "edit"`, but it is content-only: it must not open or focus `proposal:<type>`. `view_proposal` is a pure `GET` that returns the raw file body for the agent to read.
 
 ### Dual-fire: legacy streaming path coexists
 
-The live `propose_*` tool-use scanner in `src/app/remote-agent.ts::_checkToolProposals` continues to fire the legacy per-type `onXProposal` callbacks during streaming, so partial deltas flow into the panel as the model types them. The unified `remote.onProposal` callback is the WS-driven path - it handles `proposal_update` (sources `seed`, `edit`, `rehydrate`) and `proposal_cleared`. Both paths funnel into the same `state.activeProposals[type]` slot via the plugin's `mergeFields`. The streaming-partial path provides UX responsiveness; the file-derived path provides the canonical projection and restart survival.
+The live `propose_*` tool-use scanner in `src/app/remote-agent.ts::_checkToolProposals` continues to fire the legacy per-type `onXProposal` callbacks during streaming, so partial deltas flow into the panel as the model types them. The unified `remote.onProposal` callback is the WS-driven path - it handles `proposal_update` (sources `seed`, `edit`, `restore`, `rehydrate`) and `proposal_cleared`. Both paths funnel into the same `state.activeProposals[type]` slot via the plugin's `mergeFields`. The streaming-partial path provides UX responsiveness; the file-derived path provides the canonical projection and restart survival.
 
 ### Restart survival via rehydrate-on-attach
 
-On WS `auth_ok` / session attach, `src/server/ws/handler.ts` enumerates `.bobbit/state/proposal-drafts/<sessionId>/`, parses each surviving file, and emits one `proposal_update { source: "rehydrate" }` per draft to the freshly-attached client. Because the file IS the source of truth, no separate persistence layer is needed - a server restart mid-edit, a browser reload, or a session resume all yield the same broadcasted projection.
+On WS `auth_ok` / session attach, `src/server/ws/handler.ts` enumerates `.bobbit/state/proposal-drafts/<sessionId>/`, parses each surviving file, and emits one `proposal_update { source: "rehydrate" }` per draft to the freshly-attached client. The file is the source of truth for draft content, so no separate content persistence layer is needed. Tab presence still comes only from the side-panel workspace: rehydrate updates content slots and already-open tabs, but it must not recreate a closed proposal tab.
 
 Session purge cleans the directory: `session-manager.ts::purgeOneSession` fire-and-forgets `fsp.rm` of the per-session dir at the 7-day mark. Archive itself no longer touches the drafts (see [archived-proposal-reopen.md](archived-proposal-reopen.md) for the rationale — archived assistant sessions must keep their drafts on disk so the user can resubmit or continue them). An in-flight `editProposalFile` racing with cleanup is harmless - `unlink` on a missing dir is a no-op.
 
 ### Accept lifecycle
 
-The per-type submit/completion handlers (`createGoal`, `acceptProjectProposal`, role/staff save flows, the tool completion flow, etc.) are unchanged and render from the same panel implementations outside assistant sessions. When a handler accepts or saves a proposal, the client fires `DELETE /api/sessions/:id/proposal/:type` which deletes the file and broadcasts `proposal_cleared`; the unified callback then drops the slot from `state.activeProposals`. The matching `deleteProposalDraft(sid, type)` clears the local-draft side state.
+The per-type submit/completion handlers (`createGoal`, `acceptProjectProposal`, role/staff save flows, the tool completion flow, etc.) are unchanged and render from the same panel implementations outside assistant sessions. When a handler accepts or saves a proposal, the client closes the current proposal workspace tab and fires `DELETE /api/sessions/:id/proposal/:type`, which deletes the file and broadcasts `proposal_cleared`; the unified callback then drops the slot from `state.activeProposals`. The matching `deleteProposalDraft(sid, type)` clears the local-draft side state.
 
 ### Tool surface
 
@@ -1072,14 +1110,15 @@ Descriptors: `defaults/tools/proposals/{view,edit}_proposal.yaml`. Implementatio
 
 ### REST endpoints
 
-Six endpoints, full reference in [docs/rest-api.md - Proposal drafts](rest-api.md#proposal-drafts):
+Seven endpoints, full reference in [docs/rest-api.md - Proposal drafts](rest-api.md#proposal-drafts):
 
 - `GET /api/sessions/:id/proposal/:type` - read raw body
 - `GET /api/sessions/:id/proposal/:type/snapshot?rev=N` - read a historical snapshot without mutating the live draft
-- `POST /api/sessions/:id/proposal/:type/seed` - called by `propose_*` `execute()`
-- `POST /api/sessions/:id/proposal/:type/edit` - surgical edit
-- `POST /api/sessions/:id/proposal/:type/restore` - explicit mutating rollback (writes new snapshot at `currentRev+1`)
+- `POST /api/sessions/:id/proposal/:type/seed` - called by `propose_*` `execute()`; writes content and opens/focuses `proposal:<type>`
+- `POST /api/sessions/:id/proposal/:type/edit` - surgical content edit; does not open tabs
+- `POST /api/sessions/:id/proposal/:type/restore` - explicit mutating rollback (writes new snapshot at `currentRev+1`) and opens/focuses `proposal:<type>`
 - `DELETE /api/sessions/:id/proposal/:type` - clean up after accept
+- `GET /api/sessions/:id/proposals` - list parsed content slots; does not open tabs
 
 ### Revision snapshots
 
@@ -1301,9 +1340,27 @@ Resolution order is unchanged (first non-null wins):
 
 MCP server groups behave identically to built-in tool groups: with no override anywhere, they fall through to the system `allow` fallback. `defaults/tool-group-policies.yaml` deliberately ships **no** `mcp__*` entries.
 
-Why no MCP-specific builtin denials: the Tools page renders the cascaded effective policy but cannot show its origin, so a builtin `mcp__<server>: never` would display as "Allow (default)" while silently blocking every agent call — the UI must be honest. A user who wants to block a server does so explicitly via the Tools page (or `.bobbit/config/tool-group-policies.yaml`), and the dropdown then reflects reality.
+Why no MCP-specific builtin denials: MCP servers should have the same baseline as other tool groups, and any restriction should come from an explicit user/project or role decision. The Tools page now mirrors the MCP cascade for display: a sub-namespace row with no stored `mcp__<server>__<sub>` key shows an explicit parent `mcp__<server>` policy as inherited while keeping the sub-key unset.
 
 Disruptive servers (e.g. headed Chromium from `@playwright/mcp`) are opted out at the **role** layer instead — see `defaults/roles/qa-tester.yaml`, which sets `toolPolicies: { mcp__playwright: never }`. Roles that need the tool inherit the `allow` default; roles that shouldn't have it block it locally.
+
+### Refresh agent and MCP policy changes
+
+`Refresh agent` respawns the agent through the same restore path used for session recovery, but normal role-derived sessions do **not** reuse the previous live `session.allowedTools` as the authority. That array is a runtime cache of whatever was active when the agent was first spawned. On refresh, Bobbit recomputes the role-derived tool surface from the current role, tool default, group policy, and MCP server policy cascade.
+
+This matters for MCP policy edits made in the Tools page:
+
+- Changing an MCP group from `never` to `ask` makes the refreshed session register the relevant `mcp_<server>` meta-tool. Calls then hit the guard extension and broadcast the normal `tool_permission_needed` card.
+- Changing an MCP group from `never` to `allow` makes the refreshed session register the meta-tool and execute it without a permission card.
+- An explicit role-level `never` still wins over group defaults. For example, a role with `toolPolicies: { mcp__mock: never }` still blocks `mcp_mock` after the group default changes to `ask` or `allow`.
+
+Only genuinely session-scoped tool state is carried across the respawn:
+
+- persisted session allow-lists, such as delegate/read-only constraints or explicit creation-time overrides, remain authoritative and are preserved exactly;
+- `session-only` grants are re-applied in memory so they survive refresh without becoming durable role policy;
+- `one-time` grants are re-applied only for the interrupted turn and are still revoked on `agent_end`.
+
+Regression coverage lives in `tests/e2e/mcp-tool-permission.spec.ts`: the refresh scenario pins `never` → `ask` registration plus the permission-card broadcast, and the role-deny scenario pins role-level `mcp__mock: never` precedence over group `allow`.
 
 ### REST API
 
@@ -1571,12 +1628,12 @@ The search flush-on-close path is **fully awaitable** end to end. This matters b
 - **`ProjectContextManager.closeAll()`** (`project-context-manager.ts`) is `async` and `await`s `Promise.allSettled(...)` over every context's `close()` before clearing the map. `remove(projectId)` stays fire-and-forget (`void ctx.close().catch(...)`) on purpose — it runs during normal operation, not teardown, so it must not block but must not throw.
 - **`server.ts` shutdown** `await`s `projectContextManager.closeAll()`.
 
-`SearchService.close()` (`search-service.ts`) coordinates with a possibly in-flight `open()`. Without this, `_doOpen()` could resume *after* `close()` returned and re-establish the store, indexer, and rebuild timer — leaking live search resources past shutdown. The two guards together close the race:
+`SearchService.close()` (`search-service.ts`) coordinates with three async paths: a possibly in-flight `open()`, an already-fired startup/background rebuild, and fire-and-forget mutation tasks. Without the open guard, `_doOpen()` could resume *after* `close()` returned and re-establish the store, indexer, and rebuild timer — leaking live search resources past shutdown. Without rebuild or mutation tracking, background work could keep using the FlexSearch store while close closes it, surfacing `FlexSearchStore: already closed` or allowing stale title metadata writes to finish after shutdown. The shutdown guards are:
 
-1. `close()` first `await`s any in-flight `_openPromise`, then sets `_state = "closed"`, clears the startup `_rebuildTimer`, re-reads `_store` (in case `_doOpen` just assigned it), closes it, and nulls `_indexer`.
+1. `close()` first `await`s any in-flight `_openPromise`, then sets `_state = "closed"` and clears the startup `_rebuildTimer`.
 2. `_doOpen()` re-checks `_state` after the `FlexSearchStore.open()` await *and* after the meta-read awaits. If state went `"closed"` mid-open it `await store.close()` and returns **without** assigning `_store`/`_indexer`, scheduling the rebuild timer, or flipping to `"ready"`.
-
-The startup rebuild timer is `unref()`'d (never keeps the process alive) and cancelled on close; its callback also re-checks `_state === "closed" || !_indexer` before rebuilding, because an already-scheduled timer can still fire during teardown.
+3. The startup rebuild timer is `unref()`'d and cancelled on close; its callback also re-checks `_state === "closed" || !_indexer` before rebuilding. Once a rebuild starts, the callback stores `_backgroundRebuildPromise`, and `close()` awaits it before re-reading `_store`, closing it, and nulling `_indexer`.
+4. All mutation helpers go through `_scheduleMutation()`. `close()` waits for the tracked mutation set to settle before closing the store, and compound message reindexes are serialized per parent session so an older delete-and-reinsert cannot overwrite newer `sessionTitle` metadata.
 
 `FlexSearchStore` (`flex-store.ts`) is the belt-and-braces layer for any flush that still loses the race (a debounced timer or concurrent project-delete):
 
@@ -1595,6 +1652,17 @@ The surface in `src/server/search/types.ts` that downstream code sees is unchang
 
 `SearchService` (`search-service.ts`) is the per-project facade that bundles `FlexSearchStore`, `Indexer`, and the source array. `ProjectContext` constructs and owns one per project. No embedder component exists.
 
+### Search result titles
+
+Full search title rendering is driven by resolved search metadata, not client-side guesses. This matters because message hits are indexed as standalone rows; when a message-only result is restored after a rebuild or arrives without a direct session hit beside it, the UI still needs authoritative parent-session context.
+
+- `SessionIndexSource`, `MessageIndexSource`, and live `SearchService.indexMessage()` calls all use the same session-title formatter before writing rows.
+- Message rows carry the resolved parent session title in `metadata.sessionTitle`; `indexableToDoc()` stores it as `session_title`, and `toSearchResult()` returns it as `SearchResult.sessionTitle`.
+- The full search page groups message hits under their parent session and uses that resolved `sessionTitle` for both message-only session cards and nested message rows. It should not fall back to the raw message row title for message context.
+- Goal-owned sessions render as `<Goal title>: <Session title>`. The formatter avoids duplicating the goal when the session title already contains the goal title as a standalone phrase, after trimming, whitespace normalization, and case-folding.
+- Goal title, session title, and session goal-ownership changes must refresh dependent message rows as well as the session row. Project context update hooks reindex the session row and call `reindexMessagesForSession()` for affected sessions; the message content hash includes the resolved display title so metadata-only title changes are not skipped as unchanged content.
+- Full rebuilds get the same behavior because sources rebuild from the goal and session stores, including archived sessions, instead of trying to reconstruct titles in the UI.
+
 ### Content policy (role-aware weighting)
 
 What gets indexed per message matters more than the store choice. `content-policy.ts` (replaces the old `message-extractor.ts`) extracts role-tagged entries with weights applied as post-rank multipliers:
@@ -1609,7 +1677,7 @@ What gets indexed per message matters more than the store choice. `content-polic
 | `tool_call` | 0.8 | `<tool_name> + first line of input` |
 | `tool_result` | 0.5 | first 500 chars; **hard-skipped if raw >32KB** (aligns with `truncate-large-content.ts`) |
 
-Bump `CONTENT_POLICY_VERSION` when the policy changes - the meta-mismatch check auto-rebuilds. Weights are tunable server-side without re-indexing the content itself.
+Bump `CONTENT_POLICY_VERSION` when the policy changes - the meta-mismatch check auto-rebuilds. Treat derived display metadata as part of the content policy: if existing rows would keep stale titles, goal prefixes, snippets, roles, weights, or other rendered metadata after a code change, bump the version so the index is safely rebuilt from authoritative stores. Weights are tunable server-side without changing user data, but any persisted ranking/display semantics that old rows cannot self-correct must force a rebuild.
 
 ### Chunking
 
@@ -1679,17 +1747,19 @@ Indexes are a rebuildable cache; the source-of-truth stores repopulate automatic
 
 ### Two-mode search UX
 
-**1. Filter mode (sidebar):** Instant client-side filtering - no API calls. Filters goals by title, sessions by title and agent role, and staff by name using case-insensitive substring matching. Archived sections auto-expand on a match and auto-collapse when cleared. A "Full Search" link navigates to the full search page with the current query. Key file: `SearchBox.ts`; filtering lives in `Sidebar.ts`.
+**1. Filter mode (sidebar):** Live sessions, live goals, staff, and already-loaded archived rows are filtered instantly in the browser using case-insensitive substring matching on goal titles, session titles/roles, and staff names. Archived full-corpus lookup is the exception: when the sidebar query is non-empty and archived rows are visible or auto-opened, the client debounces `q`-backed calls to the archived sessions/goals endpoints so matches beyond the first archive page can appear without loading non-matching pages. Archived sections auto-open for search and auto-collapse when the query is cleared if search opened them. A "Full Search" link navigates to the full search page with the current query. Key files: `src/ui/components/SearchBox.ts`, `src/app/sidebar.ts`, and `src/app/api.ts`; detailed behavior is in [Sidebar Archived Search](sidebar-archived-search.md).
 
-**2. Full search page (`#/search`):** The sole consumer of `GET /api/search`. Large auto-focused input, type filter toggles (Goals, Sessions, Staff, Messages), grouped results with `<b>`-highlighted snippets, relative timestamps, archived badges, and "Load More" pagination. Key file: `search-page.ts`.
+**2. Full search page (`#/search`):** The sole consumer of `GET /api/search` / the FTS index. Large auto-focused input, type filter toggles (Goals, Sessions, Staff, Messages), grouped results with `<b>`-highlighted snippets, relative timestamps, archived badges, and "Load More" pagination. Key file: `search-page.ts`.
 
 > **Design note - gate content:** Gate content (design specs, review findings) is not currently indexed. Tracked for future work; adding it requires bumping `SCHEMA_VERSION` or `CONTENT_POLICY_VERSION` to force a rebuild.
 
 ### Paginated archives
 
-- `GET /api/goals?archived=true&limit=50&after=<cursor>` - cursor is `archivedAt` timestamp
-- `GET /api/sessions?include=archived&limit=50&after=<cursor>`
-- Live data uses generation-based polling (`?since=N`)
+- `GET /api/goals?archived=true&limit=50&after=<cursor>` — cursor is an `archivedAt` timestamp.
+- `GET /api/sessions?include=archived&limit=50&after=<cursor>` — cursor is an `archivedAt` timestamp.
+- Add `q=<query>` to either archived endpoint for sidebar archived search. The server applies case-insensitive substring matching across the full archived corpus before pagination: session `title`/`role` for sessions, and goal `title` or affiliated non-child session `title`/`role` for goals.
+- Query-aware archive pagination is separate from normal Show Archived pagination: "Load more matching archived..." keeps `q` and pages only matching archived rows.
+- Live data uses generation-based polling (`?since=N`).
 
 ---
 
@@ -2133,7 +2203,7 @@ Sandboxed agents use standard git worktrees inside the project container when th
 
 **Worktree pool** (host-side, `worktree-pool.ts`): The worktree pool pre-creates worktrees in the background so sessions and goals start faster. Pool entries use the `pool/_pool-<id>` branch namespace (was `session/_pool-*` pre-Phase 3); claim atomically renames the branch and moves the worktree to the target name. **Goal creation also routes through the pool** as of Phase 3 - it no longer calls `createWorktree()` directly. Multi-repo pool entries are sets of N worktrees (one per configured repo, including data-only) sharing a single branch name across repos. See [Session worktrees](#session-worktrees) for the full pool claim sequence (single rename at claim time, no first-prompt rename - see [Remove session worktree & branch renaming](design/remove-session-worktree-rename.md)). Pools are **per-project** - `SessionManager` maintains a `Map<string, WorktreePool>` keyed by project ID, so each project's worktrees are rooted in the correct repo. On startup, a pool is initialized for every registered project whose `rootPath` is a git repo, using that project's `worktree_pool_size` and `worktree_setup_command` config. When a session is created, the pool claim looks up the pool by the session's `projectId` - sessions only claim from their own project's pool. New projects registered at runtime (`POST /api/projects`) get a pool auto-initialized if they're git repos. Deleted projects (`DELETE /api/projects/:id`) get their pool drained via `removeWorktreePool(projectId)`. The pool status API (`GET /api/worktree-pool`) returns per-project data: `{ pools: { [projectId]: { enabled, ready, target, filling } } }` without a query param, or flat status for a single project with `?projectId=<id>`. Settings UI shows per-project pool status when viewing a project's settings, and aggregated status in system scope.
 
-**Pool freshness**: When a pooled worktree is acquired, it is fetched from origin and hard-reset to the configured base ref (project `base_ref`, falling back to the dynamically-resolved remote primary via `git symbolic-ref refs/remotes/origin/HEAD`, then `origin/master`). This prevents stale worktrees when the base has advanced since the pool entry was created. The pool reads the current `base_ref` on every fill/claim via a live `baseRefResolver` (sibling of `componentsResolver`) — pool entries auto-adopt the new value when the setting changes, no drain needed. The fetch+reset is non-fatal: if it fails, the worktree is still usable but may be behind. Branch publication is separate from freshness and always uses an explicit destination refspec for the target branch. Full design: [design/base-ref.md](design/base-ref.md).
+**Pool freshness**: When a pooled worktree is acquired, it is fetched from origin and hard-reset to the configured base ref (project `base_ref`, falling back to the dynamically-resolved remote primary via `git symbolic-ref refs/remotes/origin/HEAD`, then `HEAD`). This prevents stale worktrees when the base has advanced since the pool entry was created. The pool reads the current `base_ref` on every fill/claim via a live `baseRefResolver` (sibling of `componentsResolver`) — pool entries auto-adopt the new value when the setting changes, no drain needed. If fallback resolution reaches an unborn `HEAD`, pool prefill skips that repo with the initial-commit warning instead of repeatedly attempting `git worktree add ... HEAD`. The fetch+reset is non-fatal: if it fails, the worktree is still usable but may be behind. Branch publication is separate from freshness and always uses an explicit destination refspec for the target branch. Full design: [design/base-ref.md](design/base-ref.md).
 
 **Inter-agent coordination:** Because all agents share the same `/workspace` clone, they can fetch each other's branches directly (`git fetch origin <branch>`). The team lead merges agent branches locally, same as non-sandboxed teams.
 
@@ -2583,13 +2653,15 @@ Long waits made the agent feel unresponsive: users would type a correction, see 
 
 ### Call sites
 
-Live-steer delivery is centralised on `SessionManager.deliverLiveSteer(sessionId, message)`, which enqueues the row into `promptQueue` and hands it to the single `SessionManager._dispatchSteer()` site. `_dispatchSteer` calls `bgProcessManager.abortAllWaits(sessionId)` before awaiting `rpcClient.steer(batchText)`, so every dispatch path runs through one abort site. All steer entry points that run while the agent is `streaming` go through this helper:
+Live-steer delivery is centralised on the single `SessionManager._dispatchSteer()` site. Fresh live steers enqueue a steered row and hand it to `_dispatchSteer()`. Promoted queued steers (`steer_queued`) flip `isSteered=true`; while the agent is `streaming`, they immediately dequeue the steered front group via `dequeueAllSteered()` and call `_dispatchSteer()` instead of waiting for a later tool boundary. When the agent is `idle`, promotion broadcasts and `drainQueue()` drains normally with steered rows first.
+
+`_dispatchSteer()` owns wait interruption and recovery: it calls `bgProcessManager.abortAllWaits(sessionId)`, records the batch in `inFlightSteerTexts`, removes rows from `promptQueue`, persists the queue+ledger update together, then awaits `rpcClient.steer(batchText)`. Echoes clear the ledger; abort/restart restore re-enqueues un-echoed ledger entries once; RPC failure rolls rows back only if the ledger entry has not already been reconciled. All streaming steer entry points therefore reach the same abort/recovery path:
 
 - `src/server/ws/handler.ts` - `case "steer"` (user-initiated live steer) calls `deliverLiveSteer` → `_dispatchSteer`.
 - `src/server/agent/team-manager.ts` - `injectSteerMessage()` and the task-completion nudge (mid-turn `team_steer`) call `deliverLiveSteer` → `_dispatchSteer`.
-- `src/server/agent/session-manager.ts` - `SessionManager.steerQueued()` flips `isSteered=true` and (if `status === "streaming"`) calls `bgProcessManager.abortAllWaits()` so a parked `bash_bg wait` resolves and a tool boundary actually arrives. The boundary handler in `handleAgentLifecycle` (`tool_execution_end`, with `agent_end` non-aborting as a safety net for non-tool turns) drains all consecutive steered rows via `dequeueAllSteered()` and hands them to `_dispatchSteer`.
+- `src/server/agent/session-manager.ts` - `SessionManager.steerQueued()` promotes, dequeues the steered front group, and calls `_dispatchSteer()` immediately while streaming; idle promotions drain normally.
 
-Net result: `bgProcessManager.abortAllWaits(sessionId)` has exactly two call sites - once inside `_dispatchSteer` (every dispatch) and once inside `steerQueued` for the streaming case (so the parked wait resolves *before* a tool boundary can occur). Down from three pre-rewrite, with cleaner semantics.
+Net result: steer-related `bgProcessManager.abortAllWaits(sessionId)` calls are owned by `_dispatchSteer()` (plus termination cleanup), so queued promotions and fresh live steers share the same wait-abort/recovery behavior.
 
 ### Termination cleanup
 
@@ -2600,7 +2672,7 @@ Net result: `bgProcessManager.abortAllWaits(sessionId)` has exactly two call sit
 | File | Purpose |
 |---|---|
 | `src/server/agent/bg-process-manager.ts` | `waits` registry, `registerWait`/`unregisterWait`/`abortAllWaits`, `waitForExit` with `AbortSignal` support |
-| `src/server/agent/session-manager.ts` | `deliverLiveSteer()` helper; single `_dispatchSteer()` site (one `abortAllWaits` per dispatch); `steerQueued()` (one `abortAllWaits` to unblock parked waits); `_consumeSteerEcho()` / `_reconcileAfterAbort()` shadow-ledger lifecycle; `terminateSession()` termination-time abort |
+| `src/server/agent/session-manager.ts` | `deliverLiveSteer()` helper; single `_dispatchSteer()` site (one `abortAllWaits` per steer dispatch); `steerQueued()` immediate streaming promotion dispatch plus idle drain fallback; `_consumeSteerEcho()` / `_reconcileAfterAbort()` shadow-ledger lifecycle; `terminateSession()` termination-time abort |
 | `src/server/agent/team-manager.ts` | Team-initiated steers routed through `deliverLiveSteer()` |
 | `src/server/ws/handler.ts` | WebSocket `case "steer"` routed through `deliverLiveSteer()` |
 | `src/server/server.ts` | `/bg-processes/:pid/wait` REST handler - creates the `AbortController`, registers it, passes `signal` to `waitForExit`, unregisters in `finally` |
@@ -2627,6 +2699,59 @@ Several endpoints hold an HTTP request open for minutes while they wait for a se
 - `GET /api/sessions/:id/bg-processes/:pid/wait` — blocks on `BgProcessManager.waitForExit`; the response logic lives in `src/server/agent/bg-wait-response.ts::streamBgWaitResponse` (`heartbeatMs` is injectable for tests). Here the head flush is **lazy** — driven by the first heartbeat tick rather than written eagerly — specifically so the not-found case can still return a real `404`: `waitForExit` resolves `null` synchronously for an unknown pid, long before the first tick, so no bytes have been written and the status can still be set. A real pending wait flushes the `200`/chunked head on the first 60 s tick, well inside undici's timeout. See [debugging.md — `bash_bg wait` returns `fetch failed`](debugging.md#bash_bg-wait-returns-fetch-failed-on-long-running-processes).
 
 The bg-wait endpoint was the second consumer and originally shipped without the heartbeat (it post-dated the session `/wait` fix), which is why `bash_bg wait` on a ≥300 s process threw `fetch failed` until `streamBgWaitResponse` brought it in line. Regression coverage: `tests/bg-wait-response.test.ts` pins the mechanism (head flushed, heartbeat on tick, terminal JSON parses, `404` preserved) in milliseconds with an injected interval — never on a real ~300 s wall clock.
+
+---
+
+## Markdown rendering invariant
+
+Bobbit renders user- and agent-authored markdown through the global `<markdown-block>` custom element. The element is used in chat messages, proposal previews, goal dashboards, staff prompts, skill chips, thinking blocks, gate/verification outputs, and markdown artifacts. Because these surfaces can display untrusted model output, source snippets, and math in the same document, markdown rendering is a UI security and correctness boundary rather than a cosmetic helper.
+
+### Owned implementation
+
+`src/ui/lazy/markdown-block.ts` is the only public loader. It dynamically imports Bobbit's `src/ui/lazy/safe-markdown-block.ts`, which defines the `<markdown-block>` element. Bobbit owns this implementation instead of importing `@mariozechner/mini-lit/dist/MarkdownBlock.js` directly for three reasons:
+
+- **Correctness for code.** Markdown code spans and fenced code must be parsed as code before math handling sees dollar signs. The upstream implementation's custom code preservation and dollar-math path regressed on TypeScript template literals such as `` `^${foo}$` ``, causing trailing markdown to break. The local renderer lets `marked` own code tokenization and renders fenced code through `<code-block>` with encoded source.
+- **One sanitizer policy.** Link handling is centralized so every markdown surface applies the same href allow-list and obfuscation normalization.
+- **Lazy loading stays intact.** KaTeX, marked, highlight.js, and `<code-block>` remain out of the main UI chunk until a markdown surface is encountered.
+
+Consumers must not import the upstream MarkdownBlock module directly. A direct import bypasses Bobbit's code/math guarantees, href policy, and bundle boundary.
+
+### Registration contract
+
+Any component or renderer that emits `<markdown-block>` must call `ensureMarkdownBlock()` from `src/ui/lazy/markdown-block.ts` in `connectedCallback()`, the constructor, or the first `render()` path before returning the template. The helper is idempotent: the first call starts the dynamic import, later calls are no-ops, and existing unknown `<markdown-block>` nodes upgrade in place when the custom element definition lands.
+
+Do not rely on another page or earlier component having registered the element. That creates navigation-order bugs where markdown appears as raw text until an unrelated surface triggers the lazy import. The debugging entry for this symptom is [debugging.md — Markdown not rendering in chat / proposal panel](debugging.md#markdown-not-rendering-in-chat--proposal-panel).
+
+### Code and math guarantees
+
+`<markdown-block>` preserves literal dollar signs and backticks inside code:
+
+- Fenced code keeps source text such as ``const x = `^${foo}$`;`` exactly as code content.
+- Inline code keeps source text such as `` `^${foo}$` `` literally.
+- Dollar signs inside fenced or inline code are never treated as KaTeX delimiters.
+- Template-literal backticks inside fenced code do not terminate markdown parsing.
+
+Math still renders through KaTeX outside code for these delimiters:
+
+- inline dollar math: `$x$`
+- display dollar math: `$$...$$`
+- inline LaTeX math: `\(...\)`
+- display LaTeX math: `\[...\]`
+
+If KaTeX rejects an expression, the renderer falls back to escaped text for that expression rather than letting raw HTML through.
+
+### Link href policy
+
+Markdown links are allowed only when their normalized href is safe for a new browser tab:
+
+- allowed: `http:`, `https:`, `mailto:`, relative paths, root-relative paths, and same-document anchors (`#section`)
+- rejected: protocol-relative URLs (`//host/path`) and every other explicit scheme, including `javascript:`, `data:`, `vbscript:`, and `file:`
+
+Before scheme allow-listing, the sanitizer decodes HTML character references and removes ASCII control characters and whitespace from the scheme candidate. This catches browser-equivalent obfuscations such as `&#106;avascript:`, `jav&#x61;script:`, and `java&#10;script:`. Rejected links render as escaped link text, not as `<a>` elements. Allowed links receive `target="_blank"` and `rel="noopener noreferrer"`.
+
+### Regression coverage
+
+`tests/markdown-dollar-template.spec.ts` is the pinning browser/file fixture. It covers the minimal TypeScript template-literal repro, inline-code dollar preservation, supported math delimiters outside code, and href sanitizer cases including entity/control-obfuscated schemes. Add new markdown safety regressions there unless they require a full application route.
 
 ---
 
@@ -2756,7 +2881,11 @@ When extending transcript handling: every new transcript mutation goes through a
 
 When an assistant `message_end` carries tool calls, the streaming container in `AgentInterface.ts` keeps owning the rendered card until the next event arrives, while the same message is also appended to `state.messages` by the reducer. The visible-messages filter hides the duplicate by id-equality (`m.id !== streamingMessageId`). Real LLM streams sometimes deliver `message_end` without a string `id` (undefined / null / numeric / `0` / `""`); the historical inline check `typeof msg.id === "string" ? msg.id : undefined` demoted `streamingMessageId` to `undefined`, the `!streamingMessageId` short-circuit opened the filter, and the card rendered twice - each instance with its own `<bg-process-renderer>` and its own `Date.now()` start time, diverging visibly during a parked `bash_bg.wait` where no further events arrive to reconcile.
 
+Tool-call turns can also arrive as a final assistant `message_end` without any prior `message_update`. That frame is still a valid source for live streaming state: when `RemoteAgent` sees tool calls on the final message, it sets `state.streamingMessage` from that message, computes `streamingMessageId`, and stamps any synthetic reducer-row id from the same helper before dispatching the reducer action. Without this, the row can be hidden from `MessageList` by `streamingMessageId` while the streaming container has no message to render, so a long-running `bash_bg wait` card appears only after refresh or snapshot replay.
+
 The canonical key is computed by `computeStreamingMessageId(msg)` in `src/app/streaming-message-id.ts`: prefer a non-empty string `msg.id`, otherwise fall back to `synth:tc:<firstToolCallId>` (toolCall ids are stable across `message_update` deltas), otherwise `undefined`. Both sites in `src/app/remote-agent.ts` - the `streamingMessageId` field assignment **and** the `id` stamped onto the reducer entry before the `live-event` action - must go through the helper, or the two diverge and the filter's id-equality check fails. The defensive `if (streamingMessage && m === streamingMessage) return false` guard in `AgentInterface.renderMessages` is belt-and-braces for the case where the streaming message is the same object reference as a row in `messages`; it does not replace the id-equality path because production hits the separate-objects case via the reducer's `live-event` append.
+
+`AgentInterface` syncs `StreamingMessageContainer` on every `message_end`: set it to the current `state.streamingMessage` when present, or clear it when absent (for non-tool messages that should render only through `MessageList`). This preserves the single visible owner invariant. Tool-call messages render immediately through the streaming container while the reducer row is filtered by the matching id; non-tool messages clear the container so the finalized row is not duplicated.
 
 Follow-up not in this fix: `BgProcessRenderer.getCallStart` keys its start-time WeakMap on the `params` object identity rather than on `bgId`. Two render paths produce two distinct `params` objects → two start times. Re-keying on `bgId` would mask the *visible* dual-timer symptom even if the dual-render itself recurred for some other reason - worth doing as defence in depth, but a separate goal.
 
@@ -2788,7 +2917,7 @@ This is strictly better than the pre-fix state: one-off glitches self-heal on th
 ### Entry points
 
 - `SessionManager.enqueuePrompt` (`src/server/agent/session-manager.ts`) - user / REST prompt arrival.
-- `SessionManager.deliverLiveSteer` - WS `{type:"steer"}` and team-manager steer paths. Enqueues into `promptQueue` as `{ isSteered: true }` and hands to `_dispatchSteer`, which removes the row before awaiting `rpcClient.steer()` and pushes the batch text onto the shadow ledger on success. The PI-25b/c invariant that steers survive a Stop/retry roundtrip is preserved by the shadow ledger → `_reconcileAfterAbort` → `enqueueAtFront` → post-respawn `drainQueue` chain, not by an in-row `dispatched` flag (which has been deleted).
+- `SessionManager.deliverLiveSteer` - WS `{type:"steer"}` and team-manager steer paths. Enqueues into `promptQueue` as `{ isSteered: true }` and hands to `_dispatchSteer`, which records the batch text in the shadow ledger and removes the row in one persisted queue+ledger update before awaiting `rpcClient.steer()`. The PI-25b/c invariant that steers survive a Stop/retry roundtrip is preserved by the shadow ledger → `_reconcileAfterAbort` / restore → `enqueueAtFront` → post-respawn `drainQueue` chain, not by an in-row `dispatched` flag (which has been deleted).
 - Both emit a one-line log on the implicit-unstick path recording `sessionId`, `source` (`enqueuePrompt` vs `deliverLiveSteer`), and current `consecutiveErrorTurns`, so the rescue-vs-park ratio is observable in practice.
 
 ### Team-manager suppression removed
@@ -2799,7 +2928,7 @@ The old `if (teamLeadSession.lastTurnErrored) { suppress }` guard in `team-manag
 
 Direct prompts and queued prompts mark the session `streaming` optimistically before calling Pi. If `rpcClient.prompt()` rejects, or resolves `{ success: false, error }`, Bobbit assumes the agent did not accept the text and re-enqueues the same rows at the front of `PromptQueue` in original order. A zero-delay follow-up drain lets Pi finish any abort/cleanup microtasks before Bobbit tries again.
 
-The recovery path deliberately does **not** re-enqueue when the failure is a child-exit path and the session is already `terminated` or `aborting`. In that state the bridge is gone; sandbox recovery, force-abort recovery, or explicit user retry owns the next live process. This prevents a dead child from causing an immediate redispatch loop while still preserving prompts rejected by transient dispatch races.
+The recovery path suppresses re-enqueue only when an inbound agent event has advanced `agentObservedTurnVersion`, proving the dequeued turn was observed by the agent. Local status-only changes (`statusVersion` bumps such as Stop → `aborting`) do not suppress recovery, because the prompt may still be rejected before acceptance. It also does **not** re-enqueue when the failure is a child-exit path and the session is already `terminated` or `aborting`; in that state the bridge is gone, and sandbox recovery, force-abort recovery, or explicit user retry owns the next live process.
 
 ### Key files
 

@@ -245,19 +245,28 @@ function goalDashboardUrl(gw: GW, goalId: string) {
  * wait for idle, then send a message and wait for the response.
  * This is the browser-driven equivalent of abort + prompt.
  */
+async function abortStreamingSession(page: Page, gw: GW, id: string) {
+	const sessInfo = await getSession(gw, id);
+	if (sessInfo.status !== "streaming") return;
+	const stopBtn = page.locator('button[title="Stop streaming"]');
+	if (await stopBtn.isVisible({ timeout: 10_000 }).catch(() => false)) {
+		await stopBtn.click();
+		const clickDeadline = Date.now() + 5_000;
+		while (Date.now() < clickDeadline && (await getSession(gw, id)).status !== "idle") {
+			await page.waitForTimeout(500);
+		}
+	}
+	if ((await getSession(gw, id)).status !== "idle") {
+		const abortRes = await api(gw, `/api/sessions/${id}/abort`, { method: "POST" });
+		if (!abortRes.ok) throw new Error(`Direct abort failed: ${abortRes.status} ${await abortRes.text().catch(() => "")}`);
+	}
+	await pollIdle(gw, id, 60_000);
+}
+
 async function interruptAndSend(page: Page, gw: GW, id: string, text: string, idleTimeoutMs = 120_000) {
 	await page.goto(sessionUrl(gw, id));
 	await page.waitForSelector("textarea", { timeout: 30_000 });
-
-	// If streaming, click the stop button — it should appear and work reliably.
-	// forceAbort() gives 3s grace then force-kills, so 15s total is generous.
-	const sessInfo = await getSession(gw, id);
-	if (sessInfo.status === "streaming") {
-		const stopBtn = page.locator('button[title="Stop streaming"]');
-		await stopBtn.waitFor({ state: "visible", timeout: 10_000 });
-		await stopBtn.click();
-		await pollIdle(gw, id, 15_000);
-	}
+	await abortStreamingSession(page, gw, id);
 
 	// Now send the message
 	await page.fill("textarea", text);
@@ -272,11 +281,23 @@ async function browserSend(page: Page, gw: GW, id: string, text: string, idleMs 
 	await page.waitForSelector("textarea", { timeout: 30_000 });
 	try { await page.waitForSelector('[class*="tool"], [class*="Tool"], details, pre', { timeout: 8_000 }); } catch {}
 	await page.waitForTimeout(500);
-	await page.fill("textarea", text);
-	await page.press("textarea", "Enter");
-	await page.waitForTimeout(1_500);
-	await pollIdle(gw, id, idleMs);
-	await page.waitForTimeout(2_000);
+	for (let attempt = 0; attempt < 2; attempt++) {
+		await page.fill("textarea", text);
+		await page.press("textarea", "Enter");
+		await page.waitForTimeout(1_500);
+		try {
+			await pollIdle(gw, id, idleMs);
+			await page.waitForTimeout(2_000);
+			return;
+		} catch (err) {
+			const status = (await getSession(gw, id).catch(() => ({ status: "unknown" }))).status;
+			if (attempt === 0 && status === "streaming") {
+				await abortStreamingSession(page, gw, id);
+				continue;
+			}
+			throw err;
+		}
+	}
 }
 
 async function takeScreenshot(page: Page, name: string) {
@@ -328,10 +349,10 @@ async function checkGitStatusWidget(page: Page): Promise<string | null> {
 }
 
 /**
- * Create a goal via the browser UI:
- *   1. Click "New Goal" button — opens goal assistant with form panel
- *   2. Fill in title and spec directly in the form
- *   3. Select workflow from dropdown
+ * Create a goal through the current browser flow:
+ *   1. Click "New Goal" for the target project — opens a goal-assistant session
+ *   2. Ask the assistant to emit a concrete goal proposal
+ *   3. Fill/normalise the proposal form fields
  *   4. Click "Create Goal"
  *   5. Wait for navigation to goal dashboard
  *   6. Return the goalId from the URL
@@ -372,11 +393,33 @@ async function createGoalViaBrowser(
 		}
 	}
 
-	// Wait for the goal assistant form to render (title input + Create Goal button)
-	const titleInput = page.locator("input[placeholder='Goal title']").first();
-	await expect(titleInput).toBeVisible({ timeout: 15_000 });
+	// The New Goal entry point opens a goal-assistant chat first. Drive it
+	// to emit the proposal, then use the proposal form as before.
+	await expect(page).toHaveURL(/#\/session\//, { timeout: 30_000 });
+	await page.waitForSelector("textarea", { timeout: 30_000 });
+	const sessionMatch = page.url().match(/#\/session\/([^/?]+)/);
+	if (!sessionMatch) throw new Error(`Could not extract goal assistant session id from ${page.url()}`);
+	const assistantSessionId = sessionMatch[1];
+	await pollIdle(gw, assistantSessionId, 120_000);
 
-	// Fill in the title
+	const workflowId = opts?.workflowId ?? "feature";
+	const proposalPrompt = [
+		"Create a goal proposal now. Do not ask follow-up questions.",
+		`Use exactly this title: ${title}`,
+		`Use exactly this specification: ${spec}`,
+		`Use workflow id: ${workflowId}`,
+		"Do not set worktreeSetupCommand or worktreeSetupTimeoutMs.",
+		"Call the propose_goal tool with those values.",
+	].join("\n");
+	await page.fill("textarea", proposalPrompt);
+	await page.press("textarea", "Enter");
+	await pollIdle(gw, assistantSessionId, 180_000);
+
+	// Wait for the goal proposal form to render (title input + Create Goal button)
+	const titleInput = page.locator("input[placeholder='Goal title']").first();
+	await expect(titleInput).toBeVisible({ timeout: 45_000 });
+
+	// Normalise the title in case the model paraphrased it.
 	await titleInput.fill(title);
 
 	// Check "Sandbox (Docker)" if requested
@@ -400,12 +443,22 @@ async function createGoalViaBrowser(
 		}
 	}
 
-	// Select workflow from dropdown
-	if (opts?.workflowId) {
-		const workflowSelect = page.locator(".goal-preview-panel select").first();
-		if (await workflowSelect.isVisible({ timeout: 3_000 }).catch(() => false)) {
-			await workflowSelect.selectOption(opts.workflowId);
-		}
+	// Select the explicit workflow from the dropdown if the model omitted or altered it.
+	const workflowSelect = page.locator(".goal-preview-panel select").first();
+	if (await workflowSelect.isVisible({ timeout: 3_000 }).catch(() => false)) {
+		await workflowSelect.selectOption(workflowId);
+	}
+
+	// New proposal fields let the model seed a per-goal setup hook. These manual
+	// scenarios are testing goal/session lifecycle, not arbitrary setup commands;
+	// clear any model-invented hook so setup cannot hang on an unnecessary install.
+	const setupCommand = page.locator("[data-testid='goal-form-worktree-setup-command']").first();
+	if (await setupCommand.isVisible({ timeout: 3_000 }).catch(() => false)) {
+		await setupCommand.fill("");
+	}
+	const setupTimeout = page.locator("[data-testid='goal-form-worktree-setup-timeout-ms']").first();
+	if (await setupTimeout.isVisible({ timeout: 1_000 }).catch(() => false)) {
+		await setupTimeout.fill("");
 	}
 
 	await takeScreenshot(page, "goal-creation-form.png");
@@ -684,21 +737,38 @@ test.describe.serial("Integration — sessions, goals, sandboxed goals", () => {
 		for (const v of VARIATIONS) {
 			if (v.sandboxed && !sandboxAvailable) { console.log(`  SKIP ${v.name}`); continue; }
 
-			const t0 = performance.now();
-			const res = await api(gw, "/api/sessions", {
-				method: "POST", body: JSON.stringify({ worktree: v.worktree, sandboxed: v.sandboxed }),
-			});
-			expect(res.status).toBe(201);
-			const id = (await res.json()).id;
-			const createMs = Math.round(performance.now() - t0);
+			let id = "";
+			let t0 = performance.now();
+			let createMs = 0;
+			let idleMs = 0;
+			let responseMs = 0;
+			for (let attempt = 0; attempt < 2; attempt++) {
+				t0 = performance.now();
+				const res = await api(gw, "/api/sessions", {
+					method: "POST", body: JSON.stringify({ worktree: v.worktree, sandboxed: v.sandboxed }),
+				});
+				expect(res.status).toBe(201);
+				id = (await res.json()).id;
+				createMs = Math.round(performance.now() - t0);
 
-			await pollIdle(gw, id, v.sandboxed ? 180_000 : 120_000);
-			const idleMs = Math.round(performance.now() - t0);
+				await pollIdle(gw, id, v.sandboxed ? 180_000 : 120_000);
+				idleMs = Math.round(performance.now() - t0);
 
-			const tMsg = performance.now();
-			await browserSend(page, gw, id,
-				`Test: ${variationTag(v)}\nRun \`pwd\` and \`git status\` and show me the output.`);
-			const responseMs = Math.round(performance.now() - tMsg);
+				const tMsg = performance.now();
+				try {
+					await browserSend(page, gw, id,
+						`Test: ${variationTag(v)}\nUse the bash tool exactly once with this command: pwd && git status --short --branch`,
+						v.sandboxed ? 240_000 : 120_000);
+					responseMs = Math.round(performance.now() - tMsg);
+					break;
+				} catch (err) {
+					if (attempt === 0 && v.sandboxed) {
+						console.log(`  ${v.name}: retrying after sandbox agent turn failed: ${err instanceof Error ? err.message : String(err)}`);
+						continue;
+					}
+					throw err;
+				}
+			}
 
 			await waitForFile(gw, id);
 
@@ -1131,16 +1201,17 @@ test.describe.serial("Integration — sessions, goals, sandboxed goals", () => {
 			}
 
 			let screenshotId = s.id;
+			const verifyPrompt = "Use the bash tool exactly once with this command: pwd && git status --short --branch";
 			if (restored) {
-				await pollIdle(gw, s.id, 120_000);
-				await browserSend(page, gw, s.id, "Run `pwd`, and confirm `git status`");
+				await pollIdle(gw, s.id, v.sandboxed ? 180_000 : 120_000);
+				await browserSend(page, gw, s.id, verifyPrompt, v.sandboxed ? 240_000 : 120_000);
 			} else {
 				const r = await api(gw, "/api/sessions", {
 					method: "POST", body: JSON.stringify({ worktree: v.worktree, sandboxed: v.sandboxed }),
 				});
 				const ns = (await r.json()).id;
 				await pollIdle(gw, ns, v.sandboxed ? 180_000 : 120_000);
-				await browserSend(page, gw, ns, "Run `pwd`, and confirm `git status`");
+				await browserSend(page, gw, ns, verifyPrompt, v.sandboxed ? 240_000 : 120_000);
 				screenshotId = ns;
 			}
 

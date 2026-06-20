@@ -20,7 +20,7 @@ import { PrStatusStore } from "./agent/pr-status-store.js";
 import { SessionManager } from "./agent/session-manager.js";
 import { RateLimiter } from "./auth/rate-limit.js";
 import { validateToken } from "./auth/token.js";
-import { oauthComplete, oauthFlowStatus, oauthStart, oauthStatus } from "./auth/oauth.js";
+import { oauthComplete, oauthFlowStatus, oauthLogout, oauthStart, oauthStatus } from "./auth/oauth.js";
 import { handleWebSocketConnection } from "./ws/handler.js";
 import { paceAndSend, PACE_TIMEOUT_MS } from "./replay-pacing.js";
 import { discoverSlashSkills, discoverSlashSkillsResolved, getSkillDirectories, getSlashSkill, buildSlashSkillPrompt, invalidateSlashSkillsCache, type SkillMarketContext } from "./skills/slash-skills.js";
@@ -52,7 +52,10 @@ import { transcriptToHostMessages, transcriptToToolCall, buildTranscriptEnvelope
 import { resolvePackIdentityForTool } from "./extension-host/pack-identity.js";
 import { mintSurfaceToken, resolveSurfaceIdentity } from "./extension-host/surface-binding.js";
 import { PackContributionRegistry } from "./extension-host/pack-contribution-registry.js";
-import { loadPackContributions } from "./agent/pack-contributions.js";
+import { loadPackContributions, providerConfigStoreKey, PROVIDER_CONFIG_KEY_PREFIX } from "./agent/pack-contributions.js";
+import { LifecycleHub, type HookCtx } from "./agent/lifecycle-hub.js";
+import { ContextTraceStore } from "./agent/context-trace-store.js";
+import { fenceBlock } from "./agent/context-blocks.js";
 import { isPackPathWithinRoot } from "./extension-host/path-guard.js";
 import { buildGateStatusSummary } from "./gate-status-summary.js";
 import { buildGateVerificationSnapshot, UnknownVerificationStepError } from "./gate-verification-snapshot.js";
@@ -64,7 +67,7 @@ import {
 	type TextSelectionOptions,
 } from "./utils/text-selection.js";
 
-import { getPromptSections, initPromptDirs, loadPersistedPromptSections } from "./agent/system-prompt.js";
+import { getPromptSections, initPromptDirs, loadPersistedPromptSections, persistPromptSections } from "./agent/system-prompt.js";
 import { recordElapsed } from "./agent/profiling.js";
 import { cpuDiagnosticsEnabled, getCpuDiagnostics } from "./agent/cpu-diagnostics.js";
 import { resolveGrantPolicy, computeEffectiveAllowedTools } from "./agent/tool-activation.js";
@@ -131,6 +134,44 @@ function isValidBaseRefBranchGrammar(name: string): boolean {
 	if (name.includes("..") || name.includes("@{")) return false;
 	if (/[\x00-\x1f\x7f~^:?*\[\\]/.test(name)) return false;
 	return /^[A-Za-z0-9_./-]+$/.test(name);
+}
+
+function collectVisibleSessionWorktreeReferences(projectContextManager: ProjectContextManager): WorktreeReferenceRecord[] {
+	const sessions: WorktreeReferenceRecord[] = [];
+	for (const ctx of projectContextManager.visible()) {
+		sessions.push(...ctx.sessionStore.getAll());
+	}
+	return sessions;
+}
+
+function wireGoalManagerResolvers(
+	ctx: ProjectContext,
+	deps: {
+		sessionManager: SessionManager;
+		projectContextManager: ProjectContextManager;
+		projectRegistry: ProjectRegistry;
+	},
+): void {
+	const projectId = ctx.project.id;
+	ctx.goalManager.setPoolResolver(() => deps.sessionManager.getWorktreePool(projectId));
+	ctx.goalManager.setComponentsResolver((pid: string) => {
+		const c = deps.projectContextManager.getOrCreate(pid);
+		return c ? c.projectConfigStore.getComponents() : [];
+	});
+	ctx.goalManager.setProjectRootResolver((pid: string) => deps.projectRegistry.get(pid)?.rootPath);
+	ctx.goalManager.setWorktreeRootResolver((pid: string) => {
+		const c = deps.projectContextManager.getOrCreate(pid);
+		return c?.projectConfigStore.get("worktree_root") || undefined;
+	});
+	ctx.goalManager.setBaseRefResolver((pid: string) => {
+		const c = deps.projectContextManager.getOrCreate(pid);
+		return c?.projectConfigStore.get("base_ref") || undefined;
+	});
+	ctx.goalManager.setWorktreeSetupTimeoutResolver((pid: string) => {
+		const c = deps.projectContextManager.getOrCreate(pid);
+		return c?.projectConfigStore.get("worktree_setup_timeout_ms") || undefined;
+	});
+	ctx.goalManager.setLiveSessionResolver(() => collectVisibleSessionWorktreeReferences(deps.projectContextManager));
 }
 
 // Best-effort guard for add-time `base_ref` pinning: a detected `origin/<branch>`
@@ -241,7 +282,7 @@ import { PreferencesStore } from "./agent/preferences-store.js";
 import { ProjectConfigStore, type PackOrderScope } from "./agent/project-config-store.js";
 import { ToolGroupPolicyStore } from "./agent/tool-group-policy-store.js";
 import { getAllConfigDirectories, removeBuiltinDirectory, resetConfigDirectories } from "./agent/config-directories.js";
-import { checkDockerAvailability, buildSandboxImage, isBuildingImage, ensureImageAgentVersion } from "./agent/sandbox-status.js";
+import { checkDockerAvailability, buildSandboxImage, isBuildingImage, ensureImageAgentVersion, resolveSandboxDockerContext } from "./agent/sandbox-status.js";
 import { SandboxManager, type SandboxBootstrap } from "./agent/sandbox-manager.js";
 import { resolveSandboxCloneSource, type SandboxCloneSource } from "./agent/sandbox-clone-source.js";
 import { validateSandboxMounts } from "./agent/sandbox-mounts.js";
@@ -276,18 +317,21 @@ import {
 } from "./agent/aigw-manager.js";
 import { writeOpenAIModelAdditions } from "./agent/openai-model-additions.js";
 import { ReviewAnnotationStore, type ReviewAnnotation } from "./review-annotation-store.js";
-import { getAvailableModels, discoverModelsForConfig, invalidateModelCache } from "./agent/model-registry.js";
-import { testModelPreference } from "./agent/model-completion.js";
+import { getAvailableModels, discoverModelsForConfig, invalidateModelCache, getBuiltInProviderIds } from "./agent/model-registry.js";
+import { testModelPreference, testProviderApiKey } from "./agent/model-completion.js";
 import type { CustomProviderConfig } from "./agent/model-registry.js";
 import { canonicalImageModelPref, defaultImageModelPref, generateImage, getAvailableImageModels } from "./agent/image-generation.js";
 import { ProjectRegistry, SymlinkProjectRootError, PreflightFailedError, SYSTEM_PROJECT_ID, ProjectOrderError } from "./agent/project-registry.js";
 import { runPreflight } from "./agent/project-preflight.js";
 import { archiveProjectBobbitDir, ArchiveError } from "./agent/bobbit-archive.js";
 import { ProjectContextManager } from "./agent/project-context-manager.js";
+import type { ProjectContext } from "./agent/project-context.js";
 import { resolveProjectForRequest } from "./agent/resolve-project.js";
 import { GoalManager } from "./agent/goal-manager.js";
+import { cleanupGateDiagnosticsForGoal } from "./agent/gate-diagnostics-cleanup.js";
+import type { WorktreeReferenceRecord } from "./agent/worktree-reference-guard.js";
 import { computePlanFreezeUpdate } from "./agent/parent-workflow-freeze.js";
-import { detectHostTokens, resolveHostTokenValue, sandboxTokenPolicyAllowsCodexAuth } from "./agent/host-tokens.js";
+import { detectHostTokens, resolveHostTokenValue, resolveSandboxAgentAuthPolicy } from "./agent/host-tokens.js";
 import type { PersistedGoal } from "./agent/goal-store.js";
 import type { GateResetResult } from "./agent/gate-store.js";
 import { buildGithubBranchUrl, type GoalGithubLinkResponse } from "./sidebar-actions.js";
@@ -416,10 +460,6 @@ export function buildMarketToolRootsForProject(options: {
 }
 
 /**
- * Delete remote branches associated with a goal (integration + agent worktree branches).
- * Fire-and-forget — errors are logged but never block the archive flow.
- */
-/**
  * Clamp a thinking-level token against a role's pinned model (if any).
  * - Validates that the token is in the canonical set; returns undefined otherwise.
  * - When `modelStr` is set in canonical `provider/modelId` form, clamps the
@@ -453,6 +493,31 @@ function shapeGatewayModelsForDisplay(gateway: ModelGateway, models: AigwModel[]
 	);
 }
 
+
+
+export function isMissingRemoteRefDeleteError(err: unknown): boolean {
+	const texts: string[] = [];
+	const addText = (value: unknown) => {
+		if (typeof value === "string") texts.push(value);
+		else if (Buffer.isBuffer(value)) texts.push(value.toString("utf-8"));
+	};
+
+	addText(err);
+	if (err instanceof Error) addText(err.message);
+	if (err && typeof err === "object") {
+		const record = err as Record<string, unknown>;
+		addText(record.stderr);
+		addText(record.message);
+	}
+
+	return texts.some(text => /\bremote\s+ref\s+does\s+not\s+exist\b/i.test(text));
+}
+
+/**
+ * Delete remote branches associated with a goal (integration + agent worktree branches).
+ * Fire-and-forget — errors are logged but never block the archive flow.
+ */
+
 async function deleteRemoteGoalBranches(
 	goal: PersistedGoal,
 	extraBranches: readonly string[],
@@ -481,6 +546,7 @@ async function deleteRemoteGoalBranches(
 			});
 			console.log(`[api] Deleted remote branch: ${branch} (repo: ${rp})`);
 		} catch (err) {
+			if (isMissingRemoteRefDeleteError(err)) return;
 			console.warn(`[api] Failed to delete remote branch ${branch} in ${rp}:`, err);
 		}
 	})));
@@ -1079,6 +1145,7 @@ export function createGateway(config: GatewayConfig) {
 			ctx.goalStore.bumpGeneration();
 		};
 	}
+
 	const builtinConfigProvider = new BuiltinConfigProvider();
 	// Wire builtin defaults into stores (in-memory only, no disk writes).
 	// Direct store lookups (roleStore.get()) transparently fall back to
@@ -1207,7 +1274,43 @@ export function createGateway(config: GatewayConfig) {
 	packContributionRegistry = new PackContributionRegistry(
 		marketPackEntriesForProject,
 		(scope, projectId, packName) => packActivationStore(scope as PackScope, projectId)?.getPackActivation(scope as PackOrderScope, packName).entrypoints ?? [],
+		(scope, projectId, packName) => packActivationStore(scope as PackScope, projectId)?.getPackActivation(scope as PackOrderScope, packName).providers ?? [],
+		// Config-gated provider activation + effective-config overlay: read the
+		// provider's PERSISTED flat config (written by the pack's `config` route to
+		// the pack-scoped store under providerConfigStoreKey) synchronously, so a
+		// provider declaring `activation.requiresConfig` stays dormant until it is
+		// configured. packId scopes the store; scope/project are accepted for parity
+		// with the activation lookups (provider config is pack-global in external mode).
+		(_scope, _projectId, packId, providerId) => {
+			if (!packId) return undefined;
+			const persisted = getPackStore().getSync<Record<string, unknown>>(packId, providerConfigStoreKey(providerId));
+			return persisted && typeof persisted === "object" ? persisted : undefined;
+		},
 	);
+	sessionManager.lifecycleHub = new LifecycleHub({
+		registry: packContributionRegistry,
+		moduleHost,
+		trace: new ContextTraceStore(bobbitStateDir()),
+		// Least-privilege, store-only host for provider hooks (capabilities.store ===
+		// true; session/agents denied) — gives a provider its own pack-scoped durable
+		// store via the same parent-authorized path routes use.
+		providerHostApi: ({ sessionId, packId }) => createServerHostApi({
+			sessionId,
+			packId,
+			contributionId: "",
+			packStore: getPackStore(),
+			capabilityMask: { store: true, session: false, agents: false },
+		}),
+		gatewayInfo: () => {
+			try {
+				const baseUrl = process.env.BOBBIT_GATEWAY_URL || fs.readFileSync(path.join(bobbitStateDir(), "gateway-url"), "utf-8").trim();
+				const token = fs.readFileSync(path.join(bobbitStateDir(), "token"), "utf-8").trim();
+				return { baseUrl, token };
+			} catch {
+				return { baseUrl: "", token: "" };
+			}
+		},
+	});
 	routeRegistry = new RouteRegistry(packContributionRegistry);
 
 	// pack-schema-v1 §7: feed pack_activation into the roles/tools cascade so a
@@ -1950,14 +2053,21 @@ export function createGateway(config: GatewayConfig) {
 				// Auto-build or rebuild image if missing or stale. Images are
 				// shared across projects (Docker image tags) so the first project
 				// to request a sandbox pays the build cost.
-				const imageStatus = await checkDockerAvailability(imageName);
-				if (imageStatus.imageExists === false && imageStatus.dockerfileExists === true) {
-					const buildResult = await buildSandboxImage(imageName, projectDir);
+				const dockerContextRoot = resolveSandboxDockerContext(config.defaultCwd);
+				const imageStatus = await checkDockerAvailability(imageName, dockerContextRoot ?? undefined);
+				if (imageStatus.imageExists === false) {
+					if (!dockerContextRoot) {
+						throw new Error(`[sandbox] Docker image "${imageName}" is missing and docker/Dockerfile could not be found`);
+					}
+					const buildResult = await buildSandboxImage(imageName, dockerContextRoot);
 					if (!buildResult.success) {
-						console.error(`[sandbox] Auto-build failed for project ${projectId}; proceeding will likely error`);
+						throw new Error(`[sandbox] Auto-build failed for project ${projectId}: ${buildResult.error || "unknown error"}`);
 					}
 				} else if (imageStatus.imageExists === true) {
-					await ensureImageAgentVersion(imageName, projectDir);
+					const imageReady = await ensureImageAgentVersion(imageName, dockerContextRoot ?? undefined);
+					if (!imageReady) {
+						throw new Error(`[sandbox] Docker image "${imageName}" is stale and could not be rebuilt`);
+					}
 				}
 
 				const isRepo = await isGitRepo(projectDir);
@@ -2039,6 +2149,7 @@ export function createGateway(config: GatewayConfig) {
 				}
 
 				const sandboxTokenEntries = cfg.getSandboxTokens();
+				const sandboxAuthPolicy = resolveSandboxAgentAuthPolicy(sandboxTokenEntries);
 				return {
 					projectId,
 					projectDir,
@@ -2048,7 +2159,8 @@ export function createGateway(config: GatewayConfig) {
 					sandboxNetwork,
 					sandboxMounts: poolMounts,
 					sandboxCredentials: poolCredentials,
-					sandboxAgentAuthAllowed: sandboxTokenEntries.length === 0 || sandboxTokenPolicyAllowsCodexAuth(sandboxTokenEntries),
+					sandboxAgentAuthAllowed: sandboxAuthPolicy.includeCodexAuth,
+					sandboxAgentAuthGoogleAllowed: sandboxAuthPolicy.includeGoogleAuth,
 					sandboxAgentAuthPrefs: preferencesStore,
 					githubToken,
 					toolManager: ctx.toolManager,
@@ -2140,9 +2252,9 @@ export function createGateway(config: GatewayConfig) {
 					try {
 						const { sweepOrphanedWorktrees } = await import("./agent/worktree-sweeper.js");
 						const sweepProjects: Array<{ id: string; rootPath: string; repos?: string[] }> = [];
-						const sweepGoals: Array<{ id: string; branch?: string; worktreePath?: string; archived?: boolean; repoWorktrees?: Record<string, string> }> = [];
-						const sweepSessions: Array<{ id: string; branch?: string; worktreePath?: string; archived?: boolean; repoWorktrees?: Record<string, string> }> = [];
-						const sweepStaff: Array<{ id: string; branch?: string; worktreePath?: string; repoWorktrees?: Record<string, string> }> = [];
+						const sweepGoals: Array<{ id: string; branch?: string; worktreePath?: string; cwd?: string; archived?: boolean; repoWorktrees?: Record<string, string> }> = [];
+						const sweepSessions: Array<{ id: string; branch?: string; worktreePath?: string; cwd?: string; archived?: boolean; repoWorktrees?: Record<string, string> }> = [];
+						const sweepStaff: Array<{ id: string; branch?: string; worktreePath?: string; cwd?: string; repoWorktrees?: Record<string, string> }> = [];
 						// Skip hidden contexts (synthetic system project) — it has
 						// no goals/sessions/staff and must never drive worktree work.
 						for (const ctx of projectContextManager.visible()) {
@@ -2154,13 +2266,13 @@ export function createGateway(config: GatewayConfig) {
 							});
 							for (const g of ctx.goalStore.getAll()) {
 								sweepGoals.push({
-									id: g.id, branch: g.branch, worktreePath: g.worktreePath, archived: !!g.archived,
+									id: g.id, branch: g.branch, worktreePath: g.worktreePath, cwd: g.cwd, archived: !!g.archived,
 									repoWorktrees: (g as { repoWorktrees?: Record<string, string> }).repoWorktrees,
 								});
 							}
 							for (const s of ctx.sessionStore.getAll()) {
 								sweepSessions.push({
-									id: s.id, branch: s.branch, worktreePath: s.worktreePath, archived: !!s.archived,
+									id: s.id, branch: s.branch, worktreePath: s.worktreePath, cwd: s.cwd, archived: !!s.archived,
 									repoWorktrees: s.repoWorktrees,
 								});
 							}
@@ -2169,6 +2281,7 @@ export function createGateway(config: GatewayConfig) {
 									id: st.id,
 									branch: st.branch,
 									worktreePath: st.worktreePath,
+									cwd: st.cwd,
 									repoWorktrees: st.repoWorktrees,
 								});
 							}
@@ -2221,7 +2334,7 @@ export function createGateway(config: GatewayConfig) {
 								// Single-repo: resolve nested rootPath to the actual git toplevel so
 								// pool entries land under <gitRoot>-wt/, not <projectDir>-wt/.
 								const poolRepoPath = isMulti ? repoPath : await getRepoRoot(repoPath);
-								sessionManager.initWorktreePoolForProject(ctx.project.id, poolRepoPath, () => pcs.getComponents(), poolSize, wtRoot, () => pcs.get("base_ref"));
+								sessionManager.initWorktreePoolForProject(ctx.project.id, poolRepoPath, () => pcs.getComponents(), poolSize, wtRoot, () => pcs.get("base_ref"), () => pcs.get("worktree_setup_timeout_ms") || undefined);
 								console.log(`[boot] pool ready: project=${ctx.project.id} in ${Date.now() - tStart}ms`);
 							} else {
 								console.log(`[boot] pool skipped (not a git repo): project=${ctx.project.id} in ${Date.now() - tStart}ms`);
@@ -2239,23 +2352,7 @@ export function createGateway(config: GatewayConfig) {
 			// resolve components / project root for multi-repo goal creation.
 			// Hidden contexts (synthetic system project) have no goals to wire.
 			for (const ctx of projectContextManager.visible()) {
-				const projectId = ctx.project.id;
-				ctx.goalManager.setPoolResolver(() => sessionManager.getWorktreePool(projectId));
-				ctx.goalManager.setComponentsResolver((pid: string) => {
-					const c = projectContextManager.getOrCreate(pid);
-					return c ? c.projectConfigStore.getComponents() : [];
-				});
-				ctx.goalManager.setProjectRootResolver((pid: string) => {
-					return projectRegistry.get(pid)?.rootPath;
-				});
-				ctx.goalManager.setWorktreeRootResolver((pid: string) => {
-					const c = projectContextManager.getOrCreate(pid);
-					return c?.projectConfigStore.get("worktree_root") || undefined;
-				});
-				ctx.goalManager.setBaseRefResolver((pid: string) => {
-					const c = projectContextManager.getOrCreate(pid);
-					return c?.projectConfigStore.get("base_ref") || undefined;
-				});
+				wireGoalManagerResolvers(ctx, { sessionManager, projectContextManager, projectRegistry });
 			}
 
 			// Now that sessions are live, re-subscribe to team events
@@ -2555,6 +2652,14 @@ async function handleApiRoute(
 	// installed/updated/removed market-pack tool roots are re-scanned (Windows
 	// coarse-mtime can otherwise serve a stale scan after a re-copy update).
 	const invalidateResolverCaches = (): void => { invalidateSlashSkillsCache(); __resetToolScanCache(); dispatcher.invalidate(); routeDispatcher.invalidate(); routeRegistry.invalidate(); packContributionRegistry.invalidate(); };
+	// Host-owned activation-cache invalidation: a pack persisting provider config
+	// (key `provider-config:*`) must drop the activation-filtered provider index so
+	// a dormant provider (e.g. Hindsight gaining an externalUrl) activates WITHOUT a
+	// gateway restart. Wired into every pack store-write path (route `host.store`
+	// puts + the `/api/ext/store/:op` endpoint). Non-config keys are ignored.
+	const notePackStoreWrite = (key: unknown): void => {
+		if (typeof key === "string" && key.startsWith(PROVIDER_CONFIG_KEY_PREFIX)) invalidateResolverCaches();
+	};
 	// pack-schema-v1 §6.6: scoped-endpoint authorization for a PACK-BOUND surface
 	// token (no carrier tool). The token validation already proved installed +
 	// active + own-session via the pack-contribution registry, so allowedTools is
@@ -2977,7 +3082,8 @@ async function handleApiRoute(
 		const sandboxConfig = projectConfigStore.get("sandbox") || "none";
 		const imageName = projectConfigStore.get("sandbox_image") || "bobbit-agent";
 		const configured = sandboxConfig === "docker";
-		const status = await checkDockerAvailability(configured ? imageName : undefined);
+		const dockerContextRoot = resolveSandboxDockerContext(config.defaultCwd);
+		const status = await checkDockerAvailability(configured ? imageName : undefined, dockerContextRoot ?? undefined);
 		json({ ...status, configured });
 		return;
 	}
@@ -2985,7 +3091,8 @@ async function handleApiRoute(
 	// POST /api/sandbox-image/build
 	if (url.pathname === "/api/sandbox-image/build" && req.method === "POST") {
 		const imageName = projectConfigStore.get("sandbox_image") || "bobbit-agent";
-		if (!fs.existsSync(path.join(config.defaultCwd, "docker", "Dockerfile"))) {
+		const dockerContextRoot = resolveSandboxDockerContext(config.defaultCwd);
+		if (!dockerContextRoot) {
 			json({ error: "Dockerfile not found at docker/Dockerfile" }, 404);
 			return;
 		}
@@ -2993,7 +3100,7 @@ async function handleApiRoute(
 			json({ error: "Build already in progress" }, 409);
 			return;
 		}
-		const result = await buildSandboxImage(imageName, config.defaultCwd);
+		const result = await buildSandboxImage(imageName, dockerContextRoot);
 		if (result.success) {
 			json({ success: true });
 		} else {
@@ -3276,20 +3383,7 @@ async function handleApiRoute(
 						ctx.gateStore.onStatusChange = () => {
 							ctx.goalStore.bumpGeneration();
 						};
-						ctx.goalManager.setPoolResolver(() => sessionManager.getWorktreePool(existing.id));
-						ctx.goalManager.setComponentsResolver((pid: string) => {
-							const c = projectContextManager.getOrCreate(pid);
-							return c ? c.projectConfigStore.getComponents() : [];
-						});
-						ctx.goalManager.setProjectRootResolver((pid: string) => projectRegistry.get(pid)?.rootPath);
-						ctx.goalManager.setWorktreeRootResolver((pid: string) => {
-							const c = projectContextManager.getOrCreate(pid);
-							return c?.projectConfigStore.get("worktree_root") || undefined;
-						});
-						ctx.goalManager.setBaseRefResolver((pid: string) => {
-							const c = projectContextManager.getOrCreate(pid);
-							return c?.projectConfigStore.get("base_ref") || undefined;
-						});
+						wireGoalManagerResolvers(ctx, { sessionManager, projectContextManager, projectRegistry });
 					}
 					json(existing, 200);
 					return;
@@ -3426,26 +3520,13 @@ async function handleApiRoute(
 						// Single-repo: resolve nested rootPath to the actual git toplevel so
 						// pool entries land under <gitRoot>-wt/, not <projectDir>-wt/.
 						const poolRepoPath = isMulti ? body.rootPath : await getRepoRoot(body.rootPath);
-						sessionManager.initWorktreePoolForProject(project.id, poolRepoPath, pcs ? () => pcs.getComponents() : undefined, poolSize, wtRoot, pcs ? () => pcs.get("base_ref") : undefined);
+						sessionManager.initWorktreePoolForProject(project.id, poolRepoPath, pcs ? () => pcs.getComponents() : undefined, poolSize, wtRoot, pcs ? () => pcs.get("base_ref") : undefined, pcs ? () => pcs.get("worktree_setup_timeout_ms") || undefined : undefined);
 					}
 				} catch { /* best-effort */ }
 			}
 			// Wire the goal-manager pool resolver for the new project (Phase 3 — goals via pool).
 			if (newCtx) {
-				newCtx.goalManager.setPoolResolver(() => sessionManager.getWorktreePool(project.id));
-				newCtx.goalManager.setComponentsResolver((pid: string) => {
-					const c = projectContextManager.getOrCreate(pid);
-					return c ? c.projectConfigStore.getComponents() : [];
-				});
-				newCtx.goalManager.setProjectRootResolver((pid: string) => projectRegistry.get(pid)?.rootPath);
-				newCtx.goalManager.setWorktreeRootResolver((pid: string) => {
-					const c = projectContextManager.getOrCreate(pid);
-					return c?.projectConfigStore.get("worktree_root") || undefined;
-				});
-				newCtx.goalManager.setBaseRefResolver((pid: string) => {
-					const c = projectContextManager.getOrCreate(pid);
-					return c?.projectConfigStore.get("base_ref") || undefined;
-				});
+				wireGoalManagerResolvers(newCtx, { sessionManager, projectContextManager, projectRegistry });
 			}
 			json(project, 201);
 		} catch (err: any) {
@@ -4067,6 +4148,30 @@ async function handleApiRoute(
 		return result;
 	}
 
+	function normalizedArchivedQuery(value: string | null): string {
+		return (value || "").trim().toLowerCase();
+	}
+
+	function archivedSessionMatchesQuery(session: any, query: string): boolean {
+		if (!query) return true;
+		return String(session?.title || "").toLowerCase().includes(query)
+			|| String(session?.role || "").toLowerCase().includes(query);
+	}
+
+	function isArchivedQueryChildSession(session: any): boolean {
+		return !!(session?.parentSessionId || session?.delegateOf);
+	}
+
+	function archivedGoalMatchesQuery(goal: PersistedGoal, sessions: any[], query: string): boolean {
+		if (!query) return true;
+		if (String(goal.title || "").toLowerCase().includes(query)) return true;
+		return sessions.some(s =>
+			(s?.goalId === goal.id || s?.teamGoalId === goal.id)
+			&& !isArchivedQueryChildSession(s)
+			&& archivedSessionMatchesQuery(s, query),
+		);
+	}
+
 	// GET /api/sessions
 	if (url.pathname === "/api/sessions" && req.method === "GET") {
 		const currentGen = projectContextManager.getSessionGeneration();
@@ -4089,6 +4194,7 @@ async function handleApiRoute(
 		}
 		// Support ?include=archived to return archived sessions too
 		if (url.searchParams.get("include") === "archived") {
+			const archivedQuery = normalizedArchivedQuery(url.searchParams.get("q"));
 			// Collect archived sessions across all project contexts
 			const allArchived: typeof sessions = [];
 			for (const ctx of projectContextManager.visible()) {
@@ -4099,10 +4205,11 @@ async function handleApiRoute(
 			}
 			// Sort by archivedAt descending
 			allArchived.sort((a: any, b: any) => ((b as any).archivedAt ?? 0) - ((a as any).archivedAt ?? 0));
-			// Apply projectId filter if present
-			const filteredArchived = filterProjectId
+			// Apply projectId and query filters before pagination.
+			const filteredArchived = (filterProjectId
 				? allArchived.filter((s: any) => s.projectId === filterProjectId)
-				: allArchived;
+				: allArchived
+			).filter((s: any) => archivedSessionMatchesQuery(s, archivedQuery));
 
 			// Collect ALL archived sessions for BFS enrichment (not just delegates)
 			const allArchivedForBfs: typeof sessions = [];
@@ -4249,6 +4356,183 @@ async function handleApiRoute(
 			json(result);
 		} catch (err: any) {
 			jsonError(500, err);
+		}
+		return;
+	}
+
+	// ── Provider per-turn lifecycle hooks (EP G1.4) ──
+	// These endpoints are called only by the Bobbit-generated provider-bridge pi
+	// extension (before-prompt / before-compact) and the context-trace inspector.
+	// They inherit the admin-bearer gate enforced before handleApiRoute, exactly
+	// like POST /api/sessions/:id/tool-grant-request above. afterTurn /
+	// sessionShutdown are gateway-internal dispatches and intentionally have NO
+	// public endpoint.
+	//
+	// Delimiters MUST stay byte-identical to provider-bridge-extension.ts's
+	// stripDelimitedTail() so the system-prompt tail is idempotent turn-over-turn.
+	const DYNAMIC_CONTEXT_START = "<!-- bobbit:dynamic-context:start -->";
+	const DYNAMIC_CONTEXT_END = "<!-- bobbit:dynamic-context:end -->";
+
+	// Resolve a session's lifecycle dispatch context from live or persisted state.
+	// Returns undefined when the session is unknown (→ 404 for the hook endpoints).
+	const resolveHookCtx = (id: string): Omit<HookCtx, "budget" | "config" | "gateway"> | undefined => {
+		const live = sessionManager.getSession(id);
+		const persisted = sessionManager.getPersistedSession(id);
+		if (!live && !persisted) return undefined;
+		const projectId = live?.projectId ?? persisted?.projectId;
+		return {
+			sessionId: id,
+			projectId,
+			scope: projectId ? "project" : "global",
+			cwd: live?.cwd ?? persisted?.cwd ?? process.cwd(),
+			goalId: live?.goalId ?? persisted?.goalId,
+			roleName: live?.role ?? persisted?.role,
+		};
+	};
+
+	// POST /api/sessions/:id/provider-hooks/before-prompt — per-turn dynamic context.
+	const beforePromptMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/provider-hooks\/before-prompt$/);
+	if (beforePromptMatch && req.method === "POST") {
+		const sessionId = beforePromptMatch[1];
+		const body = await readBody(req).catch(() => ({} as any));
+		if (body && body.prompt !== undefined && typeof body.prompt !== "string") {
+			json({ error: "prompt must be a string" }, 400);
+			return;
+		}
+		const base = resolveHookCtx(sessionId);
+		if (!base) {
+			json({ error: "Session not found" }, 404);
+			return;
+		}
+		const hub = sessionManager.lifecycleHub;
+		if (!hub) {
+			json({ tail: "", blocks: [] });
+			return;
+		}
+		try {
+			const turnIndex = body?.turn?.index;
+			const { blocks } = await hub.dispatch("beforePrompt", {
+				...base,
+				prompt: typeof body?.prompt === "string" ? body.prompt : undefined,
+				turn: typeof turnIndex === "number" && Number.isFinite(turnIndex) ? { index: turnIndex } : undefined,
+			});
+			const tail = blocks.length
+				? `\n${DYNAMIC_CONTEXT_START}\n${blocks.map(fenceBlock).join("\n\n")}\n${DYNAMIC_CONTEXT_END}`
+				: "";
+			// Best-effort: refresh the persisted prompt-sections snapshot so the
+			// inspector reflects this turn's dynamic-context tail. Non-fatal.
+			try {
+				const parts = sessionManager.getPromptParts(sessionId);
+				if (parts) {
+					parts.dynamicContext = blocks;
+					persistPromptSections(sessionId, parts);
+				}
+			} catch (err) {
+				console.debug(`[provider-hooks] prompt-sections refresh skipped for ${sessionId}:`, err);
+			}
+			json({
+				tail,
+				blocks: blocks.map((b) => ({ id: b.id, providerId: b.providerId, title: b.title, tokenEstimate: b.tokenEstimate })),
+			});
+		} catch (err: any) {
+			jsonError(500, err);
+		}
+		return;
+	}
+
+	// POST /api/sessions/:id/provider-hooks/before-compact — notify providers before compaction.
+	const beforeCompactMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/provider-hooks\/before-compact$/);
+	if (beforeCompactMatch && req.method === "POST") {
+		const sessionId = beforeCompactMatch[1];
+		// The bridge forwards the about-to-be-lost span (and optionally a precomputed
+		// summary) from the pi session_before_compact payload. Validate both as strings
+		// so a malformed body is rejected rather than silently dispatched empty.
+		const body = await readBody(req).catch(() => ({} as any));
+		if (body && body.span !== undefined && typeof body.span !== "string") {
+			json({ error: "span must be a string" }, 400);
+			return;
+		}
+		if (body && body.summary !== undefined && typeof body.summary !== "string") {
+			json({ error: "summary must be a string" }, 400);
+			return;
+		}
+		const base = resolveHookCtx(sessionId);
+		if (!base) {
+			json({ error: "Session not found" }, 404);
+			return;
+		}
+		const hub = sessionManager.lifecycleHub;
+		if (!hub) {
+			json({});
+			return;
+		}
+		try {
+			await hub.dispatch("beforeCompact", {
+				...base,
+				span: typeof body?.span === "string" ? body.span : undefined,
+				summary: typeof body?.summary === "string" ? body.summary : undefined,
+			});
+			json({});
+		} catch (err: any) {
+			jsonError(500, err);
+		}
+		return;
+	}
+
+	// GET /api/sessions/:id/context-trace?limit=N — per-turn provider dispatch trace.
+	const contextTraceMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/context-trace$/);
+	if (contextTraceMatch && req.method === "GET") {
+		const sessionId = contextTraceMatch[1];
+		let limit: number | undefined;
+		const rawLimit = url.searchParams.get("limit");
+		if (rawLimit !== null) {
+			const n = Number.parseInt(rawLimit, 10);
+			if (Number.isFinite(n) && n > 0) limit = Math.min(n, 1000);
+		}
+		try {
+			const entries = new ContextTraceStore(bobbitStateDir()).readTrace(sessionId, limit);
+			json({ entries });
+		} catch (err: any) {
+			jsonError(500, err);
+		}
+		return;
+	}
+
+	// POST /api/sessions/:id/restart — restart a live session's agent process by id.
+	const restartMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/restart$/);
+	if (restartMatch && req.method === "POST") {
+		let id: string;
+		try {
+			id = decodeURIComponent(restartMatch[1]);
+		} catch {
+			json({ error: "Session not found", code: "SESSION_NOT_FOUND" }, 404);
+			return;
+		}
+
+		const session = sessionManager.getSession(id);
+		const persisted = session ? sessionManager.getSessionStore(session.projectId).get(session.id) : undefined;
+		if (!session || session.status === "terminated" || persisted?.archived) {
+			json({ error: "Session not found", code: "SESSION_NOT_FOUND" }, 404);
+			return;
+		}
+		if (session.readOnly || session.nonInteractive || persisted?.readOnly || persisted?.nonInteractive) {
+			json({ error: "Session cannot be restarted", code: "SESSION_NOT_RESTARTABLE" }, 403);
+			return;
+		}
+
+		const body = await readBody(req).catch(() => null);
+		const status = String(session.status);
+		if ((status === "busy" || status === "streaming" || session.isCompacting) && body?.force !== true) {
+			json({ error: "Session is busy; retry with force to restart", code: "SESSION_BUSY" }, 409);
+			return;
+		}
+
+		try {
+			await sessionManager.restartAgent(id);
+			json({ ok: true, sessionId: id });
+		} catch (err: any) {
+			const code = typeof err?.code === "string" && err.code ? err.code : "RESTART_ERROR";
+			json({ error: err instanceof Error ? err.message : String(err), code }, 500);
 		}
 		return;
 	}
@@ -4528,6 +4812,7 @@ async function handleApiRoute(
 				provCtx.gateStore.onStatusChange = () => {
 					provCtx.goalStore.bumpGeneration();
 				};
+				wireGoalManagerResolvers(provCtx, { sessionManager, projectContextManager, projectRegistry });
 			}
 		}
 
@@ -4558,7 +4843,8 @@ async function handleApiRoute(
 				// Single source of truth shared with the staff path
 				// (staff-manager.ts) and goal path (goal-manager.ts).
 				const components = projCtx?.projectConfigStore.getComponents() ?? [];
-				const support = await resolveWorktreeSupport(components, proj?.rootPath, cwd);
+				const configuredBaseRef = projCtx?.projectConfigStore.get("base_ref") || undefined;
+				const support = await resolveWorktreeSupport(components, proj?.rootPath, cwd, undefined, { configuredBaseRef });
 				if (support.supported && support.repoPath) {
 					worktreeOpts = { repoPath: support.repoPath };
 				}
@@ -4763,11 +5049,23 @@ async function handleApiRoute(
 			const afterParam = url.searchParams.get("after");
 			const afterCursor = afterParam ? parseInt(afterParam, 10) : undefined;
 			const filterProjectId = url.searchParams.get("projectId") || undefined;
+			const archivedQuery = normalizedArchivedQuery(url.searchParams.get("q"));
 			// Aggregate archived goals across all project contexts
 			let allArchived: PersistedGoal[] = [];
+			const sessionsForGoalQuery: any[] = [];
+			for (const liveSession of sessionManager.listSessions()) {
+				if (filterProjectId && liveSession.projectId !== filterProjectId) continue;
+				sessionsForGoalQuery.push(liveSession);
+			}
 			for (const ctx of projectContextManager.visible()) {
 				if (filterProjectId && ctx.project.id !== filterProjectId) continue;
 				allArchived.push(...ctx.goalStore.getArchived());
+				for (const s of ctx.sessionStore.getArchived()) {
+					sessionsForGoalQuery.push({ ...s, colorIndex: colorStore.get(s.id), status: "archived" });
+				}
+			}
+			if (archivedQuery) {
+				allArchived = allArchived.filter(g => archivedGoalMatchesQuery(g, sessionsForGoalQuery, archivedQuery));
 			}
 			allArchived.sort((a, b) => (b.archivedAt ?? 0) - (a.archivedAt ?? 0));
 			const total = allArchived.length;
@@ -4843,6 +5141,20 @@ async function handleApiRoute(
 		try {
 			const sandboxed = body.sandboxed === true;
 			const autoStartTeam = body.autoStartTeam !== false; // default true
+			// Per-goal worktree setup hook (optional). Accept camelCase or snake_case.
+			// Command: trimmed, passed only when non-empty. Timeout: number or numeric
+			// string, passed only when a finite positive integer.
+			let worktreeSetupCommand: string | undefined;
+			{
+				const raw = body.worktreeSetupCommand ?? body.worktree_setup_command;
+				if (typeof raw === "string" && raw.trim()) worktreeSetupCommand = raw.trim();
+			}
+			let worktreeSetupTimeoutMs: number | undefined;
+			{
+				const raw = body.worktreeSetupTimeoutMs ?? body.worktree_setup_timeout_ms;
+				const n = typeof raw === "number" ? raw : (typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN);
+				if (Number.isFinite(n) && n > 0) worktreeSetupTimeoutMs = Math.floor(n);
+			}
 			let enabledOptionalSteps: string[] | undefined;
 			if (Array.isArray(body.enabledOptionalSteps) && body.enabledOptionalSteps.every((s: unknown) => typeof s === "string")) {
 				enabledOptionalSteps = body.enabledOptionalSteps;
@@ -5073,6 +5385,8 @@ async function handleApiRoute(
 				maxNestingDepth: effMaxNestingDepth,
 				divergencePolicy: effDivergencePolicy,
 				maxConcurrentChildren: effMaxConcurrentChildren,
+				worktreeSetupCommand,
+				worktreeSetupTimeoutMs,
 			});
 			// Set projectId (explicit or auto-detected from cwd)
 			if (targetProjectId) {
@@ -5216,7 +5530,14 @@ async function handleApiRoute(
 		const mergedManually = url.searchParams.get("mergedManually") === "true";
 
 		const archiveOne = async (g: import("./agent/goal-store.js").PersistedGoal): Promise<boolean> => {
-			if (g.archived) return false;
+			if (g.archived) {
+				try {
+					await cleanupGateDiagnosticsForGoal(g.id, projectContextManager.getContextForGoal(g.id)?.stateDir);
+				} catch (err) {
+					console.warn(`[api] archive: gate diagnostics cleanup failed for already-archived goal ${g.id}:`, err);
+				}
+				return false;
+			}
 			if (mergedManually && g.id === id && g.state !== "complete") {
 				await getGoalManagerForGoal(g.id).updateGoal(g.id, { state: "complete" });
 			}
@@ -5749,6 +6070,8 @@ async function handleApiRoute(
 			// Sub-goal C: live status reader for host.agents.status/list (the core has
 			// no public status accessor).
 			readChildStatus: (id: string) => sessionManager.getSession(id)?.status,
+			// Drop activation caches when an action persists provider config (host-owned).
+			onStoreWrite: notePackStoreWrite,
 		});
 		// The session working dir the confined worker uses as its process.cwd() (tool
 		// parity — prefer the worktree path; fall back to the recorded cwd).
@@ -5935,6 +6258,8 @@ async function handleApiRoute(
 				result = await withStoreTimeout(packStore.get(ident.packId, key as string), undefined, `store ${op}`);
 			} else if (op === "put") {
 				await withStoreTimeout(packStore.put(ident.packId, key as string, (body as { value?: unknown }).value), undefined, `store ${op}`);
+				// Host-owned: a direct provider-config write must drop activation caches too.
+				notePackStoreWrite(key);
 				result = { ok: true };
 			} else {
 				result = await withStoreTimeout(packStore.list(ident.packId, typeof prefix === "string" ? prefix : undefined), undefined, `store ${op}`);
@@ -6122,6 +6447,8 @@ async function handleApiRoute(
 			// Sub-goal C: live status reader for host.agents.status/list (the core has
 			// no public status accessor).
 			readChildStatus: (id: string) => sessionManager.getSession(id)?.status,
+			// Drop activation caches when a route persists provider config (host-owned).
+			onStoreWrite: notePackStoreWrite,
 		});
 		const start = Date.now();
 		try {
@@ -6133,7 +6460,7 @@ async function handleApiRoute(
 				resolved.modulePath,
 				resolved.packRoot,
 				routeName,
-				{ host, sessionId: guard.sessionId, toolUseId: toolUseId ?? "", tool: ident.contributionId, workingDir: routeWorkingDir },
+				{ host, sessionId: guard.sessionId, toolUseId: toolUseId ?? "", tool: ident.contributionId, projectId: routeSessionProjectId, workingDir: routeWorkingDir },
 				{ method, query, body: init.body },
 			);
 			console.log(`[ext-route] name=${routeName} tool=${routeTool ?? ident.contributionId} packId=${ident.packId} session=${guard.sessionId} outcome=ok durationMs=${Date.now() - start}`);
@@ -6674,7 +7001,7 @@ async function handleApiRoute(
 			projectBase: string | undefined,
 			store: PackOrderStore,
 			packName: string,
-		): { roles: string[]; tools: string[]; skills: string[]; entrypoints: Array<{ listName: string; label?: string; kind?: "composer-slash" | "git-widget-button" | "command-palette" | "route"; routeId?: string }>; descriptions: PackEntityDescriptions } | null => {
+		): { roles: string[]; tools: string[]; skills: string[]; entrypoints: Array<{ listName: string; label?: string; kind?: "composer-slash" | "git-widget-button" | "command-palette" | "route"; routeId?: string }>; providers?: string[]; hooks?: string[]; mcp?: string[]; piExtensions?: string[]; runtimes?: string[]; workflows?: string[]; descriptions: PackEntityDescriptions } | null => {
 			const base = scope === "server" ? getProjectRoot() : scope === "global-user" ? os.homedir() : projectBase;
 			if (base === undefined) return null;
 			const entries = scopeMarketPackEntries(scope as PackScope, base, store.getPackOrder(scope));
@@ -6702,7 +7029,7 @@ async function handleApiRoute(
 					entrypointByListName.set(ep.listName, { label: ep.label, kind: ep.kind, routeId: ep.routeId });
 				}
 			} catch { /* metadata is optional; listName is the stable key */ }
-			return {
+			const baseCatalogue = {
 				roles: [...c.roles],
 				tools: concreteTools.tools,
 				skills: [...c.skills],
@@ -6713,6 +7040,20 @@ async function handleApiRoute(
 				// One-line per-entity descriptions for the activation disclosure (R3).
 				// Read from the SAME installed pack dir as the catalogue above — never
 				// from the runtime-filtered /api/tools or /api/ext/contributions.
+				descriptions,
+			};
+			if ((entry.manifest.schema ?? 1) < 2) return baseCatalogue;
+			return {
+				roles: baseCatalogue.roles,
+				tools: baseCatalogue.tools,
+				skills: baseCatalogue.skills,
+				entrypoints: baseCatalogue.entrypoints,
+				providers: [...(c.providers ?? [])],
+				hooks: [...(c.hooks ?? [])],
+				mcp: [...(c.mcp ?? [])],
+				piExtensions: [...(c.piExtensions ?? [])],
+				runtimes: [...(c.runtimes ?? [])],
+				workflows: [...(c.workflows ?? [])],
 				descriptions,
 			};
 		};
@@ -6745,7 +7086,7 @@ async function handleApiRoute(
 			// catalogue (drop refs for entities the pack does not declare).
 			const reqDisabled = (body?.disabled ?? {}) as Record<string, unknown>;
 			const catalogueEntrypointNames = new Set(catalogue.entrypoints.map((e) => e.listName));
-			const normaliseKind = (kind: "roles" | "tools" | "skills" | "entrypoints", valid: Set<string>): string[] => {
+			const normaliseKind = (kind: "roles" | "tools" | "skills" | "entrypoints" | "providers" | "hooks" | "mcp" | "piExtensions" | "runtimes" | "workflows", valid: Set<string>): string[] => {
 				const raw = reqDisabled[kind];
 				if (!Array.isArray(raw)) return [];
 				return raw.filter((x): x is string => typeof x === "string" && valid.has(x));
@@ -6755,6 +7096,12 @@ async function handleApiRoute(
 				tools: normaliseKind("tools", new Set(catalogue.tools)),
 				skills: normaliseKind("skills", new Set(catalogue.skills)),
 				entrypoints: normaliseKind("entrypoints", catalogueEntrypointNames),
+				providers: normaliseKind("providers", new Set(catalogue.providers ?? [])),
+				hooks: normaliseKind("hooks", new Set(catalogue.hooks ?? [])),
+				mcp: normaliseKind("mcp", new Set(catalogue.mcp ?? [])),
+				piExtensions: normaliseKind("piExtensions", new Set(catalogue.piExtensions ?? [])),
+				runtimes: normaliseKind("runtimes", new Set(catalogue.runtimes ?? [])),
+				workflows: normaliseKind("workflows", new Set(catalogue.workflows ?? [])),
 			};
 			const cfgStore = st.target.store as unknown as ProjectConfigStore;
 			cfgStore.setPackActivation(scope as PackOrderScope, packName, normalized);
@@ -7006,6 +7353,25 @@ async function handleApiRoute(
 		const filtered = configs.filter((c: CustomProviderConfig) => c.id !== providerId);
 		preferencesStore.set("customProviders", filtered);
 		json({ ok: true });
+		return;
+	}
+
+	// ── Browser-safe pi-ai boundary ──
+
+	// GET /api/pi-ai/providers — list built-in pi-ai provider ids without exposing the browser to pi-ai's Node-only index
+	if (url.pathname === "/api/pi-ai/providers" && req.method === "GET") {
+		json({ providers: getBuiltInProviderIds() });
+		return;
+	}
+
+	// POST /api/pi-ai/provider-key-test — test a provider key without persisting it
+	if (url.pathname === "/api/pi-ai/provider-key-test" && req.method === "POST") {
+		const body = await readBody(req);
+		const provider = typeof body?.provider === "string" ? body.provider.trim() : "";
+		const modelId = typeof body?.modelId === "string" ? body.modelId.trim() : "";
+		const key = typeof body?.key === "string" ? body.key.trim() : "";
+		const result = await testProviderApiKey(provider, modelId, key);
+		json(result, result.status || (result.ok ? 200 : 502));
 		return;
 	}
 
@@ -7796,7 +8162,7 @@ async function handleApiRoute(
 
 		let selectionOptions: TextSelectionOptions;
 		try {
-			selectionOptions = parseGateInspectSelectionOptions(url.searchParams);
+			selectionOptions = { ...parseGateInspectSelectionOptions(url.searchParams), includeDiagnostics: true };
 			selectText("", selectionOptions);
 		} catch (err) {
 			if (err instanceof TextSelectionError) { json({ error: err.message }, 400); return; }
@@ -8328,17 +8694,24 @@ async function handleApiRoute(
 			});
 		}
 
-		// Fire-and-forget verification — resolve primary branch dynamically so
-		// diff baselines use the repo's actual primary (origin/HEAD), not a stale
-		// hardcoded "master". See docs/goals-workflows-tasks.md — Gate baselines.
+		// Fire-and-forget verification — project `base_ref` is the configured
+		// integration target; when unset, fall back to the repo's detected primary.
+		// `parseBaseRef` normalizes remote refs like `origin/master` to `master`
+		// for workflow variables such as `{{baseBranch}}` and legacy `{{master}}`.
 		const branchContainer = goalBranchContainer(goal);
-		const primary = await detectPrimaryBranch(branchContainer).catch(() => "master");
+		const configuredBase = parseBaseRef(gateSignalCtx.projectConfigStore.get("base_ref") || "");
+		const primary = configuredBase.branch || (await detectPrimaryBranch(branchContainer).catch(() => "master"));
 		verificationHarness.verifyGateSignal(
 			signal, gateDef, branchContainer, goal.branch, primary, allGateStates, goal.spec,
 		).catch(err => console.error("[verification] Gate signal error:", err));
 
 		const verifySteps = (gateDef.verify || []).map((s: any) => ({ name: s.name, type: s.type }));
-		json({ signal: { id: signal.id, gateId, goalId, status: "running", steps: verifySteps } }, 201);
+		const signalResponse = { id: signal.id, gateId, goalId, status: "running", steps: verifySteps };
+		const response: { signal: typeof signalResponse; agentReminder?: string } = { signal: signalResponse };
+		if (verificationHarness.getActiveVerification(signal.id)?.overallStatus === "running") {
+			response.agentReminder = "Gate signal accepted. Verification is running asynchronously. Do not poll with `gate_status` or `gate_inspect`. Go idle now and wait for the server to deliver verification results or further instructions.";
+		}
+		json(response, 201);
 		return;
 	}
 
@@ -9936,11 +10309,17 @@ async function handleApiRoute(
 		const wantWorktree = !!ps.worktreePath;
 		let worktreeOpts: { repoPath: string } | undefined;
 		if (wantWorktree) {
-			try {
-				if (await isGitRepo(projCwd)) {
-					worktreeOpts = { repoPath: await getRepoRoot(projCwd) };
-				}
-			} catch { /* ignore — no worktree */ }
+			const projCtx = projectContextManager.getOrCreate(ps.projectId);
+			const components = projCtx?.projectConfigStore.getComponents() ?? [];
+			const configuredBaseRef = projCtx?.projectConfigStore.get("base_ref") || undefined;
+			const support = await resolveWorktreeSupport(components, proj.rootPath, projCwd, undefined, { configuredBaseRef });
+			if (!support.supported || !support.repoPath) {
+				json({
+					error: "failed to resolve current project repository for fresh continue worktree creation: project does not currently support git worktrees",
+				}, 500);
+				return;
+			}
+			worktreeOpts = { repoPath: support.repoPath };
 		}
 
 		// Pre-compute the cloned `.jsonl` path. We use the project root cwd here;
@@ -9983,12 +10362,21 @@ async function handleApiRoute(
 		}
 
 		const role = ps.role ? roleManager.getRole(ps.role) : undefined;
+		const oldTranscriptCwds = Array.from(new Set([ps.cwd, ps.worktreePath]
+			.filter((v): v is string => typeof v === "string" && v.length > 0)));
 		const createOpts: any = {
 			sessionId: newSessionId,
 			projectId: ps.projectId,
 			sandboxed: !!ps.sandboxed,
 			worktreeOpts,
 			preExistingAgentSessionFile: destJsonl,
+			preExistingAgentSessionOldCwds: oldTranscriptCwds,
+			// Continue must surface fresh worktree/base-ref setup failures synchronously;
+			// the archived source worktree/branch remain provenance only. Non-sandboxed
+			// continues use the normal project worktree-pool claim/fallback path; sandboxed
+			// continues keep bypassing the host-side pool because container worktrees are isolated.
+			awaitWorktreeSetup: !!worktreeOpts,
+			bypassWorktreePool: !!worktreeOpts && !!ps.sandboxed,
 			// We'll set the model explicitly below; skip the auto-selection fire-and-forget.
 			skipAutoModel: !!(ps.modelProvider && ps.modelId),
 		};
@@ -10019,7 +10407,11 @@ async function handleApiRoute(
 				projCwd, undefined, undefined, ps.assistantType, createOpts,
 			);
 		} catch (err) {
-			cleanupFailedContinue(destJsonl, newSessionId, bobbitStateDir());
+			const failedRecord = sessionManager.getPersistedSession(newSessionId);
+			cleanupFailedContinue(failedRecord?.agentSessionFile || destJsonl, newSessionId, bobbitStateDir());
+			if (failedRecord?.agentSessionFile && failedRecord.agentSessionFile !== destJsonl) {
+				cleanupFailedContinue(destJsonl, newSessionId, bobbitStateDir());
+			}
 			jsonError(500, err, { error: `failed to create session: ${err instanceof Error ? err.message : String(err)}` });
 			return;
 		}
@@ -10318,14 +10710,27 @@ async function handleApiRoute(
 				json({ ok: false, code: "INVALID_BODY", message: "args must be an object" }, 400);
 				return;
 			}
-			// Auto-inject parentGoalId for team-lead sessions proposing a goal
+			// Auto-inject parentGoalId for team-lead sessions proposing a goal,
+			// but only when the current goal is actually allowed to spawn a child.
+			// If subgoals are disabled globally or for this parent, an omitted
+			// parentGoalId must remain omitted so accepting the proposal creates a
+			// top-level goal instead of a hidden invalid child proposal.
 			let enrichedArgs = args as Record<string, unknown>;
 			if (proposalType === "goal") {
 				const sess = sessionManager.getSession(sessionId);
 				if (sess?.role === "team-lead" && sess.teamGoalId) {
 					const existingParent = enrichedArgs.parentGoalId;
 					if (!existingParent || (typeof existingParent === "string" && existingParent.trim() === "")) {
-						enrichedArgs = { ...enrichedArgs, parentGoalId: sess.teamGoalId };
+						const parent = getGoalAcrossProjects(sess.teamGoalId);
+						const prefs = readSubgoalNestingPrefs((k) => preferencesStore.get(k));
+						const canSpawnImplicitChild = !!parent && checkCanSpawnChild(
+							parent,
+							prefs,
+							(id) => getGoalAcrossProjects(id),
+						).ok;
+						if (canSpawnImplicitChild) {
+							enrichedArgs = { ...enrichedArgs, parentGoalId: sess.teamGoalId };
+						}
 					}
 				}
 			}
@@ -10353,6 +10758,22 @@ async function handleApiRoute(
 					json(parsed, 400);
 					return;
 				}
+				const proposalLabel = proposalType.charAt(0).toUpperCase() + proposalType.slice(1);
+				await openSidePanelWorkspaceTab({
+					sessionManager,
+					readBody,
+					broadcastToSession: _broadcastToSession,
+					packContributionRegistry,
+				}, sessionId, {
+					id: `proposal:${proposalType}`,
+					kind: "proposal",
+					title: `${proposalLabel} Proposal`,
+					label: proposalLabel,
+					source: { type: "proposal", sessionId, proposalType },
+					updatedAt: Date.now(),
+				}, { focus: true, placeAfterActive: true }).catch((err) => {
+					console.warn(`[proposal/seed] failed to open side-panel workspace tab for ${sessionId}/${proposalType}:`, err);
+				});
 				if (_broadcastToSession) {
 					_broadcastToSession(sessionId, {
 						type: "proposal_update",
@@ -10390,6 +10811,22 @@ async function handleApiRoute(
 					json(result, status);
 					return;
 				}
+				const proposalLabel = proposalType.charAt(0).toUpperCase() + proposalType.slice(1);
+				await openSidePanelWorkspaceTab({
+					sessionManager,
+					readBody,
+					broadcastToSession: _broadcastToSession,
+					packContributionRegistry,
+				}, sessionId, {
+					id: `proposal:${proposalType}`,
+					kind: "proposal",
+					title: `${proposalLabel} Proposal`,
+					label: proposalLabel,
+					source: { type: "proposal", sessionId, proposalType },
+					updatedAt: Date.now(),
+				}, { focus: true, placeAfterActive: true }).catch((err) => {
+					console.warn(`[proposal/restore] failed to open side-panel workspace tab for ${sessionId}/${proposalType}:`, err);
+				});
 				if (_broadcastToSession) {
 					_broadcastToSession(sessionId, {
 						type: "proposal_update",
@@ -10549,6 +10986,20 @@ async function handleApiRoute(
 			json(result, result.success ? 200 : 400);
 		} catch (err) {
 			jsonError(500, err);
+		}
+		return;
+	}
+
+	// POST /api/oauth/logout — clear/revoke a single provider's OAuth credential.
+	// Provider-partitioned: never touches other providers or API-key entries,
+	// and never echoes token material back to the client.
+	if (url.pathname === "/api/oauth/logout" && req.method === "POST") {
+		try {
+			const body = await readBody(req).catch(() => ({}));
+			const result = await oauthLogout(body?.provider);
+			json(result);
+		} catch (err) {
+			jsonError(400, err);
 		}
 		return;
 	}
@@ -13356,11 +13807,11 @@ async function handleApiRoute(
  * null if valid. Pure — caller resolves the workflow list (see seed handler).
  *
  * Rules (see docs/design — Validate goal workflow):
- * - Zero workflows ⇒ no validation (UI supplies a default; empty-state preserved).
- * - Empty/omitted `workflow` is NOT an error (UI dropdown supplies the default).
+ * - Zero workflows ⇒ no validation (nothing available to validate against).
+ * - Empty/omitted `workflow` ⇒ MISSING_WORKFLOW when workflows are available.
  * - An explicit `workflow` not among the configured ids ⇒ UNKNOWN_WORKFLOW.
  * - `options` (comma-separated optional-step names) validated against the chosen
- *   workflow (named, else first) — matched ONLY by the canonical step.name of
+ *   explicit workflow — matched ONLY by the canonical step.name of
  *   `verify` steps with `optional: true`. The runtime (verification-logic.ts) and
  *   the UI both key on step.name, so accepting optionalLabel/label here would be a
  *   false-success path that later fails to enable the step.
@@ -13373,19 +13824,30 @@ function validateGoalProposalWorkflow(
 
 	const wfArg = typeof args.workflow === "string" ? args.workflow.trim() : "";
 	const available = workflows.map(w => ({ id: w.id, name: w.name }));
+	const availableIds = available.map(w => w.id).join(", ");
 
-	// 1. Unknown explicit workflow id.
-	if (wfArg && !workflows.some(w => w.id === wfArg)) {
+	// 1. Workflow id is required when this session has resolvable workflows.
+	if (!wfArg) {
 		return {
 			ok: false,
-			code: "UNKNOWN_WORKFLOW",
-			message: `Unknown workflow "${wfArg}". Available workflows for this project: ${available.map(w => w.id).join(", ")}. Re-call propose_goal with one of these IDs (or omit workflow to use the default).`,
+			code: "MISSING_WORKFLOW",
+			message: `Workflow is required for this project. Re-call propose_goal with one of these workflow IDs: ${availableIds}.`,
 			availableWorkflows: available,
 		};
 	}
 
-	// 2. Validate optional-step names against the chosen workflow (or default = first).
-	const chosen = wfArg ? workflows.find(w => w.id === wfArg)! : workflows[0];
+	// 2. Unknown explicit workflow id.
+	if (!workflows.some(w => w.id === wfArg)) {
+		return {
+			ok: false,
+			code: "UNKNOWN_WORKFLOW",
+			message: `Unknown workflow "${wfArg}". Available workflows for this project: ${availableIds}. Re-call propose_goal with one of these IDs.`,
+			availableWorkflows: available,
+		};
+	}
+
+	// 3. Validate optional-step names against the chosen explicit workflow.
+	const chosen = workflows.find(w => w.id === wfArg)!;
 	const optsArg = typeof args.options === "string" ? args.options : "";
 	const requested = optsArg.split(",").map(s => s.trim()).filter(Boolean);
 	if (requested.length > 0) {

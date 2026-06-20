@@ -1,6 +1,7 @@
 import type { Model } from "@earendil-works/pi-ai";
 import { PROPOSAL_PARSERS } from "./proposal-parsers.js";
 import { bootMark, bootTimingMeta, bootTimingReport } from "./boot-timing.js";
+import { loadSavedBindings } from "./shortcut-registry.js";
 
 /**
  * Placeholder model used as the initial value of `_state.model` before the
@@ -30,6 +31,15 @@ const PLACEHOLDER_DEFAULT_MODEL: Model<"anthropic-messages"> = {
 };
 
 import { isProposalType, type ProposalType } from "./proposal-registry.js";
+
+export type ProposalSource = "tool" | "legacy" | "edit" | "seed" | "rehydrate" | "restore";
+const SERVER_PROPOSAL_SOURCES = new Set<ProposalSource>(["edit", "seed", "rehydrate", "restore"]);
+
+function normalizeServerProposalSource(source: unknown): ProposalSource {
+	return typeof source === "string" && SERVER_PROPOSAL_SOURCES.has(source as ProposalSource)
+		? source as ProposalSource
+		: "edit";
+}
 import { state, renderApp, setProjectsIfChanged } from "./state.js";
 import { closeReviewWorkspaceTabs, selectReviewWorkspaceTab, selectSensiblePanelWorkspaceTab } from "./preview-panel.js";
 import { clearPersistedReviewDocuments, openMarkdownReviewDocument, removePersistedReviewDocument, restorePersistedReviewDocuments } from "./review-sources.js";
@@ -222,7 +232,7 @@ export interface QueuedMessage {
 	images?: Array<{ type: "image"; data: string; mimeType: string }>;
 	attachments?: unknown[];
 	isSteered: boolean;
-	/** True if already dispatched mid-turn via steer RPC (kept in queue for UI) */
+	/** Legacy optional flag from the pre-ledger queue model; current server rows omit it. */
 	dispatched?: boolean;
 	/** True for a client-side outbox row not yet delivered to the server (S2):
 	 *  issued while the WS was reconnecting; flushed on auth_ok. Lets the pill
@@ -475,7 +485,7 @@ export class RemoteAgent {
 	 *  `streaming === true` means input is still arriving; consumers must keep
 	 *  their `*Edited` gating intact and must not commit destructive actions on
 	 *  streaming-mode fires. */
-	onGoalProposal?: (proposal: { title: string; spec: string; cwd?: string; workflow?: string }, streaming: boolean) => void;
+	onGoalProposal?: (proposal: { title: string; spec: string; cwd?: string; workflow?: string; worktreeSetupCommand?: string; worktreeSetupTimeoutMs?: number }, streaming: boolean) => void;
 	/** Callback fired when a role proposal is detected in an assistant message. */
 	onRoleProposal?: (proposal: { name: string; label: string; prompt: string; tools: string; accessory: string }, streaming: boolean) => void;
 	/** Callback fired when a tool proposal is detected in an assistant message. */
@@ -507,12 +517,14 @@ export class RemoteAgent {
 		fields: Record<string, unknown> | null,
 		streaming: boolean,
 		rev?: number,
+		source?: ProposalSource,
 	) => void;
 	private _bufferedProposalEvents: Array<{
 		type: ProposalType;
 		fields: Record<string, unknown> | null;
 		streaming: boolean;
 		rev?: number;
+		source?: ProposalSource;
 	}> = [];
 	get onProposal(): typeof this._onProposal {
 		return this._onProposal;
@@ -523,7 +535,7 @@ export class RemoteAgent {
 			const pending = this._bufferedProposalEvents;
 			this._bufferedProposalEvents = [];
 			for (const ev of pending) {
-				try { fn(ev.type, ev.fields, ev.streaming, ev.rev); }
+				try { fn(ev.type, ev.fields, ev.streaming, ev.rev, ev.source); }
 				catch (err) { console.warn("[remote-agent] buffered onProposal replay threw:", err); }
 			}
 		}
@@ -1931,11 +1943,12 @@ export class RemoteAgent {
 				const pType = (msg as any).proposalType;
 				const fields = (msg as any).fields;
 				const rev = typeof (msg as any).rev === "number" ? (msg as any).rev as number : undefined;
+				const source = normalizeServerProposalSource((msg as any).source);
 				if (isProposalType(pType) && fields && typeof fields === "object") {
 					if (this._onProposal) {
-						this._onProposal(pType, fields as Record<string, unknown>, false, rev);
+						this._onProposal(pType, fields as Record<string, unknown>, false, rev, source);
 					} else {
-						this._bufferedProposalEvents.push({ type: pType, fields: fields as Record<string, unknown>, streaming: false, rev });
+						this._bufferedProposalEvents.push({ type: pType, fields: fields as Record<string, unknown>, streaming: false, rev, source });
 					}
 				}
 				break;
@@ -2104,7 +2117,7 @@ export class RemoteAgent {
 			// which would leave nothing for mergeFields to preserve if onProposal
 			// ran second.
 			if (this.onProposal && isProposalType(proposalType)) {
-				this.onProposal(proposalType, input, streaming);
+				this.onProposal(proposalType, input, streaming, undefined, "tool");
 			}
 			if (callback) callback(input, streaming);
 
@@ -2211,7 +2224,7 @@ export class RemoteAgent {
 
 				console.warn(`[proposal] Detected legacy XML <${parser.tag}> block — this format is deprecated, use propose_* tools instead`);
 				if (this.onProposal && proposalType) {
-					this.onProposal(proposalType, normalized, false);
+					this.onProposal(proposalType, normalized, false, undefined, "legacy");
 				}
 				if (callback) callback(normalized);
 			}
@@ -2241,23 +2254,43 @@ export class RemoteAgent {
 	private _checkReviewToolResult(msg: any, isLive = false): void {
 		if (this._sessionId && state.selectedSessionId !== this._sessionId) return;
 
-		// Extract text content from the message
-		const texts: string[] = [];
-		if (typeof msg.content === "string") texts.push(msg.content);
-		else if (Array.isArray(msg.content)) {
-			for (const block of msg.content) {
-				if (typeof block === "string") texts.push(block);
-				else if (block.type === "text" && typeof block.text === "string") texts.push(block.text);
-				else if (typeof block.content === "string") texts.push(block.content);
+		// Extract review tool-result payloads. Production providers are not fully
+		// consistent here: the review extension usually returns a JSON text block,
+		// but direct/tool-protocol paths can carry the same envelope as a structured
+		// object or nested under a tool_result block. Only inspect result-like
+		// content/output fields; do not treat tool-call input as an opened review.
+		const payloads: any[] = [];
+		const collectReviewPayloads = (value: unknown): void => {
+			if (typeof value === "string") {
+				const trimmed = value.trim();
+				if (!trimmed.startsWith('{"action":"review_')) return;
+				try { payloads.push(JSON.parse(trimmed)); } catch { /* ignore non-JSON text */ }
+				return;
 			}
-		}
+			if (Array.isArray(value)) {
+				for (const item of value) collectReviewPayloads(item);
+				return;
+			}
+			if (!value || typeof value !== "object") return;
+			const block = value as Record<string, unknown>;
+			if (typeof block.action === "string" && block.action.startsWith("review_")) {
+				payloads.push(block);
+				return;
+			}
+			if (block.type === "text") collectReviewPayloads(block.text);
+			else if (block.type === "tool_result" || block.type === "toolResult" || block.role === "toolResult") {
+				collectReviewPayloads(block.content);
+				collectReviewPayloads(block.output);
+				collectReviewPayloads(block.result);
+			} else if (typeof block.content === "string") {
+				collectReviewPayloads(block.content);
+			}
+		};
+		collectReviewPayloads(msg.content);
+		collectReviewPayloads((msg as any).output);
+		collectReviewPayloads((msg as any).result);
 
-		for (const text of texts) {
-			const trimmed = text.trim();
-			if (!trimmed.startsWith('{"action":"review_')) continue;
-			let data: any;
-			try { data = JSON.parse(trimmed); } catch { continue; }
-
+		for (const data of payloads) {
 			if (data.action === "review_open" && data.title && data.markdown) {
 				if (this._sessionId) {
 					const title = String(data.title);
@@ -2267,7 +2300,7 @@ export class RemoteAgent {
 						const tabTitle = typeof source?.title === "string" ? source.title : tab.title.replace(/^Review:\s*/, "");
 						return tabTitle === title;
 					});
-					if (!hasOpenWorkspaceTab && (!isLive || isReviewSubmitted(this._sessionId))) return;
+					if (!hasOpenWorkspaceTab && !isLive) return;
 				}
 				// If the user already submitted this review, suppress reopening it on
 				// REPLAY paths (snapshot loop / non-live message_end). The submitted
@@ -2377,7 +2410,7 @@ export class RemoteAgent {
 
 		// Apply shortcuts
 		if ("shortcuts" in prefs) {
-			import("./shortcut-registry.js").then((m) => m.loadSavedBindings());
+			void loadSavedBindings();
 		}
 
 	}
@@ -2589,8 +2622,12 @@ export class RemoteAgent {
 
 						// Mark this id as the streaming-preview message so the render
 						// layer can hide it from message-list while the streaming
-						// container still owns it. When there are no tool calls the
-						// streaming container will be cleared by AgentInterface.
+						// container owns it. Some tool-only turns (notably parked
+						// `bash_bg wait`) arrive as `message_end` without a prior
+						// `message_update`; in that case this final message is the first
+						// thing the streaming container can render. When there are no
+						// tool calls the streaming container will be cleared by
+						// AgentInterface.
 						if (hasToolCalls) {
 							const sid = computeStreamingMessageId(msg);
 							this.streamingMessageId = sid;
@@ -2602,6 +2639,7 @@ export class RemoteAgent {
 							if (sid && (typeof msg.id !== "string" || msg.id.length === 0)) {
 								msg = { ...msg, id: sid };
 							}
+							this._state.streamingMessage = msg;
 						} else {
 							this._state.streamingMessage = null;
 							this.streamingMessageId = undefined;
@@ -2829,6 +2867,16 @@ export class RemoteAgent {
 				const displaySuccess = trigger === "overflow" ? true : success;
 				const nowMs = Date.now();
 				const startedAtMs = this._compactionStartedAt;
+				// The server stamps a `compactionId` on the (successful) end event,
+				// shared with the sidecar entry it just wrote. Carrying it on the
+				// live `compact_active` card lets MessageList mount the
+				// <bobbit-pre-compaction-history> affordance in-session — no reload
+				// needed. The reducer dedups the server's spliced sidecar synthetic
+				// against this card by matching compactionId (live card wins).
+				const compactionId: string | undefined =
+					typeof (event as any).compactionId === "string" && (event as any).compactionId.length > 0
+						? (event as any).compactionId
+						: undefined;
 				const payload: CompactionSummaryPayload = {
 					schemaVersion: 1,
 					trigger,
@@ -2841,6 +2889,7 @@ export class RemoteAgent {
 					tokensAfter: null,
 					reductionPct: null,
 					error: displaySuccess ? undefined : (errMsg || undefined),
+					compactionId,
 				};
 				this._compactionStartedAt = null;
 				// On hard compaction failure clear the stale flag immediately — no
@@ -2857,6 +2906,14 @@ export class RemoteAgent {
 					// Queue this card for tokens-after amendment on the next clean
 					// assistant `message_end` carrying usage.
 					this._pendingCompactionAmend = payload;
+					// When the min-visible-duration floor defers this transition into a
+					// setTimeout, no agent event follows to drive a re-render (the
+					// `compaction_end` emit below already fired synchronously, before
+					// this runs). Emit a generic `render` so AgentInterface repaints the
+					// card from in-progress → complete and reconciles the deduped
+					// single-card state. Without this the in-flight card stays visible
+					// alongside the persisted snapshot card.
+					this.emit({ type: "render" } as any);
 				};
 				if (elapsedSinceStart < COMPACT_CARD_MIN_DURATION) {
 					setTimeout(transitionCard, COMPACT_CARD_MIN_DURATION - elapsedSinceStart);

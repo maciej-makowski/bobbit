@@ -65,7 +65,6 @@ import { cwdCombobox } from "./cwd-combobox.js";
 import { ACCESSORY_IDS, getAccessory, statusBobbit } from "./session-colors.js";
 import { reloadStaffList } from "./sidebar.js";
 import {
-	assistantProposalType,
 	isHistoricalProposalTab,
 	proposalPanelTabId,
 	proposalRevisionFromPanelTab,
@@ -395,9 +394,13 @@ function clearProposalReviewState(sessionId: string | null | undefined, type: Pr
 	}
 }
 
-function closeCurrentProposalPanel(type: ProposalType, sessionId: string | null | undefined): void {
+async function closeCurrentProposalPanel(type: ProposalType, sessionId: string | null | undefined): Promise<void> {
 	if (!sessionId) return;
-	void closeSidePanelTab(proposalPanelTabId(type), { sessionId });
+	try {
+		await closeSidePanelTab(proposalPanelTabId(type), { sessionId });
+	} catch (err) {
+		console.warn("[proposal] failed to close workspace tab", { type, sessionId, err });
+	}
 }
 
 function dismissTypedProposal(type: ProposalType): void {
@@ -413,8 +416,7 @@ function dismissTypedProposal(type: ProposalType): void {
 	if (sessionId && slot?.fields) markProposalDismissed(sessionId, type, slot.fields);
 	delete state.activeProposals[type];
 	recomputeAssistantHasProposal();
-	const keepAssistantPanelOpen = type === assistantProposalType(state.assistantType);
-	if (!keepAssistantPanelOpen) closeCurrentProposalPanel(type, sessionId);
+	void closeCurrentProposalPanel(type, sessionId);
 	if (sessionId) void deleteProposalFile(sessionId, type);
 	renderApp();
 }
@@ -466,6 +468,15 @@ interface GoalFormConfig {
 	onOptionalStepsChange: (steps: string[]) => void;
 	autoStartTeam: boolean;
 	onAutoStartTeamChange: (e: Event) => void;
+
+	// ---- Per-goal worktree setup hook ----
+	/** Current value of the optional per-goal worktree setup command. */
+	worktreeSetupCommand: string;
+	/** Current value of the optional per-goal setup timeout (ms), as a raw
+	 *  string for input round-tripping. Empty = use the default. */
+	worktreeSetupTimeoutMs: string;
+	onWorktreeSetupCommandChange: (e: Event) => void;
+	onWorktreeSetupTimeoutChange: (e: Event) => void;
 
 	// CWD combobox state
 	cwdDropdownOpen: boolean;
@@ -559,6 +570,19 @@ interface GoalFormConfig {
 	roleListLoading?: boolean;
 	availableTools?: ToolInfo[];
 	groupPolicies?: Record<string, string>;
+}
+
+/**
+ * Parse the per-goal worktree-setup timeout input (a raw string) into a number
+ * suitable for createGoal. Returns undefined for blank/invalid values so the
+ * goal falls back to the project default / 120s. Only finite positive integers
+ * are forwarded.
+ */
+function parseSetupTimeoutMs(raw: string): number | undefined {
+	const t = raw.trim();
+	if (t === "") return undefined;
+	const n = Number(t);
+	return Number.isInteger(n) && n > 0 ? n : undefined;
 }
 
 /** Compute a goal's depth (1-based) by walking parentGoalId links. */
@@ -706,9 +730,9 @@ function renderSubgoalsToggle(config: GoalFormConfig): TemplateResult | string {
 	`;
 }
 
-/** Whether the dedicated Sub-goals tab should be shown for this proposal. */
+/** Whether the dedicated Sub-goals tab should be shown: it tracks only the system Subgoals (Experimental) preference. */
 function showSubgoalsTab(config: GoalFormConfig): boolean {
-	return !!(config.subgoalsEnabled || config.parentGoalId);
+	return !!config.subgoalsEnabled;
 }
 
 /** Walk parentGoalId links up to the top-level (root) goal of the tree. */
@@ -899,7 +923,7 @@ function renderGoalForm(config: GoalFormConfig) {
 					</div>
 				` : ""}
 			</div>
-			${!tabbed && (config.subgoalsEnabled || config.parentGoalId) ? renderParentPickerRow(config, lblCls) : ""}
+			${!tabbed && config.subgoalsEnabled ? renderParentPickerRow(config, lblCls) : ""}
 			${!tabbed ? renderSubgoalBreadcrumb(config) : ""}
 			${linkedProject ? html`
 				<div class="flex items-center gap-2 text-[11px] text-muted-foreground min-w-0">
@@ -980,6 +1004,31 @@ function renderGoalForm(config: GoalFormConfig) {
 					</label>
 				`;})}
 				${!tabbed ? renderSubgoalsToggle(config) : ""}
+			</div>
+			<div class="flex flex-col gap-1.5" data-testid="goal-form-worktree-setup">
+				<div class="flex items-center gap-1.5">
+					<label class="text-xs text-muted-foreground font-medium">Setup command</label>
+					<span title="Runs once on the HOST during worktree provisioning, after component setup — same trust model as the project worktree setup command. cwd is the goal worktree; env includes SOURCE_REPO, BOBBIT_GOAL_ID, BOBBIT_GOAL_BRANCH, BOBBIT_WORKTREE_PATH. Optional."
+						class="text-[9px] text-muted-foreground cursor-help">ⓘ</span>
+				</div>
+				<textarea
+					data-testid="goal-form-worktree-setup-command"
+					class="min-h-[44px] p-2 text-xs font-mono rounded-md border border-border bg-background text-foreground resize-y focus:outline-none focus:ring-1 focus:ring-ring"
+					placeholder="Optional host command, e.g. ./scripts/seed.sh"
+					.value=${config.worktreeSetupCommand}
+					@input=${config.onWorktreeSetupCommandChange}
+				></textarea>
+				<p class="text-[10px] text-muted-foreground opacity-70">Runs on the host during provisioning — trusted, same as project worktree setup.</p>
+				<div class="flex items-center gap-2">
+					<label class="text-xs text-muted-foreground font-medium">Timeout (ms)</label>
+					<input type="number" min="1" step="1"
+						data-testid="goal-form-worktree-setup-timeout-ms"
+						class="w-28 text-xs px-2 py-1 rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-1 focus:ring-ring [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+						placeholder="default"
+						.value=${config.worktreeSetupTimeoutMs}
+						@input=${config.onWorktreeSetupTimeoutChange}
+					/>
+				</div>
 			</div>
 			<div class="flex-1 flex flex-col min-h-0">
 				<div class="flex items-center justify-between mb-1.5">
@@ -1400,6 +1449,8 @@ function goalPreviewPanel() {
 				projectId,
 				enabledOptionalSteps,
 				autoStartTeam,
+				worktreeSetupCommand: state.previewWorktreeSetupCommand.trim() || undefined,
+				worktreeSetupTimeoutMs: parseSetupTimeoutMs(state.previewWorktreeSetupTimeoutMs),
 			});
 		} catch (err) {
 			const { message, code, stack } = errorDetails(err);
@@ -1412,6 +1463,8 @@ function goalPreviewPanel() {
 			return;
 		}
 
+		const closeProposalTab = closeCurrentProposalPanel("goal", sessionId);
+
 		// --- Success path: now tear down the assistant. ---
 		if (state.remoteAgent) {
 			state.remoteAgent.disconnect();
@@ -1422,18 +1475,23 @@ function goalPreviewPanel() {
 		if (sessionId) clearProposalAnnotations(sessionId, "goal");
 		resetProposalAnnCount("goal");
 		delete state.activeProposals.goal;
+		recomputeAssistantHasProposal();
 		state.previewProjectId = "";
 		_selectedWorkflowId = "";
 		_goalSandboxed = false;
 		_goalAutoStartTeam = true;
 		_assistantEnabledOptionalSteps = [];
+		state.previewWorktreeSetupCommand = "";
+		state.previewWorktreeSetupTimeoutMs = "";
 		if (sessionId) {
 			deleteGoalDraft(sessionId);
 		}
 		localStorage.removeItem("gateway.sessionId");
 		state.appView = "authenticated";
 
-		// Slice E: drop the on-disk proposal file once accepted.
+		// Slice E: close the workspace tab before deleting/navigating the source
+		// assistant session, then drop the on-disk proposal file once accepted.
+		await closeProposalTab;
 		if (sessionId) void deleteProposalFile(sessionId, "goal");
 
 		// If this is a re-attempt, archive the old goal and link the new one
@@ -1520,6 +1578,18 @@ function goalPreviewPanel() {
 				onOptionalStepsChange: (steps) => { _assistantEnabledOptionalSteps = steps; renderApp(); },
 				autoStartTeam: _goalAutoStartTeam,
 				onAutoStartTeamChange: (e: Event) => { _goalAutoStartTeam = (e.target as HTMLInputElement).checked; renderApp(); },
+				worktreeSetupCommand: state.previewWorktreeSetupCommand,
+				worktreeSetupTimeoutMs: state.previewWorktreeSetupTimeoutMs,
+				onWorktreeSetupCommandChange: (e: Event) => {
+					state.previewWorktreeSetupCommand = (e.target as HTMLTextAreaElement).value;
+					const sid = activeSessionId();
+					if (sid) saveGoalDraft(sid);
+				},
+				onWorktreeSetupTimeoutChange: (e: Event) => {
+					state.previewWorktreeSetupTimeoutMs = (e.target as HTMLInputElement).value;
+					const sid = activeSessionId();
+					if (sid) saveGoalDraft(sid);
+				},
 				cwdDropdownOpen: state.cwdDropdownOpen,
 				cwdHighlightIndex: state.cwdHighlightIndex,
 				onCwdToggle: (open) => { state.cwdDropdownOpen = open; renderApp(); },
@@ -1585,7 +1655,7 @@ function rolePreviewPanel() {
 		clearProposalReviewState(proposalSessionId, "role");
 		delete state.activeProposals.role;
 		recomputeAssistantHasProposal();
-		closeCurrentProposalPanel("role", proposalSessionId);
+		void closeCurrentProposalPanel("role", proposalSessionId);
 		if (proposalSessionId) {
 			deleteRoleDraft(proposalSessionId);
 			void deleteProposalFile(proposalSessionId, "role");
@@ -2054,7 +2124,7 @@ function staffPreviewPanel() {
 			clearProposalReviewState(proposalSessionId, "staff");
 			delete state.activeProposals.staff;
 			recomputeAssistantHasProposal();
-			closeCurrentProposalPanel("staff", proposalSessionId);
+			void closeCurrentProposalPanel("staff", proposalSessionId);
 			if (proposalSessionId) void deleteProposalFile(proposalSessionId, "staff");
 
 			if (isStaffAssistant) {
@@ -2601,6 +2671,10 @@ let _proposalSaving = false;
 let _proposalSandboxed = false;
 let _proposalAutoStartTeam = true;
 let _proposalEnabledOptionalSteps: string[] = [];
+// Per-goal worktree setup hook. Initialized from proposal frontmatter in
+// syncProposalFormState; stored as raw strings for input round-tripping.
+let _proposalWorktreeSetupCommand = "";
+let _proposalWorktreeSetupTimeoutMs = "";
 let _proposalInitializedFrom: string | null = null;
 // Per-goal subgoal controls. null means "inherit system preference" — only
 // forwarded to createGoal when the user actually touched the control.
@@ -2791,6 +2865,7 @@ function syncProposalFormState(): void {
 		parentGoalId?: string; inlineWorkflow?: Workflow; inlineRoles?: Record<string, RoleData>;
 		subgoalsAllowed?: boolean; maxNestingDepth?: number;
 		divergencePolicy?: "strict" | "balanced" | "autonomous"; maxConcurrentChildren?: number;
+		worktreeSetupCommand?: string; worktreeSetupTimeoutMs?: number;
 	};
 	if (!proposal) return;
 
@@ -2821,7 +2896,7 @@ function syncProposalFormState(): void {
 	}
 
 	// Use a simple identity check to avoid re-initializing on every render
-	const key = `${proposal.title}|${proposal.spec}|${proposal.cwd || ""}|${proposal.workflow || ""}|${proposal.options || ""}|${proposal.parentGoalId || ""}|${proposal.subgoalsAllowed ?? ""}|${proposal.maxNestingDepth ?? ""}|${proposal.divergencePolicy ?? ""}|${proposal.maxConcurrentChildren ?? ""}`;
+	const key = `${proposal.title}|${proposal.spec}|${proposal.cwd || ""}|${proposal.workflow || ""}|${proposal.options || ""}|${proposal.parentGoalId || ""}|${proposal.subgoalsAllowed ?? ""}|${proposal.maxNestingDepth ?? ""}|${proposal.divergencePolicy ?? ""}|${proposal.maxConcurrentChildren ?? ""}|${proposal.worktreeSetupCommand ?? ""}|${proposal.worktreeSetupTimeoutMs ?? ""}`;
 	if (_proposalInitializedFrom === key) return;
 	_proposalInitializedFrom = key;
 	_proposalTitle = proposal.title;
@@ -2852,6 +2927,10 @@ function syncProposalFormState(): void {
 		? proposal.divergencePolicy
 		: null;
 	_proposalMaxConcurrentChildren = typeof proposal.maxConcurrentChildren === "number" ? proposal.maxConcurrentChildren : null;
+	// Per-goal worktree setup hook: seed the dialog controls from frontmatter so
+	// a propose_goal-seeded proposal pre-fills the inputs. Absent => empty.
+	_proposalWorktreeSetupCommand = typeof proposal.worktreeSetupCommand === "string" ? proposal.worktreeSetupCommand : "";
+	_proposalWorktreeSetupTimeoutMs = typeof proposal.worktreeSetupTimeoutMs === "number" ? String(proposal.worktreeSetupTimeoutMs) : "";
 }
 
 function goalProposalPanel() {
@@ -2926,10 +3005,15 @@ function goalProposalPanel() {
 				const maxNestingDepthField = subgoalsEnabled && _proposalMaxNestingDepth !== null
 					? _proposalMaxNestingDepth
 					: undefined;
+				// Parent goal is meaningful only while the system Subgoals feature is
+				// enabled. A stale/auto-filled parentGoalId from a team-lead proposal
+				// must not be submitted while the Sub-goals tab is hidden/off; accepting
+				// that proposal should create a top-level goal.
+				const parentGoalIdField = subgoalsEnabled ? (_proposalParentGoalId || undefined) : undefined;
 				// Root-only orchestration. Only forwarded for a top-level goal
 				// (no parent) that allows subgoals, and only when the user
 				// actually picked a value (null = inherit server default).
-				const isRootProposal = !_proposalParentGoalId;
+				const isRootProposal = !parentGoalIdField;
 				const allowsChildren = subgoalsEnabled && (_proposalSubgoalsAllowed ?? false);
 				const divergencePolicyField = isRootProposal && allowsChildren && _proposalDivergencePolicy !== null
 					? _proposalDivergencePolicy
@@ -2957,11 +3041,13 @@ function goalProposalPanel() {
 					projectId,
 					enabledOptionalSteps,
 					autoStartTeam,
-					parentGoalId: _proposalParentGoalId || undefined,
+					parentGoalId: parentGoalIdField,
 					subgoalsAllowed: subgoalsAllowedField,
 					maxNestingDepth: maxNestingDepthField,
 					divergencePolicy: divergencePolicyField,
 					maxConcurrentChildren: maxConcurrentChildrenField,
+					worktreeSetupCommand: _proposalWorktreeSetupCommand.trim() || undefined,
+					worktreeSetupTimeoutMs: parseSetupTimeoutMs(_proposalWorktreeSetupTimeoutMs),
 				});
 			} catch (err) {
 				const { message, code, stack } = errorDetails(err);
@@ -2970,8 +3056,13 @@ function goalProposalPanel() {
 			}
 			if (!goal) return;
 
+			const proposalSessionId = state.activeProposals.goal?.sessionId ?? activeSessionId();
+
 			// --- Success: clear the proposal and navigate. ---
+			if (proposalSessionId) clearProposalAnnotations(proposalSessionId, "goal");
+			resetProposalAnnCount("goal");
 			delete state.activeProposals.goal;
+			recomputeAssistantHasProposal();
 			_proposalEnabledOptionalSteps = [];
 			_proposalInitializedFrom = null;
 			_proposalSandboxed = false;
@@ -2981,7 +3072,11 @@ function goalProposalPanel() {
 			_proposalMaxNestingDepth = null;
 			_proposalDivergencePolicy = null;
 			_proposalMaxConcurrentChildren = null;
+			_proposalWorktreeSetupCommand = "";
+			_proposalWorktreeSetupTimeoutMs = "";
 			resetProposalTabsState();
+			await closeCurrentProposalPanel("goal", proposalSessionId);
+			if (proposalSessionId) void deleteProposalFile(proposalSessionId, "goal");
 			setHashRoute("goal-dashboard", goal.id, true);
 		} finally {
 			_proposalSaving = false;
@@ -2997,13 +3092,14 @@ function goalProposalPanel() {
 	};
 
 	const handleDismiss = () => {
+		const proposalSessionId = state.activeProposals.goal?.sessionId ?? activeSessionId();
 		const dismissed = state.activeProposals.goal?.fields as undefined | { title: string; spec: string; cwd?: string; workflow?: string; options?: string };
 		// Suppress the in-flight streaming block so later deltas don't re-open
 		// the just-dismissed goal proposal (see dismissStreamingProposal).
 		if (isProposalStreaming("goal_proposal")) {
 			state.remoteAgent?.dismissStreamingProposal("goal_proposal");
 		}
-		const sidEarly = activeSessionId();
+		const sidEarly = proposalSessionId;
 		if (sidEarly) clearProposalAnnotations(sidEarly, "goal");
 		resetProposalAnnCount("goal");
 		delete state.activeProposals.goal;
@@ -3015,14 +3111,17 @@ function goalProposalPanel() {
 		_proposalMaxNestingDepth = null;
 		_proposalDivergencePolicy = null;
 		_proposalMaxConcurrentChildren = null;
+		_proposalWorktreeSetupCommand = "";
+		_proposalWorktreeSetupTimeoutMs = "";
 		resetProposalTabsState();
 		// Persist dismiss so it survives reconnect
-		const sid = activeSessionId();
+		const sid = proposalSessionId;
 		if (sid && dismissed) {
 			markProposalDismissed(sid, dismissed);
 			void deleteProposalFile(sid, "goal");
 		}
 		recomputeAssistantHasProposal();
+		void closeCurrentProposalPanel("goal", sid);
 		// If preview tab still available, switch to it; otherwise back to chat
 		if (state.isPreviewSession) {
 			state.previewPanelActiveTab = "preview";
@@ -3064,6 +3163,10 @@ function goalProposalPanel() {
 		onOptionalStepsChange: (steps) => { _proposalEnabledOptionalSteps = steps; renderApp(); },
 		autoStartTeam: _proposalAutoStartTeam,
 		onAutoStartTeamChange: (e: Event) => { _proposalAutoStartTeam = (e.target as HTMLInputElement).checked; renderApp(); },
+		worktreeSetupCommand: _proposalWorktreeSetupCommand,
+		worktreeSetupTimeoutMs: _proposalWorktreeSetupTimeoutMs,
+		onWorktreeSetupCommandChange: (e: Event) => { _proposalWorktreeSetupCommand = (e.target as HTMLTextAreaElement).value; },
+		onWorktreeSetupTimeoutChange: (e: Event) => { _proposalWorktreeSetupTimeoutMs = (e.target as HTMLInputElement).value; },
 		cwdDropdownOpen: _proposalCwdDropdownOpen,
 		cwdHighlightIndex: _proposalCwdHighlightIndex,
 		onCwdToggle: (open) => { _proposalCwdDropdownOpen = open; renderApp(); },
@@ -3074,7 +3177,7 @@ function goalProposalPanel() {
 		createDisabled: (() => {
 			if (!_proposalTitle.trim() || _proposalSaving) return true;
 			// Disable Create when a parent is selected but the child would exceed cap.
-			if (_proposalParentGoalId && maxNestingDepth !== undefined) {
+			if (subgoalsEnabled && _proposalParentGoalId && maxNestingDepth !== undefined) {
 				const pDepth = computeGoalDepth(_proposalParentGoalId, state.goals);
 				if (pDepth + 1 > maxNestingDepth) return true;
 			}

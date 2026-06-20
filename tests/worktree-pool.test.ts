@@ -14,12 +14,12 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { WorktreePool, isPoolBranch } from "../src/server/agent/worktree-pool.ts";
 import type { Component } from "../src/server/agent/project-config-store.ts";
+import { makeTmpDir } from "./helpers/tmp.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,7 +27,7 @@ const __dirname = path.dirname(__filename);
 const execFile = promisify(execFileCb);
 
 async function makeRepo(): Promise<string> {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobbit-pool-test-"));
+	const dir = makeTmpDir("bobbit-pool-test-");
 	const repo = path.join(dir, "repo");
 	fs.mkdirSync(repo, { recursive: true });
 	await execFile("git", ["init", "--initial-branch=master"], { cwd: repo });
@@ -88,6 +88,21 @@ describe("WorktreePool — Phase 3 claim sequence", () => {
 				.find(l => l.startsWith("pool/_pool-"));
 			assert.ok(originalPoolBranch, "should have captured the original pool branch before claim");
 
+
+			// Capture the pooled branch name BEFORE claim. claim() kicks off a
+			// background refill (replenish() → _fill() back up to targetSize), which
+			// legitimately creates a NEW `pool/_pool-*` branch. So asserting the
+			// global absence of the `pool/_pool-` prefix after claim is racy (the
+			// refill can land before the assertion under load). Instead assert that
+			// THIS pooled branch was renamed away — claim's actual contract.
+			const listBranches = async (): Promise<string[]> => {
+				const { stdout } = await execFile("git", ["branch", "--list"], { cwd: repo });
+				return stdout.split("\n").map((s) => s.replace(/^[*+]?\s*/, "").trim()).filter(Boolean);
+			};
+			const pooledBranch = (await listBranches()).find((b) => b.startsWith("pool/_pool-"));
+			assert.ok(pooledBranch, "a pool branch should exist before claim");
+
+
 			const claim = await pool.claim("session/abcd1234");
 			assert.ok(claim, "claim should succeed");
 			assert.equal(claim!.branchName, "session/abcd1234");
@@ -100,6 +115,13 @@ describe("WorktreePool — Phase 3 claim sequence", () => {
 			const { stdout: branchList } = await execFile("git", ["branch", "--list"], { cwd: repo });
 			assert.ok(branchList.includes("session/abcd1234"), "target branch should exist");
 			assert.ok(!branchList.includes(originalPoolBranch!), `claimed pool branch ${originalPoolBranch} should be renamed away`);
+
+
+			// Verify the pooled branch was renamed to the session branch.
+			const after = await listBranches();
+			assert.ok(after.includes("session/abcd1234"), "target branch should exist");
+			assert.ok(!after.includes(pooledBranch!), "the claimed pool branch should be renamed away");
+
 
 			// Verify the directory was moved (path basename is the flattened slug).
 			assert.equal(path.basename(claim!.worktreePath), "session-abcd1234");
@@ -180,6 +202,33 @@ describe("WorktreePool — Phase 3 claim sequence", () => {
 			await rmRepo(repo);
 		}
 	});
+
+	it("freshen skips missing origin in no-remote test mode without logging a reset failure", async () => {
+		const repo = await makeRepo();
+		const originalNoRemote = process.env.BOBBIT_TEST_NO_REMOTE;
+		const originalNoExternal = process.env.BOBBIT_TEST_NO_EXTERNAL;
+		const originalWarn = console.warn;
+		const warnings: string[] = [];
+		process.env.BOBBIT_TEST_NO_REMOTE = "1";
+		process.env.BOBBIT_TEST_NO_EXTERNAL = "1";
+		console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+		try {
+			const pool = new WorktreePool({ repoPath: repo, targetSize: 0 });
+			await (pool as any).freshen(repo, "session/no-remote");
+		} finally {
+			console.warn = originalWarn;
+			if (originalNoRemote === undefined) delete process.env.BOBBIT_TEST_NO_REMOTE;
+			else process.env.BOBBIT_TEST_NO_REMOTE = originalNoRemote;
+			if (originalNoExternal === undefined) delete process.env.BOBBIT_TEST_NO_EXTERNAL;
+			else process.env.BOBBIT_TEST_NO_EXTERNAL = originalNoExternal;
+			await rmRepo(repo);
+		}
+		assert.equal(
+			warnings.some(w => w.includes("[worktree-pool] Background reset failed") || w.includes("git fetch origin")),
+			false,
+			`freshen should not attempt origin in no-remote test mode; warnings: ${warnings.join("\n")}`,
+		);
+	});
 });
 
 describe("WorktreePool — components[*].worktreeSetupCommand is the source of truth", () => {
@@ -221,6 +270,39 @@ describe("WorktreePool — components[*].worktreeSetupCommand is the source of t
 			assert.ok(
 				fs.existsSync(marker),
 				`SETUP_RAN marker missing from pool worktree at ${marker} — setup hook did not run`,
+			);
+		} finally {
+			await rmRepo(repo);
+		}
+	});
+
+	it("threads the project worktree_setup_timeout_ms into pool component setup", async () => {
+		const repo = await makeRepo();
+		try {
+			const components: Component[] = [
+				{ name: "app", repo: ".", worktreeSetupCommand: "sleep 5; touch SETUP_RAN" },
+			];
+			const pool = new WorktreePool({
+				repoPath: repo,
+				targetSize: 1,
+				componentsResolver: () => components,
+				// Tiny project default — the setup command sleeps far longer, so the
+				// resolved timeout must kill it before it can create the marker. Without
+				// threading (hardcoded 120000) the sleep would finish and the marker
+				// would appear. Mirrors the per-goal timeout-resolution path.
+				setupTimeoutResolver: () => 50,
+			});
+			pool.startFilling();
+			for (let i = 0; i < 100 && pool.size === 0; i++) {
+				await new Promise(r => setTimeout(r, 100));
+			}
+			assert.equal(pool.size, 1, "pool should still publish the entry (setup failure is non-fatal)");
+			const u = await pool.claim("session/abcd1234");
+			assert.ok(u);
+			assert.equal(
+				fs.existsSync(path.join(u!.worktreePath, "SETUP_RAN")),
+				false,
+				"component setup must be killed by the resolved project timeout before touching the marker",
 			);
 		} finally {
 			await rmRepo(repo);
