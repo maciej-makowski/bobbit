@@ -10,7 +10,7 @@ import type { ProjectContextManager } from "./project-context-manager.js";
 import type { InboxManager } from "./inbox-manager.js";
 import { SYSTEM_PROJECT_ID } from "./project-registry.js";
 import type { Component } from "./project-config-store.js";
-import { createWorktree, createWorktreeSet, cleanupWorktree, resolveBaseRef } from "../skills/git.js";
+import { createWorktree, createWorktreeSet, cleanupWorktree, resolveBaseRef, shouldSkipRemoteGitForTests } from "../skills/git.js";
 import { runComponentSetups } from "../skills/worktree-setup.js";
 import { execShellCommand } from "./shell-util.js";
 import { shouldCreateWorktree } from "./worktree-decision.js";
@@ -202,7 +202,8 @@ export class StaffManager {
 		// sub-repos) resolves `supported:true`, `repoPath = projectRoot`,
 		// `multiRepo:true` — identical to a regular session. A project with no
 		// worktree-able git repo resolves `supported:false` (graceful no-worktree).
-		const support = await resolveWorktreeSupport(components, ctx.project.rootPath, cwd);
+		const configuredBaseRef = ctx.projectConfigStore.get("base_ref") || undefined;
+		const support = await resolveWorktreeSupport(components, ctx.project.rootPath, cwd, undefined, { configuredBaseRef });
 		return { ...support, components };
 	}
 
@@ -570,6 +571,7 @@ export class StaffManager {
 		for (const entry of entries) {
 			const wt = entry.worktreePath;
 			try {
+				if (await shouldSkipRemoteGitForTests(wt)) continue;
 				await execFile("git", ["fetch", "origin"], { cwd: wt, timeout: 60_000 });
 			} catch (err) {
 				console.warn(`[staff-manager] git fetch failed in ${wt} (non-fatal):`, err);

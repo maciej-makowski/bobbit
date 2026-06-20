@@ -14,25 +14,28 @@ Replace the standalone `qa-testing` gate with a phased verification step on the 
 
 ### 1. Phased verification
 
-**Current state:** All verification steps on a gate run in parallel via `Promise.all()`.
+**Current state:** Verification steps can be grouped into ordered phases.
 
-**Change:** Add an optional `phase` field (integer, default 0) to `VerifyStep`. Steps within the same phase run in parallel. Phases run sequentially in ascending order. If any step in a phase fails, subsequent phases are skipped and the gate fails immediately.
+**Change:** Add an optional `phase` field (integer, default 0) to `VerifyStep`. Phases run sequentially in ascending order. Same-phase steps run concurrently by default, including command steps. If any step in a phase fails, subsequent phases are skipped and the gate fails immediately; explicit ordering belongs in later phases.
 
 ```yaml
 verify:
   - name: "Type check"
     type: command
-    run: "{{project.typecheck_command}}"
+    component: app
+    command: check
     # phase: 0 (implicit default)
 
   - name: "Unit tests"
     type: command
-    run: "{{project.test_unit_command}}"
+    component: app
+    command: unit
     # phase: 0
 
   - name: "E2E tests"
     type: command
-    run: "{{project.test_e2e_command}}"
+    component: app
+    command: e2e
     # phase: 0
 
   - name: "Code quality review"
@@ -52,7 +55,7 @@ verify:
 
 Phase 0 (type-check, tests) runs first. If any fail, the gate fails immediately — phases 1 and 2 never start. Phase 1 (code reviews) runs next. Phase 2 (QA) runs only after everything else passes.
 
-**Implementation:** In `VerificationHarness.verifyGateSignal()`, group steps by phase, sort phases ascending, and iterate with early-exit on failure. Within each phase, existing parallel execution is preserved.
+**Implementation:** In `VerificationHarness.verifyGateSignal()`, group steps by phase, sort phases ascending, and iterate with early-exit on failure. Within each phase, steps run concurrently by default, including command steps; explicit ordering belongs in later phases.
 
 ### 2. Verification step artifacts
 
@@ -241,18 +244,21 @@ The `qa-testing` gate is removed. QA testing becomes a phase-2 verification step
   name: Implementation
   depends_on: [design-doc]
   verify:
-    # Phase 0 — fast automated checks (parallel)
+    # Phase 0 — automated command checks
     - name: "Type check passes"
       type: command
-      run: "{{project.typecheck_command}}"
+      component: app
+      command: check
     - name: "Unit tests"
       type: command
-      run: "{{project.test_unit_command}}"
+      component: app
+      command: unit
     - name: "E2E tests"
       type: command
-      run: "{{project.test_e2e_command}}"
+      component: app
+      command: e2e
 
-    # Phase 1 — code review (parallel, after phase 0 passes)
+    # Phase 1 — code review (parallel review steps, after phase 0 passes)
     - name: "Gap analysis"
       type: llm-review
       phase: 1

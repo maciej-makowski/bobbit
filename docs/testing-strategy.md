@@ -13,7 +13,7 @@ To make that a no-brainer, exactly one rule is enforced: **every test file under
 | **e2e** | all remaining non-LLM integration | `playwright-e2e.config.ts` (union across its `api` / `api-realpush` / `browser` projects) | `e2e:` → `npx playwright test --config playwright-e2e.config.ts` |
 | **manual-integration** *(gate-exempt)* | real LLM / Docker | `playwright-manual.config.ts` | `npm run test:manual` only |
 
-`npm run test:unit` runs the two unit runners **concurrently** via [`scripts/run-unit.mjs`](../scripts/run-unit.mjs), splitting the cores between them (node `--test-concurrency=N/2`, browser `--workers=N/2`) so they run genuinely in parallel without oversubscribing the box — full concurrency starves slow browser fixtures past their 15s timeout.
+`npm run test:unit` runs the two unit runners **concurrently** via [`scripts/run-unit.mjs`](../scripts/run-unit.mjs), splitting the cores between them and capping each runner at 6 workers by default (node `--test-concurrency=min(6,N/2)`, browser `--workers=min(6,N/2)`) so they run genuinely in parallel without oversubscribing or starving file:// browser fixtures. Env overrides are available for intentional local stress runs.
 
 **Convention purity**: `*.test.ts` ⇒ node:test runner; `*.spec.ts` ⇒ Playwright. A `*.test.ts` must never import `@playwright/test`; a `*.spec.ts` must never import `node:test`. This is what keeps the two unit runners cleanly separable.
 
@@ -31,7 +31,7 @@ To make that a no-brainer, exactly one rule is enforced: **every test file under
 |-------|-------|-------|---------|-------------|
 | Unit · node (node:test logic) | ~340 | ~3.4k | long pole of the ~90s unit wall | `--test-concurrency=N/2` |
 | Unit · browser (file:// fixtures) | ~120 | ~1.3k | finishes ~76s within the unit wall | `--workers=N/2` |
-| E2E (in-process API + spawned browser) | ~330 | ~1.3k | ~6.5–7 min (retries add ~0; browser project ~5.2 min standalone) | api 4 / browser 3 workers |
+| E2E (in-process API + spawned browser) | ~330 | ~1.3k | ~6.5–7 min typical, longer under verification/concurrent load | api 2 / browser 3 workers |
 | Manual integration (real agent/LLM + Docker) | ~11 | serial | ~5 min | **None** |
 
 (Counts are order-of-magnitude; the authoritative membership is the phase-invariant guard, not this table.)
@@ -45,6 +45,28 @@ To make that a no-brainer, exactly one rule is enforced: **every test file under
 **Browser E2E** — Full-stack user journeys through Playwright browser → WebSocket → spawned gateway → mock agent. Covers goal creation, project management, settings, team lifecycle, navigation. **This is where the gap is widest.**
 
 **Manual integration** — The gold standard. Real agent, real Docker, real crash recovery. Tests 6 session variations × crash/restart cycle × browser verification. Catches bugs no other layer can reach.
+
+### Browser E2E placement policy
+
+Spawned-gateway browser E2E is the most expensive automated layer. Add it only when the behavior needs real app integration: browser routing, WebSocket/server wiring, persistence across reload, cross-client state, or layout that cannot be represented in deterministic fixtures.
+
+Default new coverage to the cheapest layer that can catch the bug:
+
+1. node unit tests for pure logic and data transforms;
+2. `file://` Playwright fixtures for renderer, panel, geometry, sidebar, and component-state matrices;
+3. API E2E for gateway contracts without a browser;
+4. spawned-gateway browser E2E for one or a few integration journeys.
+
+When reducing browser rows, add replacement fixture/API/unit coverage first, keep a small full-stack smoke, and update the split-suite coverage map in [`docs/testing-metrics/coverage-map.md`](testing-metrics/coverage-map.md). The metrics command reference and baseline rules live in [`docs/testing-metrics/README.md`](testing-metrics/README.md).
+
+### Split-suite metric reporting
+
+Use split-suite metrics to prove browser E2E changes without running expensive tiers repeatedly:
+
+- Use `npm run metrics:e2e:all` for final E2E validation. It runs the full E2E tier once and emits aggregate plus project-split artifacts under `.profiles/metrics/`.
+- Use `metrics:slice:renderer`, `metrics:slice:scroll`, or `metrics:slice:sidebar` for focused feedback before the full run.
+- Use `metrics:coverage` and scoped `metrics:check` when validating coverage non-regression without requiring every current metric file.
+- Compare current `.profiles/metrics/*.json` artifacts against committed `docs/testing-metrics/baseline-*.json` files. Update baselines only after intentional coverage movement is reviewed and documented.
 
 ### The Gap
 
@@ -521,6 +543,21 @@ fast-failing `GIT_EDITOR=false` (never a blocking editor) and asserts the fixtur
 creates the tag promptly without invoking an editor. It is RED against a
 non-hermetic helper and GREEN after the fix, so the trap cannot silently return.
 
+
+### Temp dirs used as project / pack / worktree roots
+
+Use `makeTmpDir(prefix)` from [`tests/helpers/tmp.ts`](../tests/helpers/tmp.ts)
+(not a raw `fs.mkdtempSync`) for any temp directory a test passes to production as
+a project, pack, or worktree root; use its `canonical(p)` to compare such paths.
+The helper `fs.realpathSync`-canonicalizes the directory. This matters because
+production canonicalizes project/pack roots, and on macOS `os.tmpdir()` resolves
+under the `/var → /private/var` symlink — a non-canonical temp root then trips
+`SymlinkProjectRootError` and produces false extension-host confinement
+"escapes". Canonicalizing in the helper keeps these tests green on macOS, Linux,
+and Windows alike. (This is distinct from the E2E scratch-space relocation under
+[Windows temp root](#windows-temp-root).)
+
+
 ### UI E2E page-object helpers
 
 Reusable helpers in `tests/e2e/ui/ui-helpers.ts`. Import from `./ui-helpers.js`:
@@ -654,7 +691,7 @@ not come from over-parallelising a shared filesystem.
 Configured in `playwright-e2e.config.ts`:
 
 - Top-level: `workers: 4`, `retries: 3`, `fullyParallel: true`.
-- `api` project: `workers: 4` and inherited `fullyParallel: true`.
+- `api` project: `workers: 2` and inherited `fullyParallel: true`.
 - `api-realpush` project: `workers: 1`, `fullyParallel: false`.
 - `browser` project: `workers: 3`, `fullyParallel: false`.
 
@@ -662,7 +699,8 @@ Each worker owns a full gateway state directory; browser workers add Chromium
 and static UI serving. The browser and real-push projects stay spec-serial
 inside their project workers because their setup costs and filesystem side
 effects are heavier. The API project remains fully parallel because it uses the
-in-process harness and benefits from all four workers.
+in-process harness, but its worker budget is capped at two to avoid stacking too
+many gateway/git-heavy setup paths on Windows.
 
 **`retries: 3` is the deliberate current policy, not debt.** The flake-hardening
 effort root-caused the browser flake floor in place (see [Flake hardening](#flake-hardening-deterministic-waits)),
@@ -727,6 +765,35 @@ The inventory also corrected a stale suspect list: `goal-creation`,
 `stories-goal-routing`, and `verification-progress-indicator` were named as
 intermittent offenders but did **not** flake under retry-free runs; all
 previously-named specs are now hardened and de-labelled.
+
+#### RCA-driven infra fixes
+
+Recent stabilization work addressed contention at the scheduler, fixture, and
+suite-layout layers:
+
+- **Verification command scheduling.** Verification phases are the sole ordering
+  mechanism: same-phase steps run concurrently by default, including command
+  steps, and explicit sequencing should use different `phase` values.
+  Component-linked `command: unit` steps also default to 1200s when no explicit
+  timeout is set; other command steps keep the generic 300s default. Pinned by
+  `tests/verification-harness-command-scheduling.test.ts`.
+- **Activate-skill renderer fixture readiness.** The fixture used to let
+  fully-parallel workers rebuild the same esbuild output file in place. A worker
+  could load the bundle while another had truncated but not finished writing it,
+  then hang waiting for `window.__ready`. The test now builds to a per-worker
+  temp bundle and atomically replaces the shared bundle with retry-on-Windows
+  rename handling.
+- **E2E hotspot serialization.** The API project worker budget is two. Specs
+  that create many git repositories or slow verification commands, such as the
+  base-ref API/pinning specs and cancel-verification specs, opt into
+  file-local serial mode so broad runs do not stack their hottest filesystem and
+  child-process work.
+
+For pack-specific UI changes, keep durable validation tied to the persistent
+coverage contract: prefer node, fixture, or API coverage for matrices and add a
+focused browser E2E only when the changed interaction needs real app integration.
+The implementation gate should still run build, type-check, unit, and the full
+E2E command before merge.
 
 ### Playwright transform-cache isolation
 
@@ -841,8 +908,9 @@ target for the committed config.
 
 ### What not to change without re-measuring
 
-- Don't raise the top-level worker budget above 4, or the `browser` budget above
-  3, as a speed strategy. The budget is sized so up to ~4 suites can run
+- Don't raise the top-level worker budget above 4, the `api` budget above 2, or
+  the `browser` budget above 3 as a speed strategy. The budget is sized so up
+  to ~4 suites can run
   concurrently without mutual contention; raising it to chase a faster
   single-suite wall manufactures exactly the cross-suite flakes the budget
   exists to prevent. A sub-5-min single-suite wall is explicitly out of scope.
@@ -850,8 +918,9 @@ target for the committed config.
   concurrent-robustness margin, not temporary debt — see
   [Worker and retry counts](#worker-and-retry-counts).
 - Don't set `fullyParallel: true` on the `browser` or `api-realpush` projects.
-- Don't serialise the `api` project; it is the lightweight in-process lane and
-  benefits from its 4-worker budget.
+- Don't serialise the whole `api` project; keep targeted hotspot specs serial
+  instead. The in-process lane still benefits from limited parallelism at its
+  current worker budget.
 - Don't remove the wrapper-backed `npm run test:e2e` path or replace it with raw
   `npx` as the primary command.
 - Don't remove `BOBBIT_E2E_TMP_ROOT`, `BOBBIT_E2E_PWTEST_CACHE_ROOT`, or the

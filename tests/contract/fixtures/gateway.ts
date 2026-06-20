@@ -15,9 +15,9 @@
  * For tests that need HTTP/WS (most do), pass { startHttp: true }.
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
+import { makeTmpDir } from "../../helpers/tmp.ts";
 
 let serverModules: any = null;
 async function getServerModules() {
@@ -94,17 +94,20 @@ export async function createTestGateway(opts?: {
 	agentCliPath?: string;
 }): Promise<TestGateway> {
 	const startHttp = opts?.startHttp ?? true;
-	const dir = join(tmpdir(), `tier2-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	const dir = makeTmpDir(`tier2-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-`);
 	mkdirSync(join(dir, "state"), { recursive: true });
 	writeFileSync(join(dir, "state", "projects.json"), "[]");
 	writeFileSync(join(dir, "state", "setup-complete"), "tier2\n");
 
 	process.env.BOBBIT_DIR = dir;
 	process.env.BOBBIT_SKIP_MCP = "1";
+	process.env.NODE_ENV = "test";
 	process.env.BOBBIT_SKIP_NPM_CI = "1";
 	process.env.BOBBIT_LLM_REVIEW_SKIP = "1";
 	process.env.BOBBIT_NO_OPEN = "1";
 	process.env.BOBBIT_TEST_NO_PUSH = "1";
+	process.env.BOBBIT_TEST_NO_REMOTE = "1";
+	process.env.BOBBIT_TEST_NO_EXTERNAL = "1";
 
 	const { setProjectRoot, scaffoldBobbitDir, loadOrCreateToken, createGateway } = await getServerModules();
 

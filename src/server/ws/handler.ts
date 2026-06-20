@@ -15,6 +15,7 @@ import { resolveSkillExpansions } from "../skills/resolve-skill-expansions.js";
 import { resolveFileMentions, toWireMention } from "../skills/resolve-file-mentions.js";
 import { buildMergedModelText } from "../skills/merge-mentions.js";
 import { inferMeta } from "../agent/aigw-manager.js";
+import { isSessionSelectableProvider } from "../agent/google-code-assist.js";
 import { clampThinkingLevel, isKnownThinkingLevel } from "../../shared/thinking-levels.js";
 import { truncateLargeToolContentInMessages } from "../agent/truncate-large-content.js";
 import { readSkillSidecarEntries, mergeSidecarEntriesIntoMessages } from "../skills/skill-sidecar.js";
@@ -664,6 +665,14 @@ export function handleWebSocketConnection(
 					});
 					break;
 				case "set_model":
+					// Defence-in-depth: reject models the agent runtime can't run (e.g.
+					// google-gemini-cli Code Assist, emitted with sessionSelectable:false)
+					// without mutating session state. The picker already hides these, so
+					// this only fires for stale clients or direct API writes.
+					if (!isSessionSelectableProvider(msg.provider)) {
+						send(ws, { type: "error", message: `Model provider "${msg.provider}" can't run in agent sessions yet.`, code: "MODEL_NOT_SESSION_SELECTABLE" });
+						break;
+					}
 					try {
 						await session.rpcClient.setModel(msg.provider, msg.modelId);
 						sessionManager.updateModelNameFile(session.id, msg.modelId);
@@ -736,6 +745,13 @@ export function handleWebSocketConnection(
 					const startedAtMs = Date.now();
 					const compactionId = makeCompactionId(startedAtMs);
 					session.isCompacting = true;
+					// Stash the shared compactionId on the session BEFORE awaiting the
+					// RPC so session-manager's manual `compaction_end` branch can stamp
+					// the broadcast event with it. That lets the client's live
+					// `compact_active` card mount the pre-compaction affordance in the
+					// same session (it polls the sidecar, written below once the RPC
+					// resolves).
+					(session as any)._manualCompactionId = compactionId;
 					(async () => {
 						try {
 							console.log(`[ws-handler] Starting manual compact for session ${sessionId}`);
