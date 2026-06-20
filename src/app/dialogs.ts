@@ -16,7 +16,22 @@ import {
 	type Goal,
 	type GoalState,
 } from "./state.js";
-import { gatewayFetch, updateGoal, SymlinkRootError, fetchRoles, patchSession, type DetectedRepo, type MonorepoScanResult } from "./api.js";
+import {
+	gatewayFetch,
+	updateGoal,
+	SymlinkRootError,
+	fetchRoles,
+	patchSession,
+	browseDirectory,
+	detectProject,
+	fetchProjects,
+	registerProject,
+	scanProject,
+	updateLocalSessionTitle,
+	refreshSessions,
+	type DetectedRepo,
+	type MonorepoScanResult,
+} from "./api.js";
 import "../ui/components/DirectoryPicker.js";
 import type {
 	DirectoryPicker as DirectoryPickerEl,
@@ -29,8 +44,6 @@ import type {
 } from "./project-assistant-autoprompt.js";
 import { errorDetails } from "./error-helpers.js";
 import "../ui/components/ErrorDetails.js";
-import { updateLocalSessionTitle } from "./api.js";
-import { refreshSessions } from "./api.js";
 // Static import of session-manager creates a cycle (session-manager imports
 // dialogs.ts statically), but neither module references the other at
 // module-init time — ESM live bindings resolve at call time.
@@ -468,7 +481,14 @@ export function openOAuthDialog(provider = "anthropic"): Promise<boolean> {
 		const POLL_MAX_DELAY_MS = 8000;
 		const POLL_MAX_TOTAL_MS = 5 * 60 * 1000;
 
-		const providerName = provider === "openai-codex" || provider === "openai" ? "OpenAI" : "Anthropic";
+		// Canonical Google account OAuth id is `google-gemini-cli`; `google`/`gemini`
+		// are inbound aliases the server collapses to it. Label all three "Google".
+		const providerName =
+			provider === "google-gemini-cli" || provider === "google" || provider === "gemini"
+				? "Google"
+				: provider === "openai-codex" || provider === "openai"
+					? "OpenAI"
+					: "Anthropic";
 
 		const cleanup = (result: boolean) => {
 			if (pollTimer !== undefined) window.clearTimeout(pollTimer);
@@ -1359,6 +1379,7 @@ function showGoalEditDialog(existingGoal: Goal): void {
 	let specValue = existingGoal.spec;
 	let stateValue: GoalState = existingGoal.state;
 	let saving = false;
+	let titleFocused = false;
 
 	let cwdDropdownOpenEdit = false;
 	let cwdHighlightIndexEdit = -1;
@@ -1394,29 +1415,33 @@ function showGoalEditDialog(existingGoal: Goal): void {
 			Dialog({
 				isOpen: true,
 				onClose: cleanup,
-				width: "min(540px, 92vw)",
-				height: "auto",
-				className: "max-h-[90vh]",
+				width: "min(1100px, 96vw)",
+				height: "min(900px, 92vh)",
+				className: "max-h-[92vh]",
 				backdropClassName: "bg-black/50 backdrop-blur-sm",
 				children: html`
-					${DialogContent({
-						className: "overflow-y-auto",
-						children: html`
+					<div class="flex flex-col h-full min-h-0" data-testid="goal-edit-dialog">
+						<div class="shrink-0 px-6 pt-6 pb-2">
 							${DialogHeader({ title: "Edit Goal" })}
-							<div class="mt-4 flex flex-col gap-4">
-								<div>
-									<label class="text-xs text-muted-foreground mb-1 block">Title</label>
-									${Input({
-										type: "text",
-										value: titleValue,
-										onInput: (e: Event) => { titleValue = (e.target as HTMLInputElement).value; renderDialog(); },
-										onKeyDown: (e: KeyboardEvent) => {
+						</div>
+						<div class="flex-1 min-h-0 px-6 pb-4 overflow-y-auto">
+							<div class="flex min-h-full flex-col gap-4">
+								<div class="shrink-0">
+									<label class="text-xs text-muted-foreground mb-1 block" for="goal-edit-title-input">Title</label>
+									<input
+										id="goal-edit-title-input"
+										data-testid="goal-edit-title-input"
+										type="text"
+										class="w-full h-10 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+										.value=${titleValue}
+										@input=${(e: Event) => { titleValue = (e.target as HTMLInputElement).value; renderDialog(); }}
+										@keydown=${(e: KeyboardEvent) => {
 											if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doSave(); }
 											if (e.key === "Escape") cleanup();
-										},
-									})}
+										}}
+									/>
 								</div>
-								<div>
+								<div class="shrink-0">
 									<label class="text-xs text-muted-foreground mb-1 block">Working Directory</label>
 									${cwdCombobox({
 										value: cwdValue,
@@ -1429,9 +1454,9 @@ function showGoalEditDialog(existingGoal: Goal): void {
 										onHighlight: (i) => { cwdHighlightIndexEdit = i; },
 									})}
 								</div>
-								<div>
+								<div class="shrink-0">
 									<label class="text-xs text-muted-foreground mb-1 block">State</label>
-									<div class="flex gap-1.5">
+									<div class="flex flex-wrap gap-1.5">
 										${stateOptions.map((opt) => html`
 											<button
 												class="px-3 py-1.5 text-xs rounded-md border transition-colors
@@ -1444,43 +1469,48 @@ function showGoalEditDialog(existingGoal: Goal): void {
 										`)}
 									</div>
 								</div>
-								<div>
-									<label class="text-xs text-muted-foreground mb-1 block">Goal Spec (Markdown)</label>
+								<div class="flex flex-1 min-h-[320px] flex-col">
+									<label class="text-xs text-muted-foreground mb-1 block" for="goal-edit-spec-textarea">Goal Spec (Markdown)</label>
 									<textarea
-										class="w-full min-h-[120px] max-h-[300px] p-3 text-sm font-mono rounded-md border border-border bg-background text-foreground resize-y focus:outline-none focus:ring-1 focus:ring-ring"
+										id="goal-edit-spec-textarea"
+										data-testid="goal-edit-spec-textarea"
+										class="w-full flex-1 min-h-[320px] p-3 text-sm font-mono rounded-md border border-border bg-background text-foreground resize-y focus:outline-none focus:ring-1 focus:ring-ring"
 										placeholder="Describe the goal, acceptance criteria, constraints..."
 										.value=${specValue}
 										@input=${(e: Event) => { specValue = (e.target as HTMLTextAreaElement).value; }}
 									></textarea>
-									<p class="text-[10px] text-muted-foreground mt-1">Injected into the context window of all sessions under this goal.</p>
+									<p class="shrink-0 text-[10px] text-muted-foreground mt-1">Injected into the context window of all sessions under this goal.</p>
 								</div>
-	
 							</div>
-						`,
-					})}
-					${DialogFooter({
-						className: "px-6 pb-4",
-						children: html`
+						</div>
+						<div class="shrink-0 px-6 py-4 border-t border-border">
 							<div class="flex gap-2 justify-end">
-								${Button({ variant: "ghost", onClick: cleanup, children: "Cancel" })}
+								${Button({
+									variant: "ghost",
+									onClick: cleanup,
+									children: html`<span data-testid="goal-edit-cancel-button">Cancel</span>`,
+								})}
 								${Button({
 									variant: "default",
 									onClick: doSave,
 									disabled: !titleValue.trim() || saving,
-									children: saving ? "Saving…" : "Save",
+									children: html`<span data-testid="goal-edit-save-button">${saving ? "Saving…" : "Save"}</span>`,
 								})}
 							</div>
-						`,
-					})}
+						</div>
+					</div>
 				`,
 			}),
 			container,
 		);
 
-		requestAnimationFrame(() => {
-			const input = container.querySelector("input");
-			if (input) { input.focus(); input.select(); }
-		});
+		if (!titleFocused) {
+			titleFocused = true;
+			requestAnimationFrame(() => {
+				const input = container.querySelector<HTMLInputElement>("[data-testid='goal-edit-title-input']");
+				if (input) { input.focus(); input.select(); }
+			});
+		}
 	};
 
 	renderDialog();
@@ -1529,8 +1559,6 @@ export async function createProjectAssistantSession(
 		// Refresh projects so the sidebar sees the newly-created provisional project
 		// before connectToSession renders. Without this, the session falls into the
 		// default project bucket because state.projects doesn't contain the new ID yet.
-		const { fetchProjects } = await import("./api.js");
-		const { setProjects } = await import("./state.js");
 		setProjects(await fetchProjects());
 		const { connectToSession } = await import("./session-manager.js");
 		const actualType = scaffolding ? "project-scaffolding" : "project";
@@ -1689,7 +1717,6 @@ function openProjectBrowseDialog(initialPath: string): Promise<string | null> {
 			errorMessage = "";
 			renderDialog();
 			try {
-				const { browseDirectory } = await import("./api.js");
 				const result = await browseDirectory(dirPath) as DirectoryBrowseResult & { truncated?: boolean };
 				current = result.current;
 				parent = result.parent;
@@ -1896,7 +1923,6 @@ export function showProjectDialog(): void {
 		}
 		const token = ++detectionToken;
 		try {
-			const { detectProject } = await import("./api.js");
 			const result = await detectProject(trimmed);
 			if (token !== detectionToken) return;
 			detectionResult = result;
@@ -2064,7 +2090,6 @@ export function showProjectDialog(): void {
 		errorMessage = null;
 		renderDialog();
 		try {
-			const { detectProject, registerProject, fetchProjects, scanProject } = await import("./api.js");
 			const detection = await detectProject(trimmed);
 
 			if (detection.hasBobbit) {
@@ -2349,14 +2374,10 @@ export function showProjectDialog(): void {
 		// as a stable DOM node, not via Lit's property bindings.
 		pickerEl.value = pathValue;
 		pickerEl.recentPaths = recentPaths();
-		// Lazily wire the browseDirectory callback (avoids importing the API
-		// module before the dialog is opened).
 		const pickerAny = pickerEl as unknown as { __browseWired?: boolean };
 		if (!pickerAny.__browseWired) {
-			void import("./api.js").then((m) => {
-				pickerEl.browseDirectory = m.browseDirectory;
-				pickerAny.__browseWired = true;
-			});
+			pickerEl.browseDirectory = browseDirectory;
+			pickerAny.__browseWired = true;
 		}
 		pickerEl.disabled = busy;
 

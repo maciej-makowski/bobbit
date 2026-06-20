@@ -6,9 +6,9 @@ import { icon } from "@mariozechner/mini-lit";
 import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { html, render } from "lit";
 import { repeat } from "lit/directives/repeat.js";
-import Sortable from "sortablejs";
+import type Sortable from "sortablejs";
 import { shortcutHint } from "./shortcut-registry.js";
-import { AlertTriangle, Archive, ArrowLeft, ExternalLink, FileText, FolderOpen, FolderPlus, Link, MessagesSquare, ChevronDown, Goal as GoalIcon, PanelRightClose, PanelRightOpen, Pencil, Plus, QrCode, RotateCw, Server, Settings, Store, Trash2, Unplug, Users, Workflow as WorkflowIcon, Wrench, X, Zap } from "lucide";
+import { AlertTriangle, Archive, ArrowLeft, ExternalLink, FolderOpen, FolderPlus, Menu, MessagesSquare, ChevronDown, Goal as GoalIcon, PanelRightClose, PanelRightOpen, Plus, QrCode, RotateCw, Server, Settings, Store, Unplug, Users, Workflow as WorkflowIcon, Wrench, X, Zap } from "lucide";
 import {
 	state,
 	renderApp,
@@ -20,6 +20,7 @@ import {
 
 	getSidebarData,
 	setRenderSuppressed,
+	type GatewaySession,
 } from "./state.js";
 import { gatewayFetch, retryLoadSessions } from "./api.js";
 import { clearAllAnnotations, getDocumentAnnotationCount, markReviewSubmitted, flushPendingWrites } from "../ui/components/review/AnnotationStore.js";
@@ -30,7 +31,10 @@ import {
 	reviewDocumentFromDecisionDetail,
 	submitReviewDecision,
 } from "./review-sources.js";
-import { backToSessions, createAndConnectSession, terminateSession } from "./session-manager.js";
+import { backToSessions, createAndConnectSession } from "./session-manager.js";
+import { buildSessionActions, resetSessionForkNewWorktree, type SessionActionDescriptor } from "./session-actions.js";
+import type { SidebarActionsPopover, SidebarActionsPopoverItem } from "../ui/components/SidebarActionsPopover.js";
+import { captureSidebarActionSourceRects, type SidebarActionsFlipRect } from "../ui/components/sidebar-actions-flip.js";
 // Lazy wrapper for the proposal-panels chunk. Static import here keeps
 // the wrapper itself in the entry bundle while the ~80 kB body of
 // goal/role/tool/staff/project preview panels lands on first view.
@@ -44,9 +48,9 @@ export { setSelectedWorkflowId } from "./proposal-panels-lazy.js";
 // `dialogs.ts` chunk stays out of the entry bundle. Each wrapper
 // fires the same shared `import("./dialogs.js")` on first use; the
 // chunk is shared across all UI surfaces that open dialogs.
-import { openGatewayDialog, showQrCodeDialog, showRenameDialog, showGoalDialog, showProjectDialog } from "./dialogs-lazy.js";
+import { openGatewayDialog, showQrCodeDialog, showGoalDialog, showProjectDialog } from "./dialogs-lazy.js";
 import { startNewGoalFlow } from "./goal-entry.js";
-import { renderSidebar, toggleRolePicker, renderRolePickerDropdown, isProjectExpanded, toggleProjectExpanded, filterStaffByQuery, renderStaffSidebarSection, isProjectReordering, projectOrderForRender, renderProjectReorderHandle, renderProjectReorderLiveRegion } from "./sidebar.js";
+import { renderSidebar, toggleRolePicker, renderRolePickerDropdown, isProjectExpanded, toggleProjectExpanded, filterStaffByQuery, renderStaffSidebarSection, isProjectReordering, projectOrderForRender, renderProjectReorderHandle, renderProjectReorderLiveRegion, handleSidebarSearchInput, handleSidebarSearchClear, renderArchivedSearchControls } from "./sidebar.js";
 import { computeSpawnedClaim } from "./sidebar-spawned-children.js";
 import { isClientDebugEnabled, dumpClientDebugToComposer, registerDebugSection } from "./client-debug.js";
 import { fetchArchivedGoalsPaginated, fetchArchivedSessionsPaginated } from "./api.js";
@@ -215,8 +219,19 @@ window.addEventListener("bobbit-open-review-document", (e: Event) => {
 import { teardownMobileScrollTracking, ensureMobileScrollTracking } from "./mobile-header.js";
 import { getRouteFromHash, setHashRoute, isRouteActive, toggleConfigPage } from "./routing.js";
 import { lookupPackRoute } from "./pack-entrypoints.js";
-import { bobbitLoadingAnimation } from "../ui/components/BobbitLoadingAnimation.js";
 import "./config-scope.css";
+
+function bobbitLoadingAnimation() {
+	return html`
+		<div class="flex items-center justify-center w-full h-full" style="background: var(--background);">
+			<div
+				class="rounded-full animate-spin"
+				style="width: 2rem; height: 2rem; border: 2px solid color-mix(in oklch, var(--muted-foreground) 22%, transparent); border-top-color: var(--primary);"
+				aria-label="Loading"
+			></div>
+		</div>
+	`;
+}
 
 // ---------------------------------------------------------------------------
 // Lazy route page loader — see docs/design/ui-bundle-size-reduction.md (Task A)
@@ -334,17 +349,6 @@ function renderClientDebugButton() {
 
 /** Compact session row for mobile — mirrors sidebar row with always-visible buttons */
 
-// Mobile search handlers (shared logic with sidebar but separate scope)
-function _handleMobileSearchInput(query: string): void {
-	state.searchQuery = query;
-	renderApp();
-}
-
-function _handleMobileSearchClear(): void {
-	state.searchQuery = "";
-	renderApp();
-}
-
 function renderMobileLanding() {
 	const sidebarData = getSidebarData();
 	let { ungroupedSessions, liveGoals } = sidebarData;
@@ -435,8 +439,8 @@ function renderMobileLanding() {
 				<search-box
 					.query=${state.searchQuery}
 					.showControls=${!!state.searchQuery}
-					@search-input=${(e: CustomEvent) => { _handleMobileSearchInput(e.detail.query); }}
-					@search-clear=${() => { _handleMobileSearchClear(); }}
+					@search-input=${(e: CustomEvent) => { handleSidebarSearchInput(e.detail.query); }}
+					@search-clear=${() => { handleSidebarSearchClear(); }}
 					@full-search-click=${(e: CustomEvent) => { setHashRoute("search", e.detail.query); }}
 				></search-box>
 				${state.sessionsLoading
@@ -601,6 +605,7 @@ function renderMobileLanding() {
 												</div>
 											`;
 										})}
+										${renderArchivedSearchControls()}
 										${state.showArchived && !state.searchQuery && (state.archivedGoalsHasMore || state.archivedSessionsHasMore) ? html`
 											<div class="border-t border-border/30 my-1 mx-2"></div>
 											<div class="flex flex-col gap-0.5 px-2">
@@ -648,6 +653,215 @@ export function showHeaderToast(text: string): void {
 function headerToast() {
 	if (!_headerToastText) return "";
 	return html`<div class="review-toast" data-testid="header-toast">${_headerToastText}</div>`;
+}
+
+interface OpenHeaderSessionActionsPopover {
+	sessionId: string;
+	element: SidebarActionsPopover;
+	actions: SessionActionDescriptor[];
+	refresh: () => SessionActionDescriptor[];
+	cleanup?: () => void;
+}
+
+let _openHeaderSessionActionsPopover: OpenHeaderSessionActionsPopover | null = null;
+let _headerSessionActionsPopoverRequestId = 0;
+
+function headerDirectSessionActionLimit(): number {
+	const width = window.innerWidth || document.documentElement.clientWidth || 1024;
+	if (width < 760) return 1;
+	if (width < 980) return 2;
+	if (width < 1180) return 3;
+	return 4;
+}
+
+function partitionHeaderSessionActions(actions: SessionActionDescriptor[], mobile: boolean): {
+	directActions: SessionActionDescriptor[];
+	overflowActions: SessionActionDescriptor[];
+} {
+	const firstTrailingActionIndex = actions.findIndex((action) => !!action.trailingToggle);
+	const directLimit = firstTrailingActionIndex >= 0
+		? Math.min(headerDirectSessionActionLimit(), firstTrailingActionIndex)
+		: headerDirectSessionActionLimit();
+	if (mobile) {
+		return {
+			directActions: actions.filter((action) => action.quick),
+			overflowActions: actions,
+		};
+	}
+	const directCount = Math.min(actions.length, directLimit);
+	return {
+		directActions: actions.slice(0, directCount),
+		overflowActions: actions.slice(directCount),
+	};
+}
+
+function toHeaderPopoverItems(actions: SessionActionDescriptor[]): SidebarActionsPopoverItem[] {
+	return actions.map(({ id, label, title, icon: actionIcon, tone, quick, trailingToggle }) => ({
+		id: String(id),
+		label,
+		title,
+		icon: actionIcon,
+		tone,
+		quick: quick === true,
+		trailingToggle,
+	}));
+}
+
+function isHeaderSessionActionsPopoverOpen(sessionId: string): boolean {
+	return _openHeaderSessionActionsPopover?.sessionId === sessionId
+		&& _openHeaderSessionActionsPopover.element.open;
+}
+
+function closeHeaderSessionActionsPopover(renderAfterClose = true): void {
+	_headerSessionActionsPopoverRequestId++;
+	const current = _openHeaderSessionActionsPopover;
+	if (!current) return;
+	_openHeaderSessionActionsPopover = null;
+	current.cleanup?.();
+	current.element.open = false;
+	try { current.element.remove(); } catch { /* ignore */ }
+	if (renderAfterClose) renderApp();
+}
+
+function refreshOpenHeaderSessionActionsPopover(): void {
+	const current = _openHeaderSessionActionsPopover;
+	if (current) {
+		current.actions = current.refresh();
+		current.element.items = toHeaderPopoverItems(current.actions);
+		return;
+	}
+	renderApp();
+}
+
+async function openHeaderSessionActionsPopover(input: {
+	sessionId: string;
+	trigger: HTMLElement;
+	actions: SessionActionDescriptor[];
+	refresh: () => SessionActionDescriptor[];
+	sourceRects: SidebarActionsFlipRect[];
+}): Promise<void> {
+	if (isHeaderSessionActionsPopoverOpen(input.sessionId)) {
+		closeHeaderSessionActionsPopover();
+		return;
+	}
+	closeHeaderSessionActionsPopover(false);
+	const requestId = ++_headerSessionActionsPopoverRequestId;
+	await import("../ui/components/SidebarActionsPopover.js");
+	if (requestId !== _headerSessionActionsPopoverRequestId || !input.trigger.isConnected) return;
+	const element = document.createElement("sidebar-actions-popover") as SidebarActionsPopover;
+	element.anchorEl = input.trigger;
+	element.items = toHeaderPopoverItems(input.actions);
+	element.sourceRects = input.sourceRects;
+	element.open = true;
+	const handleResize = () => refreshOpenHeaderSessionActionsPopover();
+	window.addEventListener("resize", handleResize);
+	const cleanup = () => window.removeEventListener("resize", handleResize);
+	element.addEventListener("sidebar-action-select", ((event: CustomEvent<{ actionId: string }>) => {
+		event.stopPropagation();
+		const current = _openHeaderSessionActionsPopover;
+		const action = current?.actions.find((item) => String(item.id) === event.detail.actionId);
+		void action?.run(event);
+	}) as EventListener);
+	element.addEventListener("close", () => {
+		if (_openHeaderSessionActionsPopover?.element === element) {
+			_openHeaderSessionActionsPopover.cleanup?.();
+			_openHeaderSessionActionsPopover = null;
+		} else {
+			cleanup();
+		}
+		try { element.remove(); } catch { /* ignore */ }
+		renderApp();
+	});
+	document.body.appendChild(element);
+	_openHeaderSessionActionsPopover = {
+		sessionId: input.sessionId,
+		element,
+		actions: input.actions,
+		refresh: input.refresh,
+		cleanup,
+	};
+	renderApp();
+}
+
+function renderHeaderSessionActionButton(action: SessionActionDescriptor, mobile = false) {
+	const danger = action.tone === "danger";
+	return html`
+		<button
+			type="button"
+			class="${mobile ? "h-10 w-10 p-0" : "h-7 px-2"} rounded-md transition-colors inline-flex items-center justify-center text-muted-foreground hover:bg-secondary/80 hover:text-foreground ${danger ? "hover:text-destructive" : ""}"
+			data-session-action-surface="header"
+			data-session-action-id=${String(action.id)}
+			data-sidebar-action-id=${String(action.id)}
+			data-sidebar-action-quick=${action.quick ? "true" : "false"}
+			@click=${(event: Event) => {
+				event.preventDefault();
+				event.stopPropagation();
+				closeHeaderSessionActionsPopover(false);
+				void action.run(event);
+			}}
+			title=${action.title || action.label}
+			aria-label=${action.label}
+		>
+			<span class="inline-flex items-center gap-1">${action.icon}${mobile ? html`` : html`<span class="text-xs hidden md:inline">${action.label}</span>`}</span>
+		</button>
+	`;
+}
+
+function renderHeaderSessionActions(input: {
+	session: GatewaySession;
+	displayTitle: string;
+	staffId?: string;
+	staffName?: string;
+	mobile: boolean;
+}) {
+	const buildActions = () => buildSessionActions({
+		session: input.session,
+		displayTitle: input.displayTitle,
+		staffId: input.staffId,
+		staffName: input.staffName,
+		goalId: input.session.goalId || input.session.teamGoalId,
+		onRefreshStateChanged: refreshOpenHeaderSessionActionsPopover,
+	}).slice().sort((a, b) => a.priority - b.priority);
+	const actions = buildActions();
+	if (!actions.length) return html``;
+	const { directActions, overflowActions } = partitionHeaderSessionActions(actions, input.mobile);
+	const hideDirectActions = input.mobile && isHeaderSessionActionsPopoverOpen(input.session.id);
+	const visibleDirectActions = hideDirectActions ? [] : directActions;
+	const showOverflow = input.mobile || overflowActions.length > 0;
+	const openFromTrigger = (event: Event) => {
+		event.preventDefault();
+		event.stopPropagation();
+		const trigger = event.currentTarget as HTMLElement;
+		const row = trigger.closest<HTMLElement>("[data-sidebar-actions-row-root]");
+		resetSessionForkNewWorktree();
+		const currentOverflowActions = () => partitionHeaderSessionActions(buildActions(), input.mobile).overflowActions;
+		void openHeaderSessionActionsPopover({
+			sessionId: input.session.id,
+			trigger,
+			actions: currentOverflowActions(),
+			refresh: currentOverflowActions,
+			sourceRects: row ? captureSidebarActionSourceRects(row) : [],
+		});
+	};
+	return html`
+		<div class="flex items-center gap-1 shrink-0 relative" data-session-action-surface="header" data-sidebar-actions-row-root>
+			<div class="sidebar-actions flex items-center gap-1">
+				${visibleDirectActions.map((action) => renderHeaderSessionActionButton(action, input.mobile))}
+				${showOverflow ? html`
+					<button
+						type="button"
+						class="${input.mobile ? "h-10 w-10 p-0" : "h-7 px-2"} rounded-md transition-colors inline-flex items-center justify-center text-muted-foreground hover:bg-secondary/80 hover:text-foreground"
+						data-testid="session-actions-trigger"
+						aria-label="Session actions"
+						aria-haspopup="menu"
+						aria-expanded=${isHeaderSessionActionsPopoverOpen(input.session.id) ? "true" : "false"}
+						title="Session actions"
+						@click=${openFromTrigger}
+					>${icon(Menu, "xs")}</button>
+				` : html``}
+			</div>
+		</div>
+	`;
 }
 
 // ── Disabled `#/ext/<routeId>` deep-link empty state (built-in-first-party-packs
@@ -780,10 +994,14 @@ let mobileSelectedSideTabId = "";
 // lit-html doesn't fight Sortable's DOM mutations; on drop we read the new
 // DOM order and commit it back to state.
 //
-// SortableJS itself is split into its own vendor chunk (see vite.config.ts
-// manualChunks) so the ~46 kB / ~13 kB gz body lands outside the entry chunk.
+// SortableJS itself is loaded on first tab-bar render so the ~70 kB raw drag
+// library stays out of the eager app-shell SCC pinned by tests/bundle-size.test.ts.
+type SortableConstructor = typeof Sortable;
+let SortableCtor: SortableConstructor | null = null;
+let sortableLoadStarted = false;
 let panelSortable: Sortable | null = null;
 let panelSortableContainer: HTMLElement | null = null;
+let panelSortablePendingContainer: HTMLElement | null = null;
 let draggingPanelTabId = "";
 // When true, the current drag at any point tried to land on/before a pinned
 // tab. SortableJS's onMove returns false for that single candidate target, but
@@ -810,7 +1028,7 @@ let panelDragLockRaf = 0;
 function startPanelDragYLock(): void {
 	cancelAnimationFrame(panelDragLockRaf);
 	const tick = () => {
-		const ghost = (Sortable as unknown as { ghost: HTMLElement | null }).ghost;
+		const ghost = (SortableCtor as unknown as { ghost: HTMLElement | null } | null)?.ghost;
 		if (ghost && ghost.style.transform) {
 			const t = ghost.style.transform;
 			const m = /matrix\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)/.exec(t);
@@ -1421,6 +1639,22 @@ function revertPanelTabDomOrder(host: HTMLElement, expectedIds: string[]): void 
 	}
 }
 
+function loadPanelSortable(): void {
+	if (SortableCtor || sortableLoadStarted) return;
+	sortableLoadStarted = true;
+	void import("sortablejs")
+		.then((mod) => {
+			SortableCtor = (mod as unknown as { default?: SortableConstructor }).default ?? (mod as unknown as SortableConstructor);
+			const pending = panelSortablePendingContainer;
+			panelSortablePendingContainer = null;
+			if (pending?.isConnected) ensurePanelSortable(pending);
+		})
+		.catch((err) => {
+			sortableLoadStarted = false;
+			console.warn("[render] failed to load SortableJS", err);
+		});
+}
+
 // Attach a SortableJS instance to the unified tab bar's inner container. Idempotent:
 // if the container DOM node is the same as last time, we keep the existing instance.
 // If the container was replaced (e.g. workspace switched sessions), we destroy the
@@ -1435,11 +1669,17 @@ function revertPanelTabDomOrder(host: HTMLElement, expectedIds: string[]): void 
 //   - onEnd: read the new DOM order, commit to state, resume renders
 function ensurePanelSortable(container: HTMLElement | null): void {
 	if (!container) {
+		panelSortablePendingContainer = null;
 		if (panelSortable) {
 			panelSortable.destroy();
 			panelSortable = null;
 			panelSortableContainer = null;
 		}
+		return;
+	}
+	if (!SortableCtor) {
+		panelSortablePendingContainer = container;
+		loadPanelSortable();
 		return;
 	}
 	if (panelSortableContainer === container && panelSortable) return;
@@ -1449,7 +1689,7 @@ function ensurePanelSortable(container: HTMLElement | null): void {
 	}
 	panelSortableContainer = container;
 
-	panelSortable = Sortable.create(container, {
+	panelSortable = SortableCtor.create(container, {
 		animation: 180,
 		easing: "cubic-bezier(0.2, 0.8, 0.2, 1)",
 		draggable: ".goal-tab-pill",
@@ -1496,7 +1736,7 @@ function ensurePanelSortable(container: HTMLElement | null): void {
 			// opacity: 0.8 (we want it to look like a real tab, not a ghost),
 			// while the source tab (.goal-tab-pill--ghost) becomes invisible —
 			// the user should perceive the tab itself moving, not a clone.
-			const ghost = (Sortable as unknown as { ghost: HTMLElement | null }).ghost;
+			const ghost = (SortableCtor as unknown as { ghost: HTMLElement | null } | null)?.ghost;
 			if (ghost) ghost.classList.add("goal-tab-pill--floating");
 		},
 		onEnd: (evt) => {
@@ -1715,62 +1955,15 @@ export function doRenderApp(): void {
 	const activeSid = activeSessionId();
 	const activeStaffAgent = activeSid ? state.staffList.find(s => s.currentSessionId === activeSid) : undefined;
 	const headerTitle = activeStaffAgent?.name ?? sessionTitle;
-	const editLabel = activeStaffAgent ? "Edit" : "Modify";
 	const activeSession = activeSid ? state.gatewaySessions.find(s => s.id === activeSid) : undefined;
-	const isTeamLead = activeSession?.role === "team-lead";
-	const editDeleteBtns = (connected && state.remoteAgent && activeSid) ? html`
-		<div class="flex items-center gap-1 shrink-0 relative">
-			${Button({
-				variant: "ghost",
-				size: "sm",
-				onClick: () => {
-					import("../ui/dialogs/SystemPromptDialog.js").then(m => m.SystemPromptDialog.show(activeSid!));
-				},
-				children: html`<span class="inline-flex items-center gap-1">${icon(FileText, "xs")}<span class="text-xs hidden sm:inline">Prompt</span></span>`,
-				className: "h-7 px-2 text-muted-foreground",
-				title: "View System Prompt",
-			})}
-			<span data-testid="copy-session-link">${Button({
-				variant: "ghost",
-				size: "sm",
-				onClick: async () => {
-					const url = `${location.origin}/session/${activeSid}`;
-					try {
-						await navigator.clipboard.writeText(url);
-						showHeaderToast("Link copied");
-					} catch {
-						const m = await import("../ui/dialogs/CopyLinkFallbackDialog.js");
-						m.CopyLinkFallbackDialog.show(url);
-					}
-				},
-				children: html`<span class="inline-flex items-center gap-1">${icon(Link, "xs")}<span class="text-xs hidden sm:inline">Link</span></span>`,
-				className: "h-7 px-2 text-muted-foreground",
-				title: "Copy session link",
-			})}</span>
-			${Button({
-				variant: "ghost",
-				size: "sm",
-				onClick: () => {
-					if (activeStaffAgent) {
-						setHashRoute("staff-edit", activeStaffAgent.id);
-					} else {
-						showRenameDialog(activeSid, sessionTitle);
-					}
-				},
-				children: html`<span class="inline-flex items-center gap-1">${icon(Pencil, "xs")}<span class="text-xs hidden sm:inline">${editLabel}</span></span>`,
-				className: "h-7 px-2 text-muted-foreground",
-				title: activeStaffAgent ? "Edit staff agent" : "Modify session",
-			})}
-			${Button({
-				variant: "ghost",
-				size: "sm",
-				onClick: () => terminateSession(activeSid),
-				children: html`<span class="inline-flex items-center gap-1">${icon(Trash2, "xs")}<span class="text-xs hidden sm:inline">${isTeamLead ? "End Team" : "Terminate"}</span></span>`,
-				className: "h-7 px-2 text-muted-foreground hover:text-destructive",
-				title: (isTeamLead ? "End team" : "Terminate session") + shortcutHint("terminate-session"),
-			})}
-		</div>
-	` : "";
+	const hasHeaderSessionActions = Boolean(connected && state.remoteAgent && activeSession);
+	const headerSessionActions = hasHeaderSessionActions && activeSession ? renderHeaderSessionActions({
+		session: activeSession,
+		displayTitle: sessionTitle,
+		staffId: activeStaffAgent?.id ?? activeSession.staffId,
+		staffName: activeStaffAgent?.name,
+		mobile: !desktop,
+	}) : html``;
 
 	const headerLeft = () => {
 		if (connected && state.remoteAgent) {
@@ -1801,7 +1994,7 @@ export function doRenderApp(): void {
 							<span class="mobile-header-title font-medium text-foreground inline-flex items-center gap-1 min-w-0" title=${headerTitle}><span class="truncate">${headerTitle}</span>${activeSession?.sandboxed ? renderSandboxIndicator(activeSession.status) : ""}${(activeSession?.status === "preparing" || activeSession?.status === "starting") ? html`<span class="shrink-0 text-muted-foreground/70 italic" style="font-size:0.75em;">preparing…</span>` : ""}</span>
 							${goalTitle ? html`<span class="text-[10px] text-muted-foreground/60 truncate uppercase tracking-wider">${goalTitle}</span>` : ""}
 						</div>
-						<div class="shrink-0">${editDeleteBtns}</div>
+						<div class="shrink-0">${headerSessionActions}</div>
 					</div>
 				`;
 			}
@@ -1829,7 +2022,7 @@ export function doRenderApp(): void {
 
 	const headerRight = () => {
 		if (desktop) {
-			return editDeleteBtns ? html`<div class="flex items-center gap-1 px-2">${editDeleteBtns}</div>` : html``;
+			return hasHeaderSessionActions ? html`<div class="flex items-center gap-1 px-2">${headerSessionActions}</div>` : html``;
 		}
 		const settingsBtn = Button({
 			variant: "ghost",
@@ -2122,28 +2315,27 @@ export function doRenderApp(): void {
 	// which forces the iframe to reload via the `#mtime=<n>` hash.
 	const htmlPreviewContent = () => {
 		const sid = activeSessionId() || "";
-		const v = state.previewPanelMtime || 0;
-		// Derive artifactId and entry from the active panel tab rather than
-		// mirroring them in global state. Many code paths (SSE preview-changed,
-		// bootstrap fetch, PreviewRenderer, session-manager) update
-		// `previewPanelEntry` without knowing about artifactId; reading directly
-		// from the active tab keeps entry+artifactId always paired.
+		// Derive artifactId, entry, and mtime from the active panel tab rather than
+		// requiring global preview mirrors to be populated. After a gateway restart,
+		// the server-persisted workspace tab can be restored before the session's
+		// transient previewPanelEntry mirror is repopulated.
 		const activeId = activeSidePanelTabIdForSession(state, workspaceSessionId());
 		const panelTabs = unifiedPanelContentTabs();
 		const activeTab = panelTabs.find((t) => t.id === activeId);
 		let artifactId = "";
-		let entry = state.previewPanelEntry || "inline.html";
+		let entry = state.previewPanelEntry || "";
+		let tabMtime = 0;
 		if (activeTab && activeTab.kind === "preview") {
 			const tabState = (activeTab.state || {}) as Record<string, unknown>;
 			const source = activeTab.source as Record<string, unknown>;
+			const tabEntry = previewEntryFromTab(activeTab);
+			if (tabEntry) entry = tabEntry;
+			if (typeof tabState.mtime === "number" && Number.isFinite(tabState.mtime)) tabMtime = tabState.mtime;
 			const isLiveTab = isLivePreviewTab(activeTab);
-			if (!isLiveTab) {
-				artifactId = recordValue(tabState, "artifactId") || recordValue(source, "artifactId");
-				const tabEntry = previewEntryFromTab(activeTab);
-				if (tabEntry) entry = tabEntry;
-			}
+			if (!isLiveTab) artifactId = recordValue(tabState, "artifactId") || recordValue(source, "artifactId");
 		}
-		if (!sid || !state.previewPanelEntry) {
+		const v = state.previewPanelMtime || tabMtime || 0;
+		if (!sid || !entry) {
 			// Empty-state until the first SSE `preview-changed` event lands.
 			return html`
 				<div class="flex-1 min-h-0 flex items-center justify-center text-muted-foreground text-sm">
@@ -2319,7 +2511,7 @@ export function doRenderApp(): void {
 	`;
 
 	const sidePanelActionButtons = (tab: UnifiedContentTab) => html`
-		${tab.kind === "preview" && state.previewPanelEntry ? previewControlButtons(tab) : ""}
+		${tab.kind === "preview" && (previewEntryFromTab(tab) || state.previewPanelEntry) ? previewControlButtons(tab) : ""}
 	`;
 
 	const sidePanelWindowControls = (tab: UnifiedContentTab, mode: SidePanelSizeMode) => {
@@ -2337,7 +2529,7 @@ export function doRenderApp(): void {
 				${icon(PanelRightOpen, "sm")}
 			</button>
 		`}
-		<a
+		${tab.kind !== "preview" ? html`<a
 			href=${sidePanelPopoutUrl(tab)}
 			target="_blank"
 			rel="noopener noreferrer"
@@ -2345,7 +2537,7 @@ export function doRenderApp(): void {
 			style=${sidePanelChromeButtonStyle}
 			title="Open side panel in new tab"
 			data-testid="side-panel-popout"
-		>${icon(ExternalLink, "sm")}</a>
+		>${icon(ExternalLink, "sm")}</a>` : ""}
 		<button @click=${() => setSidePanelModeAndRender("collapsed")} class=${sidePanelChromeButtonClass} style=${sidePanelChromeButtonStyle} title=${`Collapse side panel${shortcutHint("toggle-preview")}`} data-testid="side-panel-collapse">
 			${icon(PanelRightClose, "sm")}
 		</button>

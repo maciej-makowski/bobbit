@@ -56,6 +56,8 @@ const config: KnipConfig = {
     // upstream (no source drift); revisit wiring on a future sync.
     'tests/e2e/e2e-coverage-teardown.ts',
     'tests/helpers/dom-stub.ts',
+    // Fork-only copy-link fallback dialog; not referenced in upstream.
+    'src/ui/dialogs/CopyLinkFallbackDialog.ts',
   ],
   ignoreDependencies: [
     'playwright', // runtime is pulled in transitively via @playwright/test

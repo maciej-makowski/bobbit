@@ -30,8 +30,8 @@ import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
-import { createWorktree, cleanupWorktree, shouldSkipRemotePush, createWorktreeSet, resolveBaseRef, type WorktreeResult } from "../skills/git.js";
-import { runComponentSetups } from "../skills/worktree-setup.js";
+import { createWorktree, cleanupWorktree, shouldSkipRemotePush, shouldSkipRemoteGitForTests, createWorktreeSet, resolveBaseRef, isUnresolvedHeadWorktreeError, type WorktreeResult } from "../skills/git.js";
+import { runComponentSetups, resolveSetupTimeoutMs } from "../skills/worktree-setup.js";
 import { cpuDiagnosticsEnabled, getCpuDiagnostics } from "./cpu-diagnostics.js";
 import { execShellCommand } from "./shell-util.js";
 import type { Component } from "./project-config-store.js";
@@ -273,6 +273,15 @@ export class WorktreePool {
 	 */
 	private baseRefResolver?: () => string | undefined;
 
+	/**
+	 * Live resolver for the project's `worktree_setup_timeout_ms` setting — called
+	 * fresh on every `_fill()` so the project default applies to per-component
+	 * setup during pool prebuild too (matching the per-goal setup path). Returns
+	 * a number, numeric string, or undefined; `resolveSetupTimeoutMs` validates
+	 * and falls back to the 120s default when unset/invalid.
+	 */
+	private setupTimeoutResolver?: () => number | string | undefined;
+
 	/** Project-level worktree_root override (sibling of <rootPath>-wt by default). */
 	private worktreeRoot?: string;
 
@@ -286,11 +295,12 @@ export class WorktreePool {
 	 * construction, `this.repoPath` is always the git root (or, when the
 	 * supplied path isn't a git working tree at all, the original input).
 	 */
-	constructor(opts: { repoPath: string; targetSize?: number; componentsResolver?: () => Component[]; baseRefResolver?: () => string | undefined; worktreeRoot?: string }) {
+	constructor(opts: { repoPath: string; targetSize?: number; componentsResolver?: () => Component[]; baseRefResolver?: () => string | undefined; setupTimeoutResolver?: () => number | string | undefined; worktreeRoot?: string }) {
 		this.repoPath = resolveRepoToplevel(opts.repoPath);
 		this.targetSize = opts.targetSize ?? 2;
 		this.componentsResolver = opts.componentsResolver;
 		this.baseRefResolver = opts.baseRefResolver;
+		this.setupTimeoutResolver = opts.setupTimeoutResolver;
 		this.worktreeRoot = opts.worktreeRoot;
 	}
 
@@ -570,7 +580,8 @@ export class WorktreePool {
 	 * Background freshen: fetch origin + reset --hard <base> + explicit branch push.
 	 * Resolves the base via `resolveBaseRef(repoPath, baseRefResolver())` so
 	 * pool entries adopt the project's currently-configured `base_ref` at the
-	 * moment they're freshened — no drain / no recorded-base needed.
+	 * moment they're freshened — no drain / no recorded-base needed. In offline
+	 * test modes, skips non-local remote work while still allowing local bare origins.
 	 * Errors are non-fatal and logged — the worktree is still usable.
 	 */
 	private freshenInBackground(worktreePath: string, branch: string): void {
@@ -587,16 +598,19 @@ export class WorktreePool {
 		const diagStart = diagEnabled ? performance.now() : 0;
 		const counters = diagEnabled ? { calls: 1, fetchResetErrors: 0, pushSkipped: 0, pushErrors: 0, success: 0 } : undefined;
 		try {
-			try {
-				await execGit(["fetch", "origin"], { cwd: worktreePath, timeout: 30_000 });
-				const configured = this.baseRefResolver?.();
-				const { ref: remotePrimary } = await resolveBaseRef(this.repoPath, configured);
-				await execGit(["reset", "--hard", remotePrimary], { cwd: worktreePath, timeout: 10_000 });
-			} catch (err) {
-				if (counters) counters.fetchResetErrors = 1;
-				console.warn(`[worktree-pool] Background reset failed for ${branch}:`, err instanceof Error ? err.message : err);
+			const skipRemoteGitForTests = await shouldSkipRemoteGitForTests(worktreePath, "origin");
+			if (!skipRemoteGitForTests) {
+				try {
+					await execGit(["fetch", "origin"], { cwd: worktreePath, timeout: 30_000 });
+					const configured = this.baseRefResolver?.();
+					const { ref: remotePrimary } = await resolveBaseRef(this.repoPath, configured);
+					await execGit(["reset", "--hard", remotePrimary], { cwd: worktreePath, timeout: 10_000 });
+				} catch (err) {
+					if (counters) counters.fetchResetErrors = 1;
+					console.warn(`[worktree-pool] Background reset failed for ${branch}:`, err instanceof Error ? err.message : err);
+				}
 			}
-			if (!shouldSkipRemotePush()) {
+			if (!skipRemoteGitForTests && !shouldSkipRemotePush()) {
 				try {
 					await execGit(["push", "origin", `${branch}:refs/heads/${branch}`], { cwd: worktreePath, timeout: 30_000 });
 					try {
@@ -734,6 +748,10 @@ export class WorktreePool {
 							worktreeRoot: this.worktreeRoot,
 							configuredBaseRef,
 						});
+						if (set.worktrees.length === 0) {
+							console.warn(`[worktree-pool] Skipping pre-build ${branchName}: no worktree-able repo with a resolved HEAD`);
+							break;
+						}
 						container = set.container;
 						entry = {
 							branchName,
@@ -768,14 +786,21 @@ export class WorktreePool {
 					const setupNames = components.filter(c => c.worktreeSetupCommand).map(c => c.name);
 					if (counters) counters.setupComponents += setupNames.length;
 					if (setupNames.length > 0) {
+						// Resolve the project default timeout fresh on every fill so a
+						// `worktree_setup_timeout_ms` config edit applies to component setup
+						// during pool prebuild too. No per-goal override exists at fill time
+						// (the pool entry isn't yet claimed by a goal), so only the project
+						// tier feeds the resolver here.
+						const setupTimeoutMs = resolveSetupTimeoutMs({ projectTimeoutMs: this.setupTimeoutResolver?.() });
 						console.log(`[worktree-pool] running setup for components: ${setupNames.join(", ")}`);
 						try {
 							await runComponentSetups({
 								components,
 								branchContainer: container,
 								primaryWorktreeRoot: this.repoPath,
+								timeoutMs: setupTimeoutMs,
 								exec: async (cmd, cwd, env) => {
-									await execShellCommand(cmd, { cwd, env, timeout: 120_000 });
+									await execShellCommand(cmd, { cwd, env, timeout: setupTimeoutMs });
 								},
 							});
 						} catch (err) {
@@ -788,7 +813,11 @@ export class WorktreePool {
 					console.log(`[worktree-pool] Ready${multi ? " (multi-repo)" : ""}: ${branchName} (pool: ${this.pool.length}/${this.targetSize})`);
 				} catch (err) {
 					if (counters) counters.failures++;
-					console.error(`[worktree-pool] Failed to pre-build ${branchName}:`, err);
+					if (isUnresolvedHeadWorktreeError(err)) {
+						console.warn(`[worktree-pool] Skipping pre-build ${branchName}: ${err.message}`);
+					} else {
+						console.error(`[worktree-pool] Failed to pre-build ${branchName}:`, err);
+					}
 					break;
 				}
 			}

@@ -29,6 +29,10 @@
  *                           bash_bg.wait toolCall in an assistant
  *                           message_end with NO `id` field, parks for
  *                           <ms> ms, then closes. No real bg process.
+ *  BG_WAIT_END_ONLY:<ms>    Emits one bash_bg.wait toolCall in an
+ *                           assistant message_end with no preceding
+ *                           message_update, then parks for <ms> ms.
+ *                           Reproduces the hidden-until-refresh card bug.
  *
  * Bursts
  * ------
@@ -118,6 +122,13 @@ export class MockAgentCore {
 		this.conversationMessages = [];
 		this.currentModel = { provider: "mock", id: "mock-model", contextWindow: 128000, maxTokens: 16384, reasoning: true };
 		this.sessionFilePath = null;
+		// When an AUTO_COMPACT turn has run, this holds the FULL on-disk
+		// transcript (orphaned pre-compaction entries + a compaction marker +
+		// the kept active-branch tail), each as a top-level `.jsonl` entry with
+		// a stable `id`. get_state writes THIS verbatim instead of re-deriving
+		// from conversationMessages so the orphan-history endpoint can split the
+		// transcript at firstKeptEntryId. Null until a compaction fires.
+		this._postCompactionEntries = null;
 		this.currentAbortController = null;
 		// Serializes concurrent handlePrompt calls so a second prompt queued
 		// while the first is still in flight runs after the first completes.
@@ -301,7 +312,7 @@ export class MockAgentCore {
 		if (text.includes("GOAL_PROPOSAL_PARITY_EDIT")) {
 			return {
 				tool: "propose_goal",
-				input: { title: "Parity Goal A — edited", spec: "Body B." },
+				input: { title: "Parity Goal A — edited", workflow: "general", spec: "Body B." },
 				output: "Goal proposal partial submitted.",
 			};
 		}
@@ -419,6 +430,43 @@ export class MockAgentCore {
 			};
 		}
 
+		// Goal proposal carrying a parentGoalId (a child-goal proposal) — used by
+		// subgoals-experimental-toggle.spec.ts to assert the Sub-goals tab is a
+		// pure function of the system flag and does NOT appear merely because the
+		// proposal has a parent. Must precede the generic goal_proposal matcher
+		// (it contains the "GOAL_PROPOSAL" substring).
+		if (text.includes("GOAL_PROPOSAL_WITH_PARENT")) {
+			return {
+				tool: "propose_goal",
+				input: {
+					title: "Child Goal",
+					workflow: "general",
+					spec: "A child-goal proposal seeded with a parentGoalId.",
+					parentGoalId: "some-parent-id",
+				},
+				output: "Proposal submitted. Waiting for user response.",
+			};
+		}
+
+		// Goal proposal carrying the per-goal worktree-setup fields — used by
+		// goal-worktree-setup-command.spec.ts to assert a propose_goal-seeded
+		// proposal mirrors worktreeSetupCommand / worktreeSetupTimeoutMs into the
+		// goal form and preserves them through acceptance. Must precede the generic
+		// goal_proposal matcher (it contains the "GOAL_PROPOSAL" substring).
+		if (text.includes("GOAL_PROPOSAL_WORKTREE_SETUP")) {
+			return {
+				tool: "propose_goal",
+				input: {
+					title: "E2E Test Goal",
+					workflow: "general",
+					spec: "A goal whose worktree-setup fields are seeded by the agent.",
+					worktreeSetupCommand: "./scripts/agent-seed.sh",
+					worktreeSetupTimeoutMs: 45000,
+				},
+				output: "Proposal submitted. Waiting for user response.",
+			};
+		}
+
 		if (lower.includes("goal_proposal") || lower.includes("goal proposal")) {
 			return {
 				tool: "propose_goal",
@@ -453,6 +501,14 @@ export class MockAgentCore {
 					input: { title: d.title, markdown: d.markdown },
 					output: JSON.stringify({ action: "review_open", title: d.title, markdown: d.markdown, replace: true }),
 				})),
+			};
+		}
+		if (lower.includes("review_open_revised")) {
+			const md = "# Test Document\n\nRevised review document after rejection.\n\n## Revised Section\n\nRevised markdown after rejected feedback should reopen the review pane.";
+			return {
+				tool: "review_open",
+				input: { title: "Test Document", markdown: md },
+				output: JSON.stringify({ action: "review_open", title: "Test Document", markdown: md, replace: true }),
 			};
 		}
 		if (lower.includes("review_open")) {
@@ -733,6 +789,28 @@ export class MockAgentCore {
 			return;
 		}
 
+		// AUTO_COMPACT:<preCount> — drive a LIVE auto/threshold compaction.
+		// Emits auto_compaction_start, persists a `.jsonl` with top-level ids
+		// (preCount orphaned entries + a compaction marker + a kept tail), then
+		// emits auto_compaction_end carrying result.firstKeptEntryId. The server
+		// (session-manager) appends the compaction sidecar from the event result
+		// and triggers refreshAfterCompaction; the orphan-history endpoint then
+		// computes the pre-compaction count from the sidecar + on-disk ids.
+		// Reproduces the live-session affordance bug (no compactionId on the
+		// in-flight `compact_active` card + a duplicate spliced sidecar card).
+		const autoCompactMatch = text.match(/AUTO_COMPACT:(\d+)/);
+		if (autoCompactMatch) {
+			await this._handleAutoCompaction(parseInt(autoCompactMatch[1], 10));
+			if (!this.currentAbortController || this.currentAbortController.signal.aborted) {
+				this.currentAbortController = null;
+				return;
+			}
+			this.currentAbortController = null;
+			this.emit({ type: "agent_end" });
+			this.emit({ type: "session_status", status: "idle" });
+			return;
+		}
+
 		// BG_WAIT_NOID:<ms> — emit an assistant message_end with a single
 		// bash_bg.wait toolCall block AND no `id` field on the message itself,
 		// mimicking the real LLM stream that triggers the dual-render bug.
@@ -772,6 +850,38 @@ export class MockAgentCore {
 			this.emit({ type: "message_end", message: assistantMsg });
 			// Park here — no further events until waitMs elapses, mirroring a real
 			// `bash_bg.wait` that sits indefinitely.
+			await this.tick(waitMs);
+			if (!this.currentAbortController || this.currentAbortController.signal.aborted) {
+				this.currentAbortController = null;
+				return;
+			}
+			this.emit({ type: "tool_execution_end", toolCallId: toolId, toolName: "bash_bg", isError: false });
+			this.currentAbortController = null;
+			this.emit({ type: "agent_end" });
+			this.emit({ type: "session_status", status: "idle" });
+			return;
+		}
+
+		// BG_WAIT_END_ONLY:<ms> — emit an assistant message_end with a
+		// bash_bg.wait toolCall but no preceding message_update. This reproduces
+		// the live UI hole where RemoteAgent hides the finalized row via
+		// streamingMessageId, but the streaming container has no message to own
+		// until a later refresh/snapshot/agent_end clears the transient id.
+		const bgWaitEndOnlyMatch = text.match(/BG_WAIT_END_ONLY:(\d+)/);
+		if (bgWaitEndOnlyMatch) {
+			const waitMs = parseInt(bgWaitEndOnlyMatch[1], 10);
+			const toolId = "tc-bg-wait-end-only-1";
+			const assistantMsg = {
+				id: "msg-bg-wait-end-only-1",
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: toolId, name: "bash_bg", arguments: { action: "wait", id: "bg-end-only-1" }, input: { action: "wait", id: "bg-end-only-1" } },
+				],
+			};
+			this.conversationMessages.push(assistantMsg);
+			this.emit({ type: "message_end", message: assistantMsg });
+			// Park here — no further events until waitMs elapses, mirroring a real
+			// `bash_bg.wait` that remains pending long enough for live UI assertions.
 			await this.tick(waitMs);
 			if (!this.currentAbortController || this.currentAbortController.signal.aborted) {
 				this.currentAbortController = null;
@@ -934,6 +1044,78 @@ export class MockAgentCore {
 
 		this.emit({ type: "agent_end" });
 		this.emit({ type: "session_status", status: "idle" });
+	}
+
+	/**
+	 * Drive a live auto/threshold compaction (AUTO_COMPACT:<preCount> trigger).
+	 *
+	 * Builds a faithful post-compaction on-disk transcript: `preCount` orphaned
+	 * message entries, a `type:"compaction"` marker, then a single kept
+	 * active-branch entry whose id is the boundary (`kept-0`). Each entry carries
+	 * a top-level `id` so the orphan-history reader can split the file at
+	 * firstKeptEntryId. getMessages() returns ONLY the kept tail (mirroring the
+	 * real agent's active-branch view); the orphans live solely in the `.jsonl`.
+	 *
+	 * Emits auto_compaction_start → (tick) → auto_compaction_end with
+	 * result.firstKeptEntryId so the server appends the sidecar and refreshes.
+	 */
+	async _handleAutoCompaction(preCount) {
+		const sf = this.ensureSessionFile();
+		const ts = new Date().toISOString();
+		const firstKeptEntryId = "kept-0";
+		const tokensBefore = 50_000;
+		const entries = [];
+		for (let i = 0; i < preCount; i++) {
+			entries.push({
+				type: "message",
+				id: `pre-${i}`,
+				parentId: null,
+				timestamp: ts,
+				ts,
+				message: {
+					role: i % 2 === 0 ? "user" : "assistant",
+					content: [{ type: "text", text: `pre-msg-${i}` }],
+				},
+			});
+		}
+		// Legacy-fallback boundary marker (the orphan reader skips non-message
+		// entries when counting, so this never inflates the orphan total).
+		entries.push({
+			type: "compaction",
+			id: "compaction-marker",
+			parentId: null,
+			timestamp: ts,
+			summary: "",
+			firstKeptEntryId,
+			tokensBefore,
+		});
+		// Kept active-branch tail. Text deliberately avoids the "Context
+		// compacted" prefix so it is NOT mistaken for a legacy text-marker by
+		// the client reducer's compaction dedup.
+		const keptMsg = { role: "assistant", content: [{ type: "text", text: "Resuming work after the summary." }] };
+		entries.push({
+			type: "message",
+			id: firstKeptEntryId,
+			parentId: null,
+			timestamp: ts,
+			ts,
+			message: keptMsg,
+		});
+		// Persist the full transcript (with ids) and pin it so get_state keeps it.
+		this._postCompactionEntries = entries;
+		fs.writeFileSync(sf, entries.map(e => JSON.stringify(e)).join("\n") + "\n");
+		// getMessages() returns only the active branch post-compaction.
+		this.conversationMessages = [{ id: firstKeptEntryId, ...keptMsg }];
+
+		// Lifecycle: start → settle (let the client render the in-flight card) → end.
+		this.emit({ type: "auto_compaction_start", reason: "threshold" });
+		await this.tick(150);
+		if (!this.currentAbortController || this.currentAbortController.signal.aborted) return;
+		this.emit({
+			type: "auto_compaction_end",
+			reason: "threshold",
+			result: { tokensBefore, firstKeptEntryId },
+		});
 	}
 
 	/**
@@ -2234,8 +2416,16 @@ export class MockAgentCore {
 
 			case "get_state": {
 				const sf = this.ensureSessionFile();
-				const lines = this.conversationMessages.map(m => JSON.stringify({ type: "message", message: m }));
-				fs.writeFileSync(sf, lines.join("\n") + (lines.length ? "\n" : ""));
+				// After an AUTO_COMPACT turn, preserve the full on-disk transcript
+				// (orphans + compaction marker + kept tail) WITH top-level ids so a
+				// post-compaction get_state (e.g. refreshAfterCompaction) does not
+				// clobber the ids the orphan-history endpoint splits on.
+				if (Array.isArray(this._postCompactionEntries)) {
+					fs.writeFileSync(sf, this._postCompactionEntries.map(e => JSON.stringify(e)).join("\n") + "\n");
+				} else {
+					const lines = this.conversationMessages.map(m => JSON.stringify({ type: "message", message: m }));
+					fs.writeFileSync(sf, lines.join("\n") + (lines.length ? "\n" : ""));
+				}
 				return {
 					success: true,
 					data: {
@@ -2272,6 +2462,8 @@ export class MockAgentCore {
 				// forked/continued sessions would open empty in the E2E tier (the
 				// real CLI loads it; the mock previously no-op'd here). The file is
 				// written by `get_state` as newline-delimited {type:"message",message}.
+				// The real CLI also validates runtime cwd metadata before accepting the
+				// transcript; stale archived worktree paths must fail here.
 				try {
 					const sp = msg.sessionPath;
 					if (sp && fs.existsSync(sp)) {
@@ -2281,6 +2473,9 @@ export class MockAgentCore {
 							if (!trimmed) continue;
 							try {
 								const parsed = JSON.parse(trimmed);
+								if (parsed && (parsed.type === "system" || parsed.type === "session") && typeof parsed.cwd === "string" && !fs.existsSync(parsed.cwd)) {
+									return { success: false, error: `Stored session working directory does not exist: ${parsed.cwd}` };
+								}
 								if (parsed && parsed.type === "message" && parsed.message) loaded.push(parsed.message);
 							} catch { /* skip malformed line */ }
 						}

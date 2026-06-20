@@ -16,7 +16,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
 	RouteDispatcher,
@@ -26,6 +25,7 @@ import {
 import { ActionError } from "../src/server/extension-host/action-dispatcher.ts";
 import type { PackContributions } from "../src/server/agent/pack-contributions.ts";
 import type { PackContributionResolver } from "../src/server/extension-host/pack-contribution-registry.ts";
+import { makeTmpDir } from "./helpers/tmp.ts";
 
 let tmp: string;
 
@@ -45,7 +45,7 @@ function writeRoutesModule(root: string, packName: string, rel: string, src: str
 	return { modulePath: abs, packRoot };
 }
 
-before(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ext-host-route-")); });
+before(() => { tmp = makeTmpDir("ext-host-route-"); });
 after(() => { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ } });
 
 describe("RouteDispatcher — resolution + happy path (pack-level module)", () => {
@@ -136,6 +136,7 @@ function contribResolver(packs: PackContributions[]): PackContributionResolver {
 		getPack: (_pid, packId) => byId.get(packId),
 		getPanel: (_pid, packId, panelId) => byId.get(packId)?.panels.find((p) => p.id === panelId),
 		getEntrypoint: (_pid, packId, id) => byId.get(packId)?.entrypoints.find((e) => e.id === id),
+		listProviders: () => packs.flatMap((p) => p.providers),
 		hasRoute: (_pid, packId, name) => !!byId.get(packId)?.routes?.names.includes(name),
 	};
 }
@@ -143,7 +144,7 @@ function contribResolver(packs: PackContributions[]): PackContributionResolver {
 function packWithRoutes(packId: string, packRoot: string, module: string, names: string[]): PackContributions {
 	return {
 		packId, packName: packId, packRoot,
-		panels: [], entrypoints: [],
+		panels: [], entrypoints: [], providers: [],
 		routes: { module, names, sourceFile: path.join(packRoot, "pack.yaml"), packRoot },
 	};
 }
@@ -180,7 +181,7 @@ describe("RouteRegistry — pack-level resolution + allowlist + namespacing", ()
 	it("a pack with no routes ref → undefined; empty/unknown packId → undefined", () => {
 		const packRoot = path.join(tmp, "noroutes", "market-packs", "mypack");
 		const reg = new RouteRegistry(contribResolver([
-			{ packId: "mypack", packName: "mypack", packRoot, panels: [], entrypoints: [] },
+			{ packId: "mypack", packName: "mypack", packRoot, panels: [], entrypoints: [], providers: [] },
 		]));
 		assert.equal(reg.resolve("mypack", "bundle", undefined), undefined);
 		assert.equal(reg.resolve("", "bundle", undefined), undefined);
