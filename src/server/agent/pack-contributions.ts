@@ -38,7 +38,18 @@ const PANEL_ID_RE = /^[a-z0-9][a-z0-9_.-]*$/i;
 const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9_.-]*$/i;
 const ROUTE_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const PROVIDER_KINDS = new Set(["memory", "selector", "generic"]);
-const PROVIDER_HOOKS = new Set(["sessionSetup", "beforePrompt", "afterTurn", "beforeCompact", "sessionShutdown"]);
+const PROVIDER_HOOKS = new Set([
+	"sessionSetup",
+	"beforePrompt",
+	"afterTurn",
+	"beforeCompact",
+	"sessionShutdown",
+	// Goal-lifecycle hook (hierarchical goal metadata): fired once per worktree
+	// provisioning in a goal's subtree with the resolved goal metadata. Lets a
+	// provider apply per-goal filesystem treatments (content-addressed marker/
+	// cache) without per-turn cost. See docs/design/goal-metadata.md.
+	"goalProvisioned",
+]);
 
 /** A hard pack-contribution conflict (§5.4). Throwing aborts the pack's load so
  *  the registry can surface a loud error instead of silently registering an
@@ -68,7 +79,7 @@ export interface PanelContribution {
 /** A pack-scoped entrypoint (entrypoints/<file>.yaml). */
 export interface EntrypointContribution {
 	id: string; // unique within the pack
-	kind: "composer-slash" | "git-widget-button" | "command-palette" | "route";
+	kind: "composer-slash" | "session-menu" | "route";
 	label?: string; // required for launcher kinds
 	routeId?: string; // required for kind:"route"; host-global
 	target?: { action?: string; panelId?: string; route?: string; params?: Record<string, unknown> };
