@@ -11,7 +11,7 @@
 
 import { readFileSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import WebSocket from "ws";
 
@@ -188,13 +188,18 @@ function token(): string {
 }
 
 /**
- * Routes where POST must carry a registered projectId (or a cwd matching one).
+ * Collection-create routes where POST must carry a registered projectId (or a
+ * cwd matching one). Session subroutes such as `/api/sessions/:id/fork` and
+ * `/continue` derive project scope from the source session; injecting the
+ * harness default into those bodies can leak stale default-project config into
+ * cross-project worktree tests.
+ *
  * The E2E harness registers a "default" project at startup; tests that omit
  * projectId get it injected automatically so they don't need to know about
  * the underlying server requirement. Tests that deliberately exercise the
  * 400-path bypass this helper by calling `fetch(...)` directly.
  */
-const PROJECT_INJECT_ROUTES = /^\/api\/(sessions|goals|staff)(\?|$|\/)/;
+const PROJECT_INJECT_ROUTES = /^\/api\/(sessions|goals|staff)(\?|$)/;
 
 /**
  * Routes where workflow mutations need projectId. Workflows are now project-scoped
@@ -228,7 +233,7 @@ export async function injectDefaultProjectId(body: unknown): Promise<unknown> {
 	if (typeof parsed.projectId === "string" && parsed.projectId) {
 		return typeof body === "string" ? body : JSON.stringify(parsed);
 	}
-	const pid = await defaultProjectId();
+	const pid = (await projectIdForRequestCwd(parsed.cwd)) ?? (await defaultProjectId());
 	if (!pid) return typeof body === "string" ? body : JSON.stringify(parsed);
 	return JSON.stringify({ ...parsed, projectId: pid });
 }
@@ -426,23 +431,29 @@ async function maybeAutoSeedWorkflows(path: string, method: string, requestBody:
 
 /**
  * The OPERATOR-class Children REST endpoints guarded by the S1 authz check
- * (`src/server/auth/children-mutation-authz.ts`): `pause`, `resume`, and
- * mutation `decision`. These are the human-in-the-loop verbs the web UI
- * drives, so a verified `bobbit_session` cookie authorizes them. A node
- * `apiFetch` carries no cookie, so without one these would 403; we therefore
- * auto-inject the gateway-minted cookie. (Browser-initiated requests carry the
- * cookie automatically and don't need this.) Tests that deliberately exercise
- * the agent/deny path use `rawApiFetch` with explicit headers.
+ * (`src/server/auth/children-mutation-authz.ts`): `pause`, `resume`,
+ * mutation `decision`, and `policy` (only when the PATCH body carries
+ * EXCLUSIVELY the per-goal sub-goal opt-in fields `subgoalsAllowed` /
+ * `maxNestingDepth` — see the split classifier in `nested-goal-routes.ts`).
+ * These are the human-in-the-loop verbs the web UI drives, so a verified
+ * `bobbit_session` cookie authorizes them. A node `apiFetch` carries no cookie,
+ * so without one these would 403; we therefore auto-inject the gateway-minted
+ * cookie. (Browser-initiated requests carry the cookie automatically and don't
+ * need this.) Tests that deliberately exercise the agent/deny path use
+ * `rawApiFetch` with explicit headers.
  *
  * NOTE: the ORCHESTRATION-class verbs (`spawn-child`, plan `PATCH`,
- * `integrate-child`, `policy`) are NOT in this set. The cookie does NOT bypass
- * an orchestration check (it is mintable by any holder of the shared admin
- * token), so auto-injecting it would not authorize them. Tests that drive
- * orchestration must authenticate as the goal's team-lead — see
- * `seedTeamLeadHeader()` below.
+ * `integrate-child`, and `policy` carrying `divergencePolicy` /
+ * `maxConcurrentChildren`) still require the team-lead secret. The cookie does
+ * NOT bypass an orchestration check (it is mintable by any holder of the shared
+ * admin token), so auto-injecting it would not authorize them — it is merely
+ * harmless. Tests that drive orchestration must authenticate as the goal's
+ * team-lead — see `seedTeamLeadHeader()` below. We include `policy` in the
+ * auto-inject set because the common (subgoal-only) case is operator-class;
+ * orchestration-class policy patches still need the secret regardless.
  */
 const CHILDREN_MUTATION_PATH =
-	/^\/api\/goals\/[^/]+\/(pause|resume|mutation\/[^/]+\/decision)$/;
+	/^\/api\/goals\/[^/]+\/(pause|resume|policy|mutation\/[^/]+\/decision)$/;
 
 /**
  * Authorize an ORCHESTRATION-class Children mutation (`spawn-child`, plan
@@ -723,6 +734,45 @@ function formatLiveProjectState(state: LiveProjectState): string {
 		return safeJson({ ok: false, status: state.status, body: state.body, error: state.error });
 	}
 	return safeJson({ ok: true, status: state.status, rawKind: state.rawKind, projects: state.projects });
+}
+
+function canonicalPathForMatch(p: string): string {
+	try { return realpathSync(p); } catch { return resolve(p); }
+}
+
+function pathContains(parent: string, child: string): boolean {
+	const rel = relative(parent, child);
+	return rel === "" || (!!rel && !rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function findProjectIdForCwd(state: LiveProjectState, cwdValue: string): string | undefined {
+	if (!state.ok) return undefined;
+	const cwd = canonicalPathForMatch(cwdValue);
+	let best: { id: string; root: string } | undefined;
+	for (const project of state.projects) {
+		if (project.hidden || !project.id || !project.rootPath) continue;
+		const root = canonicalPathForMatch(project.rootPath);
+		if (!pathContains(root, cwd)) continue;
+		if (!best || root.length > best.root.length) best = { id: project.id, root };
+	}
+	return best?.id;
+}
+
+async function projectIdForRequestCwd(cwdValue: unknown): Promise<string | undefined> {
+	if (typeof cwdValue !== "string" || !cwdValue.trim()) return undefined;
+	// Project registration and immediate session creation happen back-to-back in
+	// several E2E specs. Under broad-suite contention, the first list request can
+	// occasionally race the just-registered project becoming visible to this
+	// helper; retry briefly before falling back to the harness default project.
+	// Without this, worktree creation can incorrectly use default-project config
+	// such as a deliberately stale `base_ref` from another test.
+	for (let attempt = 0; attempt < 5; attempt++) {
+		const state = await readLiveProjectState();
+		const match = findProjectIdForCwd(state, cwdValue);
+		if (match) return match;
+		if (attempt < 4) await new Promise(r => setTimeout(r, 25));
+	}
+	return undefined;
 }
 
 async function seedHarnessDefaultProjectWorkflows(projectId: string, reason: string): Promise<void> {

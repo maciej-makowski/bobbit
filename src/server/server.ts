@@ -46,11 +46,12 @@ import { ActionDispatcher, ActionError, resolveActionToolManager } from "./exten
 import { RouteDispatcher, RouteRegistry } from "./extension-host/route-dispatcher.js";
 import { ModuleHost } from "./extension-host/module-host-worker.js";
 import { authorizeActionRequest, authorizeScopedRequest, transcriptHasToolUse, type ActionGuardSession } from "./extension-host/action-guard.js";
-import { getPackStore, withStoreTimeout, PackStoreTimeoutError } from "./extension-host/pack-store.js";
+import { getPackStore, withStoreTimeout, PackStoreTimeoutError, PackStoreQuotaError } from "./extension-host/pack-store.js";
 import { createServerHostApi } from "./extension-host/server-host-api.js";
 import { transcriptToHostMessages, transcriptToToolCall, buildTranscriptEnvelope } from "./extension-host/contract-adapter.js";
 import { resolvePackIdentityForTool } from "./extension-host/pack-identity.js";
 import { mintSurfaceToken, resolveSurfaceIdentity } from "./extension-host/surface-binding.js";
+import type { StorePutOptions } from "../shared/extension-host/host-api.js";
 import { PackContributionRegistry } from "./extension-host/pack-contribution-registry.js";
 import { loadPackContributions, providerConfigStoreKey, PROVIDER_CONFIG_KEY_PREFIX } from "./agent/pack-contributions.js";
 import { LifecycleHub, type HookCtx } from "./agent/lifecycle-hub.js";
@@ -59,6 +60,14 @@ import { fenceBlock } from "./agent/context-blocks.js";
 import { isPackPathWithinRoot } from "./extension-host/path-guard.js";
 import { buildGateStatusSummary } from "./gate-status-summary.js";
 import { buildGateVerificationSnapshot, UnknownVerificationStepError } from "./gate-verification-snapshot.js";
+import {
+	GateArtifactResolutionError,
+	buildArtifactLookup,
+	isTextInspectableArtifact,
+	resolveArtifactFromLookup,
+	stripPlaywrightErrorContextBoilerplate,
+	validateRetainedArtifactPath,
+} from "./gate-artifacts.js";
 import { handleSidePanelWorkspaceRoute, openSidePanelWorkspaceTab } from "./side-panel-workspace-routes.js";
 import {
 	TextSelectionError,
@@ -294,6 +303,7 @@ import { handlePrWalkthroughApiRoute } from "./pr-walkthrough/routes.js";
 import { normalizeTrustedHosts } from "../shared/pr-walkthrough/url-safety.js";
 import { progressBus as searchProgressBus } from "./search/progress-bus.js";
 import { isSandboxAllowed } from "./auth/sandbox-guard.js";
+import { getGoogleAccessToken, ensureCodeAssistProject, hasGoogleCodeAssistCredential } from "./agent/google-code-assist.js";
 import * as previewMount from "./preview/mount.js";
 import * as previewArtifacts from "./preview/artifacts.js";
 import { broadcastPreviewChanged, subscribePreviewChanged } from "./preview/events.js";
@@ -1229,6 +1239,29 @@ export function createGateway(config: GatewayConfig) {
 	// roots (server < global-user < project) — applied to existing + future ctxs.
 	projectContextManager.setContextConfigurator((ctx) => {
 		ctx.toolManager.setMarketToolRootsProvider(() => marketToolRoots(ctx.project.id));
+		// Goal-metadata lifecycle wiring: connect this project's GoalManager to the
+		// shared LifecycleHub `goalProvisioned` dispatcher so every worktree
+		// provisioning in the goal subtree fans out to extension providers with the
+		// resolved (hierarchically inherited) metadata. Feature-detected on BOTH
+		// ends — the setter is contributed by the goal-metadata data/provisioning
+		// slice and `dispatchGoalProvisioned` by the lifecycle slice — so this is a
+		// no-op until those land, then activates automatically. The hub is read
+		// lazily (it is constructed after this configurator is registered).
+		const gm = ctx.goalManager as unknown as {
+			setGoalProvisionedDispatcher?: (
+				fn: (dctx: { goalId: string; projectId?: string; worktreePath: string; cwd: string; branch?: string; metadata: Record<string, unknown> }) => Promise<void>,
+			) => void;
+		};
+		if (typeof gm.setGoalProvisionedDispatcher === "function") {
+			gm.setGoalProvisionedDispatcher(async (dctx) => {
+				const hub = sessionManager.lifecycleHub as unknown as {
+					dispatchGoalProvisioned?: (c: typeof dctx) => Promise<void>;
+				} | undefined;
+				if (hub && typeof hub.dispatchGoalProvisioned === "function") {
+					await hub.dispatchGoalProvisioned(dctx);
+				}
+			});
+		}
 	});
 
 	// pack-schema-v1 §6.7: resolve the pack_activation store for a scope+project.
@@ -1291,6 +1324,20 @@ export function createGateway(config: GatewayConfig) {
 		registry: packContributionRegistry,
 		moduleHost,
 		trace: new ContextTraceStore(bobbitStateDir()),
+		// Hierarchical goal-metadata resolver. The hub is shared across projects
+		// while each GoalStore is per ProjectContext, so route STRICTLY by goalId
+		// (never the caller-supplied projectId, which may be stale/cross-project).
+		// Resolves to {} for missing/unknown goals so provider/bridge filtering is
+		// a guaranteed no-op when metadata is absent.
+		goalMetadataResolver: (goalId: string | undefined, _projectId?: string): Record<string, unknown> => {
+			if (!goalId) return {};
+			const ctx = projectContextManager.getContextForGoal(goalId);
+			if (!ctx) {
+				console.warn(`[goal-metadata] no project context owns goal ${goalId}; resolving to {}`);
+				return {};
+			}
+			return ctx.goalManager.getEffectiveGoalMetadata(goalId);
+		},
 		// Least-privilege, store-only host for provider hooks (capabilities.store ===
 		// true; session/agents denied) — gives a provider its own pack-scoped durable
 		// store via the same parent-authorized path routes use.
@@ -4385,7 +4432,11 @@ async function handleApiRoute(
 			projectId,
 			scope: projectId ? "project" : "global",
 			cwd: live?.cwd ?? persisted?.cwd ?? process.cwd(),
-			goalId: live?.goalId ?? persisted?.goalId,
+			// Effective goal: team members, delegates, and reviewers carry the goal
+			// only in teamGoalId, so fall back to it before persisted state. Without
+			// this, disabled-provider filtering would not apply at the provider hook
+			// endpoints (beforePrompt / beforeCompact) for non-lead sessions.
+			goalId: live?.goalId ?? live?.teamGoalId ?? persisted?.goalId ?? persisted?.teamGoalId,
 			roleName: live?.role ?? persisted?.role,
 		};
 	};
@@ -5141,19 +5192,20 @@ async function handleApiRoute(
 		try {
 			const sandboxed = body.sandboxed === true;
 			const autoStartTeam = body.autoStartTeam !== false; // default true
-			// Per-goal worktree setup hook (optional). Accept camelCase or snake_case.
-			// Command: trimmed, passed only when non-empty. Timeout: number or numeric
-			// string, passed only when a finite positive integer.
-			let worktreeSetupCommand: string | undefined;
+			// Per-goal metadata (optional, arbitrary namespaced key/value bag, e.g.
+			// `bobbit.disabledTools`, `hindsight.memory.enabled`). Accepted only as a
+			// NON-EMPTY plain object; passed verbatim to createGoal where it is
+			// persisted and resolved hierarchically down the goal tree. Supersedes the
+			// removed per-goal worktree-setup hook (PR #816); legacy
+			// `worktreeSetupCommand`/`worktreeSetupTimeoutMs` body fields are now
+			// ignored (no parse, no persistence). Component-level
+			// `worktree_setup_command` is unaffected.
+			let metadata: Record<string, unknown> | undefined;
 			{
-				const raw = body.worktreeSetupCommand ?? body.worktree_setup_command;
-				if (typeof raw === "string" && raw.trim()) worktreeSetupCommand = raw.trim();
-			}
-			let worktreeSetupTimeoutMs: number | undefined;
-			{
-				const raw = body.worktreeSetupTimeoutMs ?? body.worktree_setup_timeout_ms;
-				const n = typeof raw === "number" ? raw : (typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN);
-				if (Number.isFinite(n) && n > 0) worktreeSetupTimeoutMs = Math.floor(n);
+				const raw = body.metadata;
+				if (raw && typeof raw === "object" && !Array.isArray(raw) && Object.keys(raw as object).length > 0) {
+					metadata = raw as Record<string, unknown>;
+				}
 			}
 			let enabledOptionalSteps: string[] | undefined;
 			if (Array.isArray(body.enabledOptionalSteps) && body.enabledOptionalSteps.every((s: unknown) => typeof s === "string")) {
@@ -5268,6 +5320,13 @@ async function handleApiRoute(
 						json({ error: "Subgoals are disabled", code: "SUBGOALS_DISABLED" }, 422);
 						return;
 					}
+					if (nestResult.code === "PARENT_SUBGOALS_DISABLED") {
+						json({
+							error: `Parent goal "${resolvedParentGoal.title}" doesn't allow sub-goals`,
+							code: "PARENT_SUBGOALS_DISABLED",
+						}, 422);
+						return;
+					}
 					if (nestResult.code === "NESTING_DEPTH_EXCEEDED") {
 						json({
 							error: `Nesting depth cap reached: ${nestResult.currentDepth} / ${nestResult.maxDepth}`,
@@ -5335,7 +5394,11 @@ async function handleApiRoute(
 			// the single source of truth.
 			const nestingPrefs = readSubgoalNestingPrefs((k) => preferencesStore.get(k));
 			const inheritedNesting = (parentGoalId && resolvedParentGoal)
-				? inheritedChildOverrides(resolvedParentGoal, nestingPrefs)
+				? inheritedChildOverrides(
+					resolvedParentGoal,
+					nestingPrefs,
+					(id) => targetGoalManager.getGoal(id) ?? getGoalAcrossProjects(id),
+				)
 				: undefined;
 			const ceilSubgoalsAllowed = inheritedNesting
 				? inheritedNesting.subgoalsAllowed
@@ -5385,8 +5448,7 @@ async function handleApiRoute(
 				maxNestingDepth: effMaxNestingDepth,
 				divergencePolicy: effDivergencePolicy,
 				maxConcurrentChildren: effMaxConcurrentChildren,
-				worktreeSetupCommand,
-				worktreeSetupTimeoutMs,
+				metadata,
 			});
 			// Set projectId (explicit or auto-detected from cwd)
 			if (targetProjectId) {
@@ -6200,8 +6262,8 @@ async function handleApiRoute(
 	const storeMatch = url.pathname.match(/^\/api\/ext\/store\/([^/]+)$/);
 	if (storeMatch && req.method === "POST") {
 		const op = decodeURIComponent(storeMatch[1]);
-		if (op !== "get" && op !== "put" && op !== "list") {
-			json({ error: `Unknown store op "${op}"` }, 404);
+		if (op !== "get" && op !== "put" && op !== "list" && op !== "delete" && op !== "deletePrefix" && op !== "stats") {
+			json({ error: `Unknown store op "${op}"`, code: "STORE_OP_UNKNOWN" }, 404);
 			return;
 		}
 		const body = (await readBody(req)) ?? {};
@@ -6257,10 +6319,16 @@ async function handleApiRoute(
 			if (op === "get") {
 				result = await withStoreTimeout(packStore.get(ident.packId, key as string), undefined, `store ${op}`);
 			} else if (op === "put") {
-				await withStoreTimeout(packStore.put(ident.packId, key as string, (body as { value?: unknown }).value), undefined, `store ${op}`);
+				await withStoreTimeout(packStore.put(ident.packId, key as string, (body as { value?: unknown }).value, (body as { opts?: StorePutOptions }).opts), undefined, `store ${op}`);
 				// Host-owned: a direct provider-config write must drop activation caches too.
 				notePackStoreWrite(key);
 				result = { ok: true };
+			} else if (op === "delete") {
+				result = await withStoreTimeout(packStore.delete(ident.packId, key as string), undefined, `store ${op}`);
+			} else if (op === "deletePrefix") {
+				result = await withStoreTimeout(packStore.deletePrefix(ident.packId, prefix as string), undefined, `store ${op}`);
+			} else if (op === "stats") {
+				result = await withStoreTimeout(packStore.stats(ident.packId, typeof prefix === "string" ? prefix : undefined), undefined, `store ${op}`);
 			} else {
 				result = await withStoreTimeout(packStore.list(ident.packId, typeof prefix === "string" ? prefix : undefined), undefined, `store ${op}`);
 			}
@@ -6271,8 +6339,12 @@ async function handleApiRoute(
 			// A timed-out store op is a 5xx (backend unavailable); other errors (quota,
 			// bad input) stay 4xx.
 			const status = err instanceof PackStoreTimeoutError ? 504 : 400;
+			const code = err instanceof PackStoreTimeoutError
+				? "STORE_TIMEOUT"
+				: err instanceof PackStoreQuotaError ? err.code : "STORE_ERROR";
+			const details = err instanceof PackStoreQuotaError ? err.details : undefined;
 			console.warn(`[ext-store] op=${op} tool=${tool} packId=${ident.packId} session=${guard.sessionId} outcome=error(${status}) durationMs=${Date.now() - start}: ${message}`);
-			json({ error: message }, status);
+			json({ error: message, code, ...(details ? { details } : {}) }, status);
 		}
 		return;
 	}
@@ -7001,7 +7073,7 @@ async function handleApiRoute(
 			projectBase: string | undefined,
 			store: PackOrderStore,
 			packName: string,
-		): { roles: string[]; tools: string[]; skills: string[]; entrypoints: Array<{ listName: string; label?: string; kind?: "composer-slash" | "git-widget-button" | "command-palette" | "route"; routeId?: string }>; providers?: string[]; hooks?: string[]; mcp?: string[]; piExtensions?: string[]; runtimes?: string[]; workflows?: string[]; descriptions: PackEntityDescriptions } | null => {
+		): { roles: string[]; tools: string[]; skills: string[]; entrypoints: Array<{ listName: string; label?: string; kind?: "composer-slash" | "session-menu" | "route"; routeId?: string }>; providers?: string[]; hooks?: string[]; mcp?: string[]; piExtensions?: string[]; runtimes?: string[]; workflows?: string[]; descriptions: PackEntityDescriptions } | null => {
 			const base = scope === "server" ? getProjectRoot() : scope === "global-user" ? os.homedir() : projectBase;
 			if (base === undefined) return null;
 			const entries = scopeMarketPackEntries(scope as PackScope, base, store.getPackOrder(scope));
@@ -7020,10 +7092,10 @@ async function handleApiRoute(
 			} else {
 				delete descriptions.tools;
 			}
-			// Entrypoint display metadata (best-effort) from the entrypoint files.
-			// The Market UI needs the kind/route to distinguish duplicate labels such as
-			// "PR Walkthrough" in different launch surfaces.
-			const entrypointByListName = new Map<string, { label?: string; kind: "composer-slash" | "git-widget-button" | "command-palette" | "route"; routeId?: string }>();
+			// Valid entrypoint display metadata from the entrypoint files. Invalid or
+			// unsupported entrypoint kinds are omitted so retired launch surfaces do not
+			// render as activation toggles.
+			const entrypointByListName = new Map<string, { label?: string; kind: "composer-slash" | "session-menu" | "route"; routeId?: string }>();
 			try {
 				for (const ep of loadPackContributions(entry.path, entry.manifest).entrypoints) {
 					entrypointByListName.set(ep.listName, { label: ep.label, kind: ep.kind, routeId: ep.routeId });
@@ -7033,9 +7105,9 @@ async function handleApiRoute(
 				roles: [...c.roles],
 				tools: concreteTools.tools,
 				skills: [...c.skills],
-				entrypoints: (c.entrypoints ?? []).map((listName) => {
+				entrypoints: (c.entrypoints ?? []).flatMap((listName) => {
 					const meta = entrypointByListName.get(listName);
-					return meta ? { listName, ...meta } : { listName };
+					return meta ? [{ listName, ...meta }] : [];
 				}),
 				// One-line per-entity descriptions for the activation disclosure (R3).
 				// Read from the SAME installed pack dir as the catalogue above — never
@@ -8149,20 +8221,27 @@ async function handleApiRoute(
 		if (!gate) { json({ error: "Gate not found" }, 404); return; }
 
 		const section = url.searchParams.get("section");
-		if (!section || !["content", "verification", "signals"].includes(section)) {
-			json({ error: "section query parameter is required: 'content', 'verification', or 'signals'" }, 400);
+		if (!section || !["content", "verification", "signals", "artifact"].includes(section)) {
+			json({ error: "section query parameter is required: 'content', 'verification', 'signals', or 'artifact'" }, 400);
 			return;
 		}
 
 		const stepName = url.searchParams.get("step") ?? undefined;
-		if (stepName !== undefined && section !== "verification") {
-			json({ error: "step is only valid with section='verification'" }, 400);
+		if (stepName !== undefined && section !== "verification" && section !== "artifact") {
+			json({ error: "step is only valid with section='verification' or section='artifact'" }, 400);
+			return;
+		}
+		if (url.searchParams.has("retry") && section !== "artifact") {
+			json({ error: "retry is only valid with section='artifact'" }, 400);
 			return;
 		}
 
 		let selectionOptions: TextSelectionOptions;
 		try {
 			selectionOptions = { ...parseGateInspectSelectionOptions(url.searchParams), includeDiagnostics: true };
+			if (section === "artifact" && selectionOptions.mode === undefined) {
+				selectionOptions = { ...selectionOptions, mode: "tail", lines: selectionOptions.lines ?? 200 };
+			}
 			selectText("", selectionOptions);
 		} catch (err) {
 			if (err instanceof TextSelectionError) { json({ error: err.message }, 400); return; }
@@ -8225,6 +8304,107 @@ async function handleApiRoute(
 			} catch (err) {
 				if (err instanceof TextSelectionError) { json({ error: err.message }, 400); return; }
 				if (err instanceof UnknownVerificationStepError) { json({ error: err.message }, 400); return; }
+				throw err;
+			}
+			return;
+		}
+
+		if (section === "artifact") {
+			const resolved = resolveSignal();
+			if (!resolved) { json({ error: "Signal not found" }, 404); return; }
+			const artifactTarget = url.searchParams.get("artifact") ?? "";
+			if (!artifactTarget) {
+				json({ error: "artifact query parameter is required with section='artifact'" }, 400);
+				return;
+			}
+			let retry: number | undefined;
+			const rawRetry = url.searchParams.get("retry");
+			if (rawRetry !== null && rawRetry !== "") {
+				if (!/^\d+$/.test(rawRetry)) { json({ error: "retry must be a non-negative integer" }, 400); return; }
+				retry = Number(rawRetry);
+			}
+
+			const candidateSteps = resolved.signal.verification.steps.filter(step =>
+				step.type === "command"
+				&& step.diagnostics
+				&& step.diagnostics.artifacts
+				&& step.diagnostics.artifacts.length > 0
+				&& (stepName === undefined || step.name === stepName),
+			);
+			if (stepName !== undefined && candidateSteps.length === 0) {
+				json({
+					error: `Unknown verification step "${stepName}" with retained artifacts.`,
+					validSteps: resolved.signal.verification.steps
+						.filter(step => step.type === "command" && step.diagnostics?.artifacts?.length)
+						.map(step => step.name),
+				}, 400);
+				return;
+			}
+
+			const matches: Array<{ stepName: string; diagnostics: NonNullable<typeof candidateSteps[number]["diagnostics"]>; artifact: ReturnType<typeof resolveArtifactFromLookup> }> = [];
+			const resolutionErrors: Array<{ stepName: string; error: GateArtifactResolutionError }> = [];
+			const validSteps = candidateSteps.map(step => step.name);
+			const validArtifactsByStep = candidateSteps.map(step => {
+				const lookup = buildArtifactLookup(step.diagnostics);
+				return {
+					step: step.name,
+					validArtifactIds: [...new Set(lookup.index.files.map(file => file.id))],
+					validArtifacts: lookup.index.files.map(file => ({ id: file.id, relativePath: file.relativePath, retry: file.retry })),
+				};
+			});
+			for (const step of candidateSteps) {
+				if (!step.diagnostics) continue;
+				const lookup = buildArtifactLookup(step.diagnostics);
+				try {
+					matches.push({
+						stepName: step.name,
+						diagnostics: step.diagnostics,
+						artifact: resolveArtifactFromLookup(lookup, artifactTarget, retry),
+					});
+				} catch (err) {
+					if (!(err instanceof GateArtifactResolutionError)) throw err;
+					resolutionErrors.push({ stepName: step.name, error: err });
+				}
+			}
+
+			if (matches.length === 0) {
+				const nonUnknownError = resolutionErrors.find(({ error }) => !error.message.startsWith(`Unknown artifact "${artifactTarget}".`));
+				json({ error: nonUnknownError?.error.message ?? `Unknown artifact "${artifactTarget}".`, validSteps, validArtifactsByStep }, 400);
+				return;
+			}
+			if (matches.length > 1) {
+				json({
+					error: `Artifact "${artifactTarget}" is ambiguous across verification steps; pass step to disambiguate.`,
+					validSteps: matches.map(match => match.stepName),
+					validArtifacts: matches.map(match => ({ step: match.stepName, id: match.artifact.id, relativePath: match.artifact.relativePath, retry: match.artifact.retry })),
+				}, 400);
+				return;
+			}
+
+			const match = matches[0];
+			try {
+				const retainedPath = validateRetainedArtifactPath(match.diagnostics, match.artifact);
+				if (!isTextInspectableArtifact(match.artifact)) {
+					json({ error: `Artifact "${match.artifact.relativePath}" is not a text artifact; use read(path) or inspect the file directly.`, validSteps, validArtifactsByStep }, 400);
+					return;
+				}
+				let text = fs.readFileSync(retainedPath, "utf8");
+				if (match.artifact.relativePath.endsWith("/error-context.md") || match.artifact.relativePath === "error-context.md") {
+					text = stripPlaywrightErrorContextBoilerplate(text);
+				}
+				const selected = selectText(text, selectionOptions);
+				json({
+					gateId, section: "artifact",
+					signalIndex: resolved.index,
+					signalId: resolved.signal.id,
+					step: match.stepName,
+					artifact: match.artifact,
+					text: selected.text,
+					selection: selected.selection,
+				});
+			} catch (err) {
+				if (err instanceof TextSelectionError) { json({ error: err.message }, 400); return; }
+				if (err instanceof Error) { json({ error: err.message, validSteps, validArtifactsByStep }, 400); return; }
 				throw err;
 			}
 			return;
@@ -8574,6 +8754,17 @@ async function handleApiRoute(
 					&& !s.verification.steps.some(step => step.type === "human-signoff")
 				);
 				if (priorPassed?.verification) {
+					const phaseByStepName = new Map((gateDef.verify || []).map((s: any) => [s.name, s.phase ?? 0]));
+					const cachedSteps = priorPassed.verification.steps.map((s: any) => {
+						const status = s.skipped ? "skipped" : (s.status ?? (s.passed ? "passed" : "failed"));
+						return {
+							...s,
+							status,
+							...(status === "skipped" ? { skipped: true } : {}),
+							phase: s.phase ?? phaseByStepName.get(s.name) ?? 0,
+							output: `[cached from prior signal] ${s.output}`,
+						};
+					});
 					// Create a signal record with cached results
 					const cachedSignal = {
 						id: randomUUID(),
@@ -8587,7 +8778,7 @@ async function handleApiRoute(
 						contentVersion: body?.content ? (existingGateForCache.currentContentVersion || 0) + 1 : undefined,
 						verification: {
 							status: "passed" as const,
-							steps: priorPassed.verification.steps.map(s => ({ ...s, output: `[cached from prior signal] ${s.output}` })),
+							steps: cachedSteps,
 						},
 					};
 					gateStore.recordSignal(cachedSignal);
@@ -8601,7 +8792,16 @@ async function handleApiRoute(
 					broadcastToGoal(goalId, { type: "gate_signal_received", goalId, gateId, signalId: cachedSignal.id });
 					broadcastToGoal(goalId, { type: "gate_verification_complete", goalId, gateId, signalId: cachedSignal.id, status: "passed" });
 					broadcastToGoal(goalId, { type: "gate_status_changed", goalId, gateId, status: "passed" });
-					const verifySteps = (gateDef.verify || []).map((s: any) => ({ name: s.name, type: s.type }));
+					const verifySteps = cachedSignal.verification.steps.map((s: any) => ({
+						name: s.name,
+						type: s.type,
+						status: s.status,
+						passed: s.passed,
+						skipped: s.skipped,
+						phase: s.phase,
+						duration_ms: s.duration_ms,
+						output: s.output,
+					}));
 					json({ signal: { id: cachedSignal.id, gateId, goalId, status: "passed", steps: verifySteps, cached: true } }, 201);
 					return;
 				}
@@ -8705,7 +8905,16 @@ async function handleApiRoute(
 			signal, gateDef, branchContainer, goal.branch, primary, allGateStates, goal.spec,
 		).catch(err => console.error("[verification] Gate signal error:", err));
 
-		const verifySteps = (gateDef.verify || []).map((s: any) => ({ name: s.name, type: s.type }));
+		const verifySteps = initialSteps.map((s: any) => ({
+			name: s.name,
+			type: s.type,
+			status: s.status,
+			passed: s.passed,
+			skipped: s.skipped,
+			phase: s.phase,
+			duration_ms: s.duration_ms,
+			output: s.output,
+		}));
 		const signalResponse = { id: signal.id, gateId, goalId, status: "running", steps: verifySteps };
 		const response: { signal: typeof signalResponse; agentReminder?: string } = { signal: signalResponse };
 		if (verificationHarness.getActiveVerification(signal.id)?.overallStatus === "running") {
@@ -10143,6 +10352,7 @@ async function handleApiRoute(
 				const heartbeat = setInterval(() => { try { res.write("\n"); } catch { /* ignore */ } }, 60_000);
 				const startTime = Date.now();
 				const handles: Array<{ sessionId: string } | null> = [];
+				let responsePayload: unknown;
 				try {
 					// Spawn the full set. assertCanSpawn / spawn failures become a
 					// failed delegate entry rather than aborting the others.
@@ -10189,16 +10399,19 @@ async function handleApiRoute(
 					}
 					const completed = delegates.filter(d => d.status === "completed").length;
 					const summary = `${completed}/${delegates.length} delegates completed.`;
-					res.end(JSON.stringify({ delegates, summary }));
+					responsePayload = { delegates, summary };
 				} catch (err) {
-					res.end(JSON.stringify({ delegates: [], summary: "", error: String(err instanceof Error ? err.message : err) }));
+					responsePayload = { delegates: [], summary: "", error: String(err instanceof Error ? err.message : err) };
 				} finally {
-					// Guaranteed cleanup — dismiss EVERY spawned child regardless of outcome.
+					// Guaranteed cleanup — dismiss EVERY spawned child before the blocking
+					// response completes. Ending the chunked response first races callers that
+					// immediately list children and violates team_delegate's auto-dismiss contract.
 					for (const h of handles) {
 						if (h) { try { await orchestrationCore.dismiss(ownerId, h.sessionId); } catch { /* already gone */ } }
 					}
 					clearInterval(heartbeat);
 				}
+				res.end(JSON.stringify(responsePayload ?? { delegates: [], summary: "", error: "Delegate route ended without a result." }));
 				return;
 			}
 
@@ -11056,6 +11269,68 @@ async function handleApiRoute(
 		} catch {
 			json({ error: "File not found" }, 404);
 		}
+		return;
+	}
+
+	// GET /api/sessions/:id/google-code-assist/token — short-lived runtime material
+	// for the agent-side Code Assist provider extension. Returns a fresh Google
+	// account Bearer access token and the Code Assist project id. This is the only
+	// way the spawned pi-coding-agent runtime obtains credentials for
+	// google-gemini-cli session models, so it can refresh per request instead of
+	// relying on a stale env-only token. Never returns the OAuth refresh token.
+	if (req.method === 'GET' && url.pathname.startsWith('/api/sessions/') && url.pathname.endsWith('/google-code-assist/token')) {
+		const id = url.pathname.split('/')[3];
+		const session = sessionManager.getSession(id);
+		if (!session) {
+			json({ error: "Session not found" }, 404);
+			return;
+		}
+		// Provider isolation: this endpoint is exclusively the Google account
+		// (OAuth / Code Assist) path. It must never touch the API-key-only `google`
+		// provider. A 401 here means "re-auth your Google account", not "add an API key".
+		if (!hasGoogleCodeAssistCredential()) {
+			json(
+				{
+					error: "No Google account is signed in. Re-authenticate via Settings \u2192 Account \u2192 Google (Gemini).",
+					code: "GOOGLE_CODE_ASSIST_REAUTH",
+				},
+				401,
+			);
+			return;
+		}
+		let accessToken: string | null;
+		try {
+			accessToken = await getGoogleAccessToken();
+		} catch (err) {
+			jsonError(401, err, { code: "GOOGLE_CODE_ASSIST_REAUTH" });
+			return;
+		}
+		if (!accessToken) {
+			json(
+				{
+					error: "Google account token could not be refreshed. Sign in again via Settings \u2192 Account \u2192 Google (Gemini).",
+					code: "GOOGLE_CODE_ASSIST_REAUTH",
+				},
+				401,
+			);
+			return;
+		}
+		// Project selection: an explicit GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_PROJECT_ID
+		// (paid Code Assist / GCP-billed subscriptions) wins; otherwise resolve/onboard
+		// the free-tier project via the Code Assist API.
+		let projectId: string | undefined =
+			(process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID || "").trim() || undefined;
+		if (!projectId) {
+			try {
+				projectId = await ensureCodeAssistProject(accessToken);
+			} catch (err) {
+				// Token is valid but project onboarding failed — surface as a non-auth
+				// error so the runtime doesn't misreport it as a re-auth requirement.
+				jsonError(502, err, { code: "GOOGLE_CODE_ASSIST_PROJECT" });
+				return;
+			}
+		}
+		json({ accessToken, projectId: projectId ?? null });
 		return;
 	}
 
