@@ -300,6 +300,51 @@
       }
     },
     {
+      "path": "tests2/core/multi-gateway-writer.test.ts",
+      "reason": "Ported from fork tests/multi-gateway-writer.test.ts; pins per-type models.json provider-block shapes plus OUR hardened writer's authoritative (api+baseUrl+wireId) branch and the sync orchestrator (headers, Bedrock env, pruning).",
+      "execution": {
+        "runner": "vitest",
+        "tier": "unit",
+        "project": "core"
+      }
+    },
+    {
+      "path": "tests2/core/multi-gateway-migration.test.ts",
+      "reason": "Ported from fork tests/multi-gateway-migration.test.ts; pins the idempotent boot-time legacy aigw.url → modelGateways migration.",
+      "execution": {
+        "runner": "vitest",
+        "tier": "unit",
+        "project": "core"
+      }
+    },
+    {
+      "path": "tests2/core/multi-gateway-exclusivity.test.ts",
+      "reason": "Ported from fork tests/multi-gateway-exclusivity.test.ts; pins the derived isExclusiveMode() truth table.",
+      "execution": {
+        "runner": "vitest",
+        "tier": "unit",
+        "project": "core"
+      }
+    },
+    {
+      "path": "tests2/core/multi-gateway-validation.test.ts",
+      "reason": "Ported from fork tests/multi-gateway-validation.test.ts; pins saveGateways() name validation, built-in collision, dup, and aigw-singleton rules.",
+      "execution": {
+        "runner": "vitest",
+        "tier": "unit",
+        "project": "core"
+      }
+    },
+    {
+      "path": "tests2/core/multi-gateway-dns-guard.test.ts",
+      "reason": "New coverage for the multi-gateway DNS-guard host union: only aigw-type blocks with cross-origin https model baseUrls contribute guarded hosts; openai-compatible gateways contribute none.",
+      "execution": {
+        "runner": "vitest",
+        "tier": "unit",
+        "project": "core"
+      }
+    },
+    {
       "path": "tests2/core/aigw-wellknown-translate.test.ts",
       "reason": "Unit coverage for provider-specific translation, filtering, unique bare IDs, metadata and pricing units, URL validation, and default-model seeding.",
       "execution": {
@@ -1609,6 +1654,10 @@
     },
     {
       "path": "tests2/browser/journeys/misc.journey.spec.ts",
+      "type": "smoke-journey"
+    },
+    {
+      "path": "tests2/browser/journeys/multi-gateway-settings.journey.spec.ts",
       "type": "smoke-journey"
     },
     {
@@ -3116,6 +3165,20 @@
       "rationale": "API/integration E2E against a real gateway â€” gateway-per-worker integration tier.",
       "migrated": true,
       "v2Path": "tests2/integration/agent-tools-e2e.test.ts",
+      "execution": {
+        "runner": "vitest",
+        "tier": "unit",
+        "project": "integration"
+      }
+    },
+    {
+      "file": "tests/e2e/multi-gateway-api.spec.ts",
+      "bucket": "v2-integration",
+      "method": "adapter",
+      "replacement": [],
+      "rationale": "Multi-gateway provider REST contract against in-process stub gateways — gateway-per-worker integration tier.",
+      "migrated": true,
+      "v2Path": "tests2/integration/multi-gateway-api.test.ts",
       "execution": {
         "runner": "vitest",
         "tier": "unit",

@@ -159,15 +159,15 @@ test.describe("AI Gateway Configure Flow", () => {
 			body: JSON.stringify({ url: `http://127.0.0.1:${mockPort}` }),
 		});
 		resetRecordedRequests();
-		(gateway.sessionManager as any)._aigwModelCache = {
+		(gateway.sessionManager as any)._gatewayModelCache.set("aigw", {
 			url: `http://127.0.0.1:${mockPort}`,
 			models: [{ id: "removed-old-model" }],
 			ts: Date.now(),
-		};
+		});
 
 		const res = await apiFetch("/api/aigw/refresh", { method: "POST" });
 		expect(res.status).toBe(200);
-		expect((gateway.sessionManager as any)._aigwModelCache).toBeNull();
+		expect((gateway.sessionManager as any)._gatewayModelCache.size).toBe(0);
 		const data = await res.json();
 		expect(data.models).toHaveLength(3);
 		expectSingleBobbitUserAgent(lastRecordedRequest("/v1/models"));
@@ -179,27 +179,27 @@ test.describe("AI Gateway Configure Flow", () => {
 		const originalRefresh = sandboxManager!.refreshAgentModelMounts.bind(sandboxManager);
 		(sandboxManager as any).refreshAgentModelMounts = async () => { throw new Error("simulated remount failure"); };
 		try {
-			(gateway.sessionManager as any)._aigwModelCache = { url: "stale", models: [{ id: "stale" }], ts: Date.now() };
+			(gateway.sessionManager as any)._gatewayModelCache.set("aigw", { url: "stale", models: [{ id: "stale" }], ts: Date.now() });
 			const configureRes = await apiFetch("/api/aigw/configure", {
 				method: "POST",
 				body: JSON.stringify({ url: `http://127.0.0.1:${mockPort}` }),
 			});
 			expect(configureRes.status).toBe(200);
 			expect(await configureRes.json()).toMatchObject({ ok: true, remountPending: true });
-			expect((gateway.sessionManager as any)._aigwModelCache).toBeNull();
+			expect((gateway.sessionManager as any)._gatewayModelCache.size).toBe(0);
 			expect((await (await apiFetch("/api/aigw/status")).json()).configured).toBe(true);
 
-			(gateway.sessionManager as any)._aigwModelCache = { url: "stale", models: [{ id: "stale" }], ts: Date.now() };
+			(gateway.sessionManager as any)._gatewayModelCache.set("aigw", { url: "stale", models: [{ id: "stale" }], ts: Date.now() });
 			const refreshRes = await apiFetch("/api/aigw/refresh", { method: "POST" });
 			expect(refreshRes.status).toBe(200);
 			expect(await refreshRes.json()).toMatchObject({ remountPending: true });
-			expect((gateway.sessionManager as any)._aigwModelCache).toBeNull();
+			expect((gateway.sessionManager as any)._gatewayModelCache.size).toBe(0);
 
-			(gateway.sessionManager as any)._aigwModelCache = { url: "stale", models: [{ id: "stale" }], ts: Date.now() };
+			(gateway.sessionManager as any)._gatewayModelCache.set("aigw", { url: "stale", models: [{ id: "stale" }], ts: Date.now() });
 			const deleteRes = await apiFetch("/api/aigw/configure", { method: "DELETE" });
 			expect(deleteRes.status).toBe(200);
 			expect(await deleteRes.json()).toMatchObject({ ok: true, remountPending: true });
-			expect((gateway.sessionManager as any)._aigwModelCache).toBeNull();
+			expect((gateway.sessionManager as any)._gatewayModelCache.size).toBe(0);
 			expect((await (await apiFetch("/api/aigw/status")).json()).configured).toBe(false);
 		} finally {
 			(sandboxManager as any).refreshAgentModelMounts = originalRefresh;
@@ -272,7 +272,16 @@ test.describe("AI Gateway Configure Flow", () => {
 
 		const res = await apiFetch("/api/preferences");
 		const prefs = await res.json();
-		expect(prefs["aigw.url"]).toBe(`http://127.0.0.1:${mockPort}`);
+		// Multi-gateway migration: config now lives in the `modelGateways` list, not the
+		// legacy `aigw.url` scalar. The configure shim upserts a single {name:"aigw",
+		// type:"aigw", enabled:true} gateway carrying the configured URL.
+		const gateways = prefs["modelGateways"];
+		expect(Array.isArray(gateways)).toBe(true);
+		const aigw = (gateways as any[]).find((g) => g.type === "aigw");
+		expect(aigw).toBeTruthy();
+		expect(aigw.name).toBe("aigw");
+		expect(aigw.url).toBe(`http://127.0.0.1:${mockPort}`);
+		expect(aigw.enabled).toBe(true);
 		// aigw.models is no longer cached in preferences — models are discovered fresh via GET /api/models
 	});
 

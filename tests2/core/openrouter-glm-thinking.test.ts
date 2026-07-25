@@ -26,6 +26,7 @@ const { PreferencesStore } = await import("../../src/server/agent/preferences-st
 const { getAvailableModels, invalidateModelCache } = await import("../../src/server/agent/model-registry.ts");
 const { getBuiltinModel } = await import("@earendil-works/pi-ai/providers/all");
 const { clampThinkingLevelForModel, resolveThinkingClampModel } = await import("../../src/server/agent/thinking-level-clamp.ts");
+const { saveGateways } = await import("../../src/server/agent/aigw-manager.ts");
 
 const managers: any[] = [];
 
@@ -131,7 +132,7 @@ describe("OpenRouter/AIGW GLM 5.x thinking clamp", () => {
 			{ id: "openai/gpt-5.6-luna", context_length: 272_000, max_tokens: 128_000 },
 		], async (baseUrl) => {
 			const prefs = new PreferencesStore(fs.mkdtempSync(path.join(stateDir, "aigw-gpt56-prefs-")));
-			prefs.set("aigw.url", baseUrl);
+			saveGateways(prefs, [{ id: "aigw", name: "aigw", url: baseUrl, type: "aigw", enabled: true }]);
 			invalidateModelCache();
 
 			const models = await getAvailableModels(prefs);
@@ -166,7 +167,7 @@ describe("OpenRouter/AIGW GLM 5.x thinking clamp", () => {
 			{ id: "z-ai/glm-5.2", context_length: 131_072, max_tokens: 32_768 },
 		], async (baseUrl) => {
 			const prefs = new PreferencesStore(fs.mkdtempSync(path.join(stateDir, "aigw-prefs-")));
-			prefs.set("aigw.url", baseUrl);
+			saveGateways(prefs, [{ id: "aigw", name: "aigw", url: baseUrl, type: "aigw", enabled: true }]);
 			invalidateModelCache();
 
 			const models = await getAvailableModels(prefs);

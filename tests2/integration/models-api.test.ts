@@ -138,27 +138,41 @@ test.describe("GET /api/models with AI Gateway", () => {
 		expect(providers.has("openai")).toBe(false);
 	});
 
-	test("built-in providers return when aigw.exclusive is set to false", async () => {
-		await apiFetch("/api/aigw/configure", {
-			method: "POST",
-			body: JSON.stringify({ url: `http://127.0.0.1:${mockPort}` }),
-		});
-		await apiFetch("/api/preferences", {
+	test("built-in providers return alongside a non-exclusive (openai-compatible) gateway", async () => {
+		// Exclusivity is now DERIVED (docs/design/multi-gateway-providers.md): only an
+		// enabled `aigw`-type gateway hides built-ins. The old `aigw.exclusive=false`
+		// toggle is gone — its successor scenario is an `openai-compatible` gateway,
+		// which is inherently non-exclusive, so built-in upstream providers stay visible
+		// next to the gateway's own models. Assertion intent (built-ins appear while a
+		// gateway is configured) is preserved.
+		const putRes = await apiFetch("/api/aigw/gateways", {
 			method: "PUT",
-			body: JSON.stringify({ "aigw.exclusive": false }),
+			body: JSON.stringify({
+				gateways: [{
+					id: "localgw",
+					name: "localgw",
+					url: `http://127.0.0.1:${mockPort}`,
+					type: "openai-compatible",
+					enabled: true,
+				}],
+			}),
 		});
+		expect(putRes.status).toBe(200);
 
 		const res = await apiFetch("/api/models");
 		const models = await res.json();
 		const providers = new Set(models.map((m: any) => m.provider));
-		expect(providers.has("aigw")).toBe(true);
+		// The non-exclusive gateway contributes its models under its own provider name…
+		expect(providers.has("localgw")).toBe(true);
+		// …and built-in upstream providers remain visible (the preserved intent).
 		const hasBuiltIn = providers.has("anthropic") || providers.has("amazon-bedrock");
 		expect(hasBuiltIn).toBe(true);
 
-		// Reset to default for subsequent tests.
-		await apiFetch("/api/preferences", {
+		// Reset the gateway list for subsequent tests (afterEach's DELETE only drops
+		// the `aigw`-type gateway, not this `openai-compatible` one).
+		await apiFetch("/api/aigw/gateways", {
 			method: "PUT",
-			body: JSON.stringify({ "aigw.exclusive": null }),
+			body: JSON.stringify({ gateways: [] }),
 		});
 	});
 

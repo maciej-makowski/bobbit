@@ -66,7 +66,12 @@ function loadTryAutoSelectModel(): (this: any, session: any) => Promise<void> {
 	let body = extractMethodBody(src, "private async tryAutoSelectModel(session: SessionInfo)");
 	body = body
 		.replace(/\s+as\s+string\s*\|\s*undefined/g, "")
-		.replace(/SessionManager\.AIGW_CACHE_TTL_MS/g, "60_000");
+		.replace(/SessionManager\.AIGW_CACHE_TTL_MS/g, "60_000")
+		// Strip TS-only syntax introduced by the multi-gateway fallback branch so the
+		// method body parses under `new Function`: the inline `type` alias and its
+		// annotation usage. Behavior is unchanged — these are erased at compile time.
+		.replace(/\n\s*type\s+\w+\s*=\s*\{[^}]*\};/g, "")
+		.replace(/:\s*GatewayCandidate\[\]/g, "");
 
 	// The extracted production method now normalizes legacy provider-prefixed AIGW
 	// preferences before selecting or comparing them. Keep that dependency explicit
@@ -91,8 +96,23 @@ function loadTryAutoSelectModel(): (this: any, session: any) => Promise<void> {
 	const isSessionSelectableModelString = (value: unknown) => (
 		typeof value === "string" && /^[^/]+\/.+/.test(value) && !value.startsWith("image-only/")
 	);
-	const getAigwUrl = (prefs: { get: (key: string) => unknown }) => prefs.get("aigw.baseUrl") as string | undefined;
-	const discoverAigwModels = async () => ([{ id: "us.anthropic.claude-opus-4-5" }]);
+	// Multi-gateway migration: the fallback branch now enumerates configured
+	// gateways instead of a single `aigw.baseUrl`. Mirror the prior stubs — a
+	// gateway IS available (derived from the same `aigw.baseUrl` pref the tests set)
+	// and discovery yields a model — so the "never falls through to the gateway"
+	// assertions still prove the controlled policy suppresses gateway auto-selection
+	// after an explicit-model failure.
+	const listGateways = (prefs: { get: (key: string) => unknown }) => {
+		const url = prefs.get("aigw.baseUrl");
+		return typeof url === "string" && url
+			? [{ id: "aigw", name: "aigw", url, type: "aigw", enabled: true }]
+			: [];
+	};
+	const getEnabledGateways = (prefs: { get: (key: string) => unknown }) => listGateways(prefs).filter((g: any) => g.enabled);
+	const isExclusiveMode = (gateways: any[]) => gateways.some((g) => g.enabled && g.type === "aigw");
+	const bedrockRoutesForType = (type: string) => type === "aigw";
+	const isClaudeId = (id: string) => /claude/i.test(id);
+	const stripProviderPrefix = (id: string) => (id.includes("/") ? id.slice(id.indexOf("/") + 1) : id);
 	const modelRecencyRank = () => 1;
 	const inferMeta = () => ({ reasoning: false });
 	const sanitizeModelErrorText = (err: unknown) => err instanceof Error ? err.message : String(err);
@@ -113,8 +133,12 @@ function loadTryAutoSelectModel(): (this: any, session: any) => Promise<void> {
 		"normalizeAigwModelString",
 		"applyModelString",
 		"isSessionSelectableModelString",
-		"getAigwUrl",
-		"discoverAigwModels",
+		"listGateways",
+		"getEnabledGateways",
+		"isExclusiveMode",
+		"bedrockRoutesForType",
+		"isClaudeId",
+		"stripProviderPrefix",
 		"modelRecencyRank",
 		"inferMeta",
 		"sanitizeModelErrorText",
@@ -126,8 +150,12 @@ function loadTryAutoSelectModel(): (this: any, session: any) => Promise<void> {
 		normalizeAigwModelString,
 		applyModelString,
 		isSessionSelectableModelString,
-		getAigwUrl,
-		discoverAigwModels,
+		listGateways,
+		getEnabledGateways,
+		isExclusiveMode,
+		bedrockRoutesForType,
+		isClaudeId,
+		stripProviderPrefix,
 		modelRecencyRank,
 		inferMeta,
 		sanitizeModelErrorText,
@@ -165,7 +193,10 @@ async function exerciseAutoSelect(options: {
 			update: (_sessionId: string, update: Record<string, unknown>) => persisted.push(update),
 		}),
 		_writeModelNameFile: (_sessionId: string, model: string) => modelFiles.push(model),
-		_aigwModelCache: undefined,
+		_gatewayModelCache: new Map<string, { url: string; models: unknown[]; ts: number }>(),
+		// Mirrors the old `discoverAigwModels` stub: a gateway model is available so
+		// the auto-selection branch has something to (deliberately) NOT pick.
+		discoverGatewayModelsCached: async () => ([{ id: "us.anthropic.claude-opus-4-5" }]),
 	};
 	const session = {
 		id: "session-under-test",

@@ -24,7 +24,7 @@ import { createMemFs } from "../harness/mem-fs.js";
 
 const { PreferencesStore } = await import("../../src/server/agent/preferences-store.ts");
 const { getAvailableModels, invalidateModelCache } = await import("../../src/server/agent/model-registry.ts");
-const { discoverAigwModels, writeAigwModelsJson } = await import("../../src/server/agent/aigw-manager.ts");
+const { discoverAigwModels, writeAigwModelsJson, saveGateways } = await import("../../src/server/agent/aigw-manager.ts");
 const { resetAgentDirStateForTests } = await import("../../src/server/bobbit-dir.js");
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -170,7 +170,7 @@ describe("AI Gateway pricing metadata", () => {
 		const mock = await startMockAigw();
 		try {
 			const prefs = new PreferencesStore(stateDir, memfs);
-			prefs.set("aigw.url", mock.url);
+			saveGateways(prefs as any, [{ id: "aigw", name: "aigw", url: mock.url, type: "aigw", enabled: true }]);
 			invalidateModelCache();
 
 			const models = await getAvailableModels(prefs as any);

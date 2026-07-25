@@ -1014,6 +1014,8 @@ Resolution: restart the gateway. `startupAigwCheck` in `src/server/agent/aigw-ma
 
 `BOBBIT_SKIP_AIGW_DISCOVERY=1` semantics shifted with this change: it now skips only the network call. When aigw is already configured, Bedrock env vars are still applied and the existing `models.json` is kept untouched. Previously this flag short-circuited everything pre-config; the post-config refresh path is the new behaviour.
 
+Note (multi-gateway): the header/Bedrock/well-known behavior above applies to the **`aigw`-type** gateway in the `modelGateways` list (the pinned singleton named `"aigw"`). `syncGatewaysModelsJson` re-discovers every **enabled** gateway on startup and rewrites its `providers.<name>` block, so if an `openai-compatible` gateway's models are stale, restart likewise refreshes them — but such gateways carry **no** `User-Agent`/`x-opencode-session` header block by design, so their absence there is expected, not a bug. A missing `providers.<name>` block after restart usually means the gateway was disabled (blocks for disabled/removed/renamed gateways are pruned) or unreachable on that boot. See [docs/multi-gateway-providers.md](multi-gateway-providers.md).
+
 See [docs/internals.md — Startup refresh behavior](internals.md#startup-refresh-behavior).
 
 ## Review/naming model mismatch under AI Gateway

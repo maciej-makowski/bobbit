@@ -9,7 +9,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { refreshOAuthToken } from "../auth/oauth.js";
 import { globalAuthPath } from "../bobbit-dir.js";
-import { discoverAigwModels, normalizeAigwModelString } from "./aigw-manager.js";
+import { discoverAigwModels, normalizeAigwModelString, type ModelGateway } from "./aigw-manager.js";
 import { aigwUserAgentHeaders } from "./aigw-user-agent.js";
 import { completeModelText } from "./model-completion.js";
 import { getAvailableModels, modelRecencyRank, type ApiModel } from "./model-registry.js";
@@ -72,6 +72,8 @@ export interface TitleGenOptions {
 	namingModel?: string;
 	/** AI Gateway URL for proxying requests (used when provider is "aigw") */
 	aigwUrl?: string;
+	/** Enabled gateways, for resolving a naming model whose provider matches a gateway name. */
+	gateways?: ModelGateway[];
 	/** Thinking level for title generation: "off"|"minimal"|"low"|"medium"|"high"|"xhigh" */
 	thinkingLevel?: string;
 	/** Model to try when no explicit naming model is configured (usually default.sessionModel). */

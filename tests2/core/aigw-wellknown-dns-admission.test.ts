@@ -10,6 +10,9 @@ import {
 	GATEWAY, filterValidatedProviderUrls, getAigwProviderDnsGuardHosts, removeAigw,
 	replaceAigwProviderDnsGuardHosts, resetAgentDirStateForTests, translateWellKnown,
 } from "./helpers/aigw-wellknown-test-helpers.js";
+import { createMemFs } from "../harness/mem-fs.js";
+
+const { PreferencesStore } = await import("../../src/server/agent/preferences-store.ts");
 
 describe("AIGW DNS admission lifecycle", () => {
 	afterEach(() => replaceAigwProviderDnsGuardHosts([]));
@@ -40,7 +43,8 @@ describe("AIGW DNS admission lifecycle", () => {
 			replaceAigwProviderDnsGuardHosts(["old.example"]);
 			replaceAigwProviderDnsGuardHosts(["new.example"]);
 			assert.deepEqual(getAigwProviderDnsGuardHosts(), ["new.example"]);
-			removeAigw({ remove() {} } as any);
+			const prefs = new PreferencesStore(path.join(agentDir, "state"), createMemFs());
+			removeAigw(prefs as any);
 			assert.deepEqual(getAigwProviderDnsGuardHosts(), []);
 		} finally {
 			if (previousAgentDir === undefined) delete process.env.BOBBIT_AGENT_DIR;

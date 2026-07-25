@@ -126,11 +126,15 @@ describe("Settings Models tab redesign", () => {
 		expect(aigwBox).toBeTruthy();
 		expect(defaultsBox).toBeTruthy();
 
-		const gatewayUrlInput = aigwBox.querySelector('[data-testid="aigw-url-input"]') as HTMLElement;
-		expect(gatewayUrlInput.getAttribute("name")).toBe("bobbit-aigw-url");
-		expect(gatewayUrlInput.getAttribute("autocomplete")).toBe("off");
-		expect(gatewayUrlInput.getAttribute("autocapitalize")).toBe("off");
-		expect(gatewayUrlInput.getAttribute("spellcheck")).toBe("false");
+		// Multi-gateway redesign: the single `aigw-url-input` block became the gateway
+		// list editor (`gateways-editor`), which renders one `gateway-row` per configured
+		// gateway. The fixture's `aigwUrl` seeds a single aigw-type row, so the editor
+		// lives inside the AI Gateway section and carries the configured URL.
+		const editor = aigwBox.querySelector('[data-testid="gateways-editor"]') as HTMLElement;
+		expect(editor).toBeTruthy();
+		const gatewayUrlInput = editor.querySelector('[data-testid="gateway-url-input"]') as HTMLInputElement;
+		expect(gatewayUrlInput).toBeTruthy();
+		expect(gatewayUrlInput.value).toBe("http://dummy/v1");
 
 		// DOM order: aigw appears before defaults.
 		const pos = aigwBox.compareDocumentPosition(defaultsBox);

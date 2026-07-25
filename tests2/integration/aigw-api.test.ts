@@ -29,14 +29,33 @@ test.describe("AI Gateway API", () => {
 		expect(res.status).toBe(400);
 	});
 
-	test("POST /api/aigw/configure rejects unreachable gateway", async () => {
+	test("POST /api/aigw/configure accepts an unreachable gateway leniently; reachability is surfaced by /api/aigw/test", async () => {
+		// Multi-gateway contract (docs/design/multi-gateway-providers.md §REST shims):
+		// configure now upserts a {name:"aigw",type:"aigw"} gateway and re-syncs via
+		// syncGatewaysModelsJson, returning {ok:true, models}. An unreachable gateway is
+		// NOT rejected here — sync preserves the "unreachable ⇒ don't fail, keep/empty
+		// models" behavior — so a fresh configure returns an empty model list, not 502.
+		const url = "http://127.0.0.1:19999";
 		const res = await apiFetch("/api/aigw/configure", {
 			method: "POST",
-			body: JSON.stringify({ url: "http://127.0.0.1:19999" }),
+			body: JSON.stringify({ url }),
 		});
-		expect(res.status).toBe(502);
+		expect(res.status).toBe(200);
 		const data = await res.json();
-		expect(data.error).toBeTruthy();
+		expect(data.ok).toBe(true);
+		expect(Array.isArray(data.models)).toBe(true);
+		expect(data.models.length).toBe(0);
+
+		// The reachability guarantee the old configure enforced now lives on the
+		// pre-flight /api/aigw/test shim, which still rejects an unreachable gateway
+		// with 502 + a truthy error — the assertion's original intent is preserved here.
+		const testRes = await apiFetch("/api/aigw/test", {
+			method: "POST",
+			body: JSON.stringify({ url }),
+		});
+		expect(testRes.status).toBe(502);
+		const testData = await testRes.json();
+		expect(testData.error).toBeTruthy();
 	});
 
 	test("POST /api/aigw/test rejects missing url", async () => {

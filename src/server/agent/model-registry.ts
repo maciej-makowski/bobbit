@@ -3,7 +3,7 @@
  *
  * Assembles a merged model list from:
  * 1. Built-in providers (from pi-ai getBuiltinProviders()/getBuiltinModels())
- * 2. AI Gateway models (if configured, live fetch via discoverAigwModels())
+ * 2. Gateway models (enabled named/typed gateways, live fetch via discoverGatewayModels())
  * 3. Custom local providers (Ollama, LM Studio, vLLM, llama.cpp)
  *
  * Served via GET /api/models with a 5-second TTL cache.
@@ -19,7 +19,17 @@ import https from "node:https";
 import { getBuiltinProviders, getBuiltinModels, getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import type { PreferencesStore } from "./preferences-store.js";
 import { globalAuthPath } from "../bobbit-dir.js";
-import { inferMeta, discoverAigwModels, getAigwUrl } from "./aigw-manager.js";
+import {
+	inferMeta,
+	discoverGatewayModels,
+	listGateways,
+	getEnabledGateways,
+	isExclusiveMode,
+	isClaudeId,
+	stripProviderPrefix,
+	bedrockRoutesForType,
+	getGatewayByName,
+} from "./aigw-manager.js";
 import { getOpenAIModelAdditions } from "./openai-model-additions.js";
 import { getGoogleCodeAssistModels } from "./google-code-assist-models.js";
 import { GOOGLE_GEMINI_CLI_PROVIDER, hasGoogleCodeAssistSpawnCredential } from "./google-code-assist.js";
@@ -146,7 +156,7 @@ export interface ResolvedModelStateMeta {
  *   3. `inferMeta(id)` — last resort for genuinely-unknown models. Carries no
  *      thinkingLevelMap (the client then falls back to the family heuristic).
  */
-export function resolveModelStateMeta(provider: string | undefined, modelId: string): ResolvedModelStateMeta {
+export function resolveModelStateMeta(provider: string | undefined, modelId: string, prefs?: PreferencesStore): ResolvedModelStateMeta {
 	// Tier 1: registry cache (ignore TTL — metadata is static per id).
 	if (cachedModels) {
 		const hit = cachedModels.find(m => m.provider === provider && m.id === modelId);
@@ -163,8 +173,26 @@ export function resolveModelStateMeta(provider: string | undefined, modelId: str
 	}
 
 	// Tier 2: pi-ai catalog for known upstream providers (not aigw / custom).
+	//
+	// Named gateways (multi-gateway providers) must be treated like the legacy
+	// `aigw`/`custom` providers here: their models are not in pi-ai's built-in
+	// catalog and their `provider` is the gateway `name` (which may not collide
+	// with the small BUILTIN_PROVIDER_IDS set but CAN match a broader pi-ai
+	// provider id such as `openrouter`/`deepseek`). Resolving those against
+	// getBuiltinModel would mis-attach a built-in catalog entry, so skip Tier 2
+	// when the provider names an enabled/known gateway and fall through to the
+	// live-preserving inferMeta path.
+	//
+	// TODO(multi-gateway): the gateway guard only fires when a caller threads
+	// `prefs`. The three live-frame callers (ws/handler, ws/runtime-model-
+	// selection, session-manager) currently call `resolveModelStateMeta(provider,
+	// id)` without prefs, so for them a gateway model that misses the Tier-1 cache
+	// could still hit Tier 2. Cache misses are rare (assembleModels populates the
+	// cache), but wiring `prefs` through those call sites would make the guard
+	// authoritative. Left out of scope here (edit is confined to this file).
+	const isGatewayProvider = !!(prefs && provider && getGatewayByName(prefs, provider));
 	const normalizedProvider = (provider ?? "").toLowerCase();
-	if (normalizedProvider && normalizedProvider !== "aigw" && normalizedProvider !== "custom") {
+	if (!isGatewayProvider && normalizedProvider && normalizedProvider !== "aigw" && normalizedProvider !== "custom") {
 		try {
 			const model = getBuiltinModel(normalizedProvider as any, modelId as any) as {
 				contextWindow?: number; maxTokens?: number; reasoning?: boolean;
@@ -229,14 +257,13 @@ export async function getAvailableModels(prefs: PreferencesStore): Promise<ApiMo
 
 /**
  * Simple version tracking — hash relevant preference keys.
- * We use a string hash of aigw.url + customProviders + providerKeys to detect changes.
+ * We use a string hash of modelGateways + customProviders + providerKeys to detect changes.
  */
 function getPrefsVersion(prefs: PreferencesStore): number {
 	const all = prefs.getAll();
 	let hash = 0;
 	const str = JSON.stringify([
-		all["aigw.url"],
-		all["aigw.exclusive"],
+		all["modelGateways"],
 		all["customProviders"],
 		...Object.keys(all).filter(k => k.startsWith("providerKey.")).sort(),
 	]);
@@ -264,19 +291,20 @@ function builtInNumber(modelId: string, explicitValue: unknown, inferredValue: n
 
 async function assembleModels(prefs: PreferencesStore): Promise<ApiModel[]> {
 	const results: ApiModel[] = [];
-	const aigwUrl = getAigwUrl(prefs);
+	const gateways = listGateways(prefs);
+	const enabled = getEnabledGateways(prefs);
 
-	// When an AI Gateway is configured, it is treated as the single egress path
-	// by default — built-in upstream providers (anthropic, openai, bedrock, ...)
-	// are hidden because in a secure-zone deployment they can't be reached
-	// directly. Users who need to see built-ins alongside the gateway (e.g. for
-	// local development against a real API key AND a dev gateway) can opt out
-	// by setting `aigw.exclusive` to false in preferences.
-	// Custom local providers (Ollama, LM Studio) are always shown because they
-	// live on the user's own machine, not behind the gateway.
-	const aigwExclusive = aigwUrl ? (prefs.get("aigw.exclusive") as boolean | undefined) ?? true : false;
+	// Exclusivity is DERIVED from gateway types (see aigw-manager.ts::isExclusiveMode):
+	// any enabled `aigw`-type gateway makes the setup exclusive. In exclusive mode the
+	// enterprise gateway is the single egress path — built-in upstream providers
+	// (anthropic, openai, bedrock, ...) AND `openai-compatible` gateways are suppressed
+	// because in a secure-zone deployment they can't be reached directly. In merged mode
+	// built-ins + all enabled `openai-compatible` gateways contribute together.
+	// Custom local providers (Ollama, LM Studio) are always shown (both modes) because
+	// they live on the user's own machine, not behind the gateway.
+	const exclusive = isExclusiveMode(gateways);
 
-	if (!aigwExclusive) {
+	if (!exclusive) {
 		// 1. Built-in providers from pi-ai
 		try {
 			const providers = getBobbitBuiltInProviders();
@@ -325,31 +353,24 @@ async function assembleModels(prefs: PreferencesStore): Promise<ApiModel[]> {
 		}
 	}
 
-	// 2. AI Gateway models (if configured)
-	if (aigwUrl) {
+	// 2. Gateway models — loop the enabled gateways. In exclusive mode only
+	// `aigw`-type gateways contribute (matching the built-in suppression above);
+	// `openai-compatible` gateways are skipped.
+	for (const g of enabled) {
+		if (exclusive && g.type !== "aigw") continue;
 		try {
-			const aigwModels = await discoverAigwModels(aigwUrl);
-			// IMPORTANT: Claude models get their provider prefix stripped and are
-			// routed through bedrock-converse-stream by configureAigw() when writing
-			// models.json. The agent's rpc `set_model` does a strict equality match
-			// against that file, so the IDs we return here MUST match the stripped
-			// form — otherwise picking a Claude model from the UI silently fails
-			// (the agent rejects with "Model not found", the error is swallowed,
-			// and the next prompt goes to the previously bound model).
-			const isClaudeModel = (id: string) => id.toLowerCase().includes("claude");
-			const stripPrefix = (id: string) => { const i = id.indexOf("/"); return i >= 0 ? id.slice(i + 1) : id; };
-			for (const m of aigwModels) {
+			const discovered = await discoverGatewayModels(g);
+			for (const m of discovered) {
 				// AUTHORITATIVE path: a model carrying both `api` and `baseUrl` came from
 				// well-known discovery (or the fallback option-1 OpenAI-responses fix).
 				// Trust those fields verbatim and DON'T re-derive via inferMeta — the
-				// id/baseUrl/api must match writeAigwModelsJson (which emits the bare
+				// id/baseUrl/api must match syncGatewaysModelsJson (which emits the bare
 				// wireId) so `set_model`'s strict-equality match keeps working.
 				if (m.api && m.baseUrl) {
-					const wireId = m.wireId ?? m.id;
 					results.push({
-						id: wireId,
+						id: m.wireId ?? m.id,
 						name: m.name,
-						provider: "aigw",
+						provider: g.name,
 						...(m.upstreamProvider ? { upstreamProvider: m.upstreamProvider } : {}),
 						api: m.api,
 						baseUrl: m.baseUrl,
@@ -365,20 +386,23 @@ async function assembleModels(prefs: PreferencesStore): Promise<ApiModel[]> {
 					continue;
 				}
 				// ── Fallback heuristic path (no authoritative api/baseUrl) ──
-				// Claude models get their provider prefix stripped and are routed
-				// through bedrock-converse-stream by configureAigw() when writing
-				// models.json. The agent's rpc `set_model` does a strict equality match
-				// against that file, so the IDs we return here MUST match the stripped
-				// form — otherwise picking a Claude model from the UI silently fails.
-				const normalizedId = isClaudeModel(m.id) ? stripPrefix(m.id) : m.id;
-				const meta = inferMeta(normalizedId);
+				// Claude→Bedrock routing is a property of the `aigw` TYPE only
+				// (bedrockRoutesForType). An `openai-compatible` gateway exposing a model
+				// literally named `claude-*` must NEVER be Bedrock-routed. For
+				// Bedrock-routed ids the provider prefix is stripped to match the
+				// `providers[name]` block written by syncGatewaysModelsJson — the agent's
+				// rpc `set_model` does a strict equality match against that file, so a
+				// mismatch silently falls back to the previously bound model.
+				const bedrock = bedrockRoutesForType(g.type) && isClaudeId(m.id);
+				const id = bedrock ? stripProviderPrefix(m.id) : m.id;
+				const meta = inferMeta(id);
 				results.push({
-					id: normalizedId,
+					id,
 					name: m.name,
-					provider: "aigw",
+					provider: g.name,
 					...(m.upstreamProvider ? { upstreamProvider: m.upstreamProvider } : {}),
-					api: isClaudeModel(m.id) ? "bedrock-converse-stream" : (m.api || "openai-completions"),
-					baseUrl: aigwUrl,
+					api: bedrock ? "bedrock-converse-stream" : (m.api || "openai-completions"),
+					baseUrl: g.url,
 					contextWindow: Math.max(meta.contextWindow, m.contextWindow || 0),
 					maxTokens: Math.max(meta.maxTokens, m.maxTokens || 0),
 					reasoning: meta.reasoning || m.reasoning || false,
@@ -388,11 +412,11 @@ async function assembleModels(prefs: PreferencesStore): Promise<ApiModel[]> {
 					...(meta.thinkingLevelMap ?? m.thinkingLevelMap ? { thinkingLevelMap: meta.thinkingLevelMap ?? m.thinkingLevelMap } : {}),
 					input: meta.input || ["text"],
 					cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					authenticated: true, // aigw is always authenticated (no key needed)
+					authenticated: true, // gateways are always authenticated (no key needed)
 				});
 			}
 		} catch (err) {
-			console.error("[model-registry] Failed to discover AI Gateway models:", err);
+			console.error(`[model-registry] Failed to discover gateway "${g.name}" models:`, err);
 		}
 	}
 

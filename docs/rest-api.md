@@ -1099,18 +1099,34 @@ Used by the Settings → Models tab per-row Test button. See [AI Gateway routing
 
 ### AI Gateway
 
+Gateways are a **named, typed list** persisted under the `modelGateways` preference. Each gateway is `{ id, name, url, type: "aigw" | "openai-compatible", enabled }`. The `aigw` type is the enterprise AI Gateway (Bedrock-routed Claude ids, `x-opencode-session`/User-Agent headers, well-known-first discovery, cross-origin DNS-rebinding guard) and is a singleton pinned to the name `"aigw"`; `openai-compatible` is a plain OpenAI gateway (ollama, llama-swap, vLLM, …) with none of that machinery. Exclusivity is **derived**: any enabled `aigw` gateway suppresses built-in cloud providers **and** every `openai-compatible` gateway. See [docs/multi-gateway-providers.md](multi-gateway-providers.md).
+
+**Canonical list-management surface:**
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/aigw/gateways` | Return `{ gateways: ModelGateway[] }` — the full list, including disabled rows |
+| `PUT` | `/api/aigw/gateways` | Replace the whole list (`{ gateways }`); validates (name shape/uniqueness, `aigw`-name singleton), fills missing `id`, persists, re-syncs `models.json`, invalidates the model cache; returns `{ gateways, modelsByGateway }` |
+| `POST` | `/api/aigw/test` | Run discovery for `{ url, type? }` without saving or changing active routing (well-known-first for `aigw`, `/v1/models` for `openai-compatible`) |
+| `POST` | `/api/aigw/gateways/:name/refresh` | Re-discover the named gateway and re-run `models.json` sync |
+| `GET` | `/api/aigw/gateways/:name/status` | Per-gateway `{ configured, name, url, type, enabled, models }` |
+| `*` | `/api/aigw/:name/v1/*` | Proxy `/v1/*` to `<gateway.url>` for the named enabled gateway (404 if none); browser model discovery / completions route through here |
+
+**Backward-compatible shims** (single-URL era) — all operate on the gateway named `aigw` (or the first enabled gateway):
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/aigw/status` | Return `{ configured, url?, models? }`; configured gateways are discovered fresh, with failures represented by `models: []` |
-| `POST` | `/api/aigw/configure` | Discover and persist a gateway (`{ url }`), publish `models.json`, and refresh sandbox mounts |
-| `DELETE` | `/api/aigw/configure` | Remove gateway configuration and its generated provider |
-| `POST` | `/api/aigw/test` | Run well-known-first discovery for `{ url }` without saving or changing active routing |
-| `POST` | `/api/aigw/refresh` | Repeat configuration for the saved URL and refresh models/default seeding |
-| `*` | `/api/aigw/v1/*` | Append `/v1/*` to the configured URL and proxy the request; save the gateway origin, not an already suffixed `/v1`, when using this route |
+| `POST` | `/api/aigw/configure` | Upsert the `aigw` gateway (`{ url }`), publish `models.json`, and refresh sandbox mounts |
+| `DELETE` | `/api/aigw/configure` | Remove the `aigw` gateway and its generated provider |
+| `POST` | `/api/aigw/refresh` | Repeat configuration for the saved `aigw` URL and refresh models/default seeding |
+| `*` | `/api/aigw/v1/*` | Append `/v1/*` to the `aigw` gateway URL and proxy the request; save the gateway origin, not an already suffixed `/v1`, when using this route |
 
-Configure, refresh, and delete return `remountPending: true` when the durable configuration succeeded but one or more tracked sandbox containers could not yet remount the atomically replaced `models.json`. Callers must not interpret that flag as a rollback; normal container health recovery continues.
+`/api/models/test` accepts any configured gateway name as a `provider` (not just `"aigw"`); `/api/health` and `/api/status` report `aigw: true` whenever **any** gateway is enabled.
 
-Discovery first requests `/.well-known/opencode` at the gateway origin and falls back to `/v1/models` only when no authoritative config resolves. Outbound requests carry Bobbit's canonical AI Gateway user agent. See [AI Gateway routing](ai-gateway-routing.md) for precedence, remote-config security, provider-specific routes, model-ID migration, and cache/container behavior; see [AI Gateway request headers](internals.md#ai-gateway-request-headers-user-agent-x-opencode-session) for implementation details.
+Configure, refresh, delete, and `PUT /api/aigw/gateways` return `remountPending: true` when the durable configuration succeeded but one or more tracked sandbox containers could not yet remount the atomically replaced `models.json`. Callers must not interpret that flag as a rollback; normal container health recovery continues.
+
+For the `aigw` type, discovery first requests `/.well-known/opencode` at the gateway origin and falls back to `/v1/models` only when no authoritative config resolves; outbound requests carry Bobbit's canonical AI Gateway user agent. `openai-compatible` gateways use `GET /v1/models` only and send no gateway user agent to the agent config. See [AI Gateway routing](ai-gateway-routing.md) for precedence, remote-config security, provider-specific routes, model-ID migration, and cache/container behavior; see [AI Gateway request headers](internals.md#ai-gateway-request-headers-user-agent-x-opencode-session) for implementation details.
 
 ### OAuth
 

@@ -537,7 +537,7 @@ import { getGoogleAccessToken, ensureCodeAssistProject, hasGoogleCodeAssistCrede
 import * as previewMount from "./preview/mount.js";
 import * as previewArtifacts from "./preview/artifacts.js";
 import { broadcastPreviewChanged, subscribePreviewChanged } from "./preview/events.js";
-import { configureAigw, removeAigw, getAigwUrl, discoverAigwModels, proxyRequest, startupAigwCheck, writeContextWindowOverrides, configureAigwRuntimeFlags, normalizeAigwModelString } from "./agent/aigw-manager.js";
+import { configureAigw, removeAigw, getAigwUrl, discoverAigwModels, discoverGatewayModels, proxyRequest, startupAigwCheck, writeContextWindowOverrides, configureAigwRuntimeFlags, normalizeAigwModelString, listGateways, getEnabledGateways, getGatewayByName, saveGateways, migrateGatewayPrefs, syncGatewaysModelsJson, isClaudeId, stripProviderPrefix, type ModelGateway, type AigwModel } from "./agent/aigw-manager.js";
 import { aigwUserAgentHeaders } from "./agent/aigw-user-agent.js";
 import { writeOpenAIModelAdditions } from "./agent/openai-model-additions.js";
 import { ReviewAnnotationStore, type ReviewAnnotation } from "./review-annotation-store.js";
@@ -3298,6 +3298,9 @@ export function createGateway(config: GatewayConfig, deps?: GatewayDeps) {
 			// Check internet and auto-configure AI Gateway if offline
 			// Runs before session restore so models.json is written before
 			// any agent subprocesses start.
+			// Migrate legacy single-URL aigw prefs → modelGateways list first
+			// (idempotent; startupAigwCheck also migrates internally).
+			migrateGatewayPrefs(preferencesStore);
 			await bootPhase("aigw-check", () => startupAigwCheck(preferencesStore));
 			writeContextWindowOverrides();
 			writeOpenAIModelAdditions();
@@ -3982,6 +3985,20 @@ function parseGateInspectSelectionOptions(params: URLSearchParams): TextSelectio
 	};
 }
 
+/**
+ * Shape a gateway's freshly-discovered models for an API response (the
+ * per-gateway refresh/status endpoints). Mirrors what the model registry
+ * surfaces: an `aigw`-type gateway prefix-strips Claude ids and tags them
+ * `bedrock-converse-stream`; an `openai-compatible` gateway returns raw ids
+ * untouched (never Bedrock-routed, even for `claude-*`).
+ */
+function shapeGatewayModelsForDisplay(gateway: ModelGateway, models: AigwModel[]): AigwModel[] {
+	if (gateway.type !== "aigw") return models;
+	return models.map((m) =>
+		isClaudeId(m.id) ? { ...m, id: stripProviderPrefix(m.id), api: "bedrock-converse-stream" } : m,
+	);
+}
+
 async function handleApiRoute(
 	url: URL,
 	req: http.IncomingMessage,
@@ -4501,7 +4518,7 @@ async function handleApiRoute(
 			status: "ok",
 			sessions: sessionManager.listSessions().length,
 			localhost: isLocalhost,
-			aigw: !!getAigwUrl(preferencesStore),
+			aigw: getEnabledGateways(preferencesStore).length > 0,
 			setupComplete: isSetupComplete(),
 			orphanedTranscripts: sessionManager.orphanedTranscriptsCount,
 		});
@@ -10009,6 +10026,84 @@ async function handleApiRoute(
 		}
 	}
 
+	// Multi-gateway provider management (see docs/design/multi-gateway-providers.md):
+	//   GET  /api/aigw/gateways                 → full list (incl. disabled)
+	//   PUT  /api/aigw/gateways                 → replace whole list (validate + sync)
+	//   POST /api/aigw/gateways/:name/refresh   → re-discover one gateway + re-sync
+	//   GET  /api/aigw/gateways/:name/status    → per-gateway status + models
+	// The single-URL shims below (status/configure/refresh + /api/aigw/v1/*) remain
+	// for back-compat; a named proxy /api/aigw/:name/v1/* lives further down.
+
+	// GET /api/aigw/gateways — full gateway list (including disabled rows).
+	if (url.pathname === "/api/aigw/gateways" && req.method === "GET") {
+		json({ gateways: listGateways(preferencesStore) });
+		return;
+	}
+
+	// PUT /api/aigw/gateways — replace the whole gateway list, then re-sync
+	// models.json. saveGateways validates and throws on any violation → 400.
+	if (url.pathname === "/api/aigw/gateways" && req.method === "PUT") {
+		const body = await readBody(req);
+		const rows = body?.gateways;
+		if (!Array.isArray(rows)) {
+			json({ error: "Missing 'gateways' array" }, 400);
+			return;
+		}
+		try {
+			saveGateways(preferencesStore, rows as ModelGateway[]);
+		} catch (err: any) {
+			json({ error: err?.message || "Invalid gateways" }, 400);
+			return;
+		}
+		try {
+			const modelsByGateway = await syncGatewaysModelsJson(preferencesStore);
+			await finalizeAigwPublication();
+			json({ gateways: listGateways(preferencesStore), modelsByGateway });
+		} catch (err: any) {
+			jsonError(502, err, { error: `Failed to sync gateways: ${err.message}` });
+		}
+		return;
+	}
+
+	// POST /api/aigw/gateways/:name/refresh — re-discover ONE gateway + re-sync.
+	const gatewayRefreshMatch = url.pathname.match(/^\/api\/aigw\/gateways\/([^/]+)\/refresh$/);
+	if (gatewayRefreshMatch && req.method === "POST") {
+		const name = decodeURIComponent(gatewayRefreshMatch[1]);
+		const gw = getGatewayByName(preferencesStore, name);
+		if (!gw) {
+			json({ error: `Unknown gateway "${name}"` }, 404);
+			return;
+		}
+		try {
+			const raw = await discoverGatewayModels(gw);
+			await syncGatewaysModelsJson(preferencesStore);
+			await finalizeAigwPublication();
+			json({ models: shapeGatewayModelsForDisplay(gw, raw) });
+		} catch (err: any) {
+			jsonError(502, err);
+		}
+		return;
+	}
+
+	// GET /api/aigw/gateways/:name/status — per-gateway "view models" affordance.
+	const gatewayStatusMatch = url.pathname.match(/^\/api\/aigw\/gateways\/([^/]+)\/status$/);
+	if (gatewayStatusMatch && req.method === "GET") {
+		const name = decodeURIComponent(gatewayStatusMatch[1]);
+		const gw = getGatewayByName(preferencesStore, name);
+		if (!gw) {
+			json({ configured: false });
+			return;
+		}
+		const meta = { configured: true, name: gw.name, url: gw.url, type: gw.type, enabled: gw.enabled };
+		try {
+			const raw = await discoverGatewayModels(gw);
+			json({ ...meta, models: shapeGatewayModelsForDisplay(gw, raw) });
+		} catch {
+			json({ ...meta, models: [] });
+		}
+		return;
+	}
+
 	// GET /api/aigw/status — check if aigw is configured
 	if (url.pathname === "/api/aigw/status" && req.method === "GET") {
 		const aigwUrl = getAigwUrl(preferencesStore);
@@ -10113,17 +10208,15 @@ async function handleApiRoute(
 				}, 404);
 				return;
 			}
-			if (provider !== "aigw") {
+			// Is this provider one of the configured gateways? If not, fall back to
+			// the standard provider-key / direct test path.
+			const gw = getGatewayByName(preferencesStore, provider);
+			if (!gw) {
 				const result = await testModelPreference(preferencesStore, pref);
 				json(result, result.status || (result.ok ? 200 : 502));
 				return;
 			}
-			const aigwUrl = getAigwUrl(preferencesStore);
-			if (!aigwUrl) {
-				json({ ok: false, error: "No AI Gateway configured." });
-				return;
-			}
-			const baseUrl = aigwUrl.replace(/\/+$/, "");
+			const baseUrl = gw.url.replace(/\/+$/, "");
 			const modelBaseUrl = (resolved.baseUrl || baseUrl).replace(/\/+$/, "");
 			if (resolved.api !== "openai-responses" && resolved.api !== "openai-completions") {
 				// Converse and future provider-native APIs must be exercised through
@@ -10181,6 +10274,25 @@ async function handleApiRoute(
 			jsonError(500, err, { ok: false, error: err?.message || "Test failed" });
 		}
 		return;
+	}
+
+	// Proxy by name: /api/aigw/:name/v1/* → <gateway.url>/v1/* for the named
+	// ENABLED gateway. The browser may not resolve the gateway host directly, so
+	// it routes model discovery / completions through here.
+	const namedProxyMatch = url.pathname.match(/^\/api\/aigw\/([^/]+)\/v1\/(.*)$/);
+	if (namedProxyMatch) {
+		const name = decodeURIComponent(namedProxyMatch[1]);
+		// `/api/aigw/v1/*` (legacy, name-less) is handled below — don't treat the
+		// literal "v1" segment as a gateway name.
+		if (name !== "v1") {
+			const gw = getGatewayByName(preferencesStore, name);
+			if (gw && gw.enabled) {
+				const targetUrl = `${gw.url.replace(/\/+$/, "")}/v1/${namedProxyMatch[2]}${url.search}`;
+				proxyRequest(targetUrl, req, res);
+				return;
+			}
+			// Unknown/disabled gateway — fall through to the 404 handler.
+		}
 	}
 
 	// Proxy: /api/aigw/v1/* → forward to configured aigw URL
