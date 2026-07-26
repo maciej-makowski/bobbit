@@ -1139,7 +1139,14 @@ const DISCOVERY: Record<GatewayType, (url: string) => Promise<AigwModel[]>> = {
 
 /** Discover a gateway's models via the dispatch table for its type. */
 export function discoverGatewayModels(g: ModelGateway): Promise<AigwModel[]> {
-	return DISCOVERY[g.type](g.url);
+	if (!Object.prototype.hasOwnProperty.call(DISCOVERY, g.type)) {
+		throw new Error(`Unsupported gateway type: ${String(g.type)}`);
+	}
+	const discover = DISCOVERY[g.type as GatewayType];
+	if (typeof discover !== "function") {
+		throw new Error(`Invalid discovery handler for gateway type: ${String(g.type)}`);
+	}
+	return discover(g.url);
 }
 
 // ── Gateway list preferences ───────────────────────────────────────
